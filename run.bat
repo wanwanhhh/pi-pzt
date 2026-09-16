@@ -1,6 +1,7 @@
 @echo off
 rem PI P-621.1CD 位移台控制台
 chcp 65001 >nul
+set PYTHONUTF8=1
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
