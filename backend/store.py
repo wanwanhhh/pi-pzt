@@ -77,8 +77,9 @@ def create_scan(
 ) -> int:
     with _db() as conn:
         cur = conn.execute(
+            # 直接写 running：这一行建好后立刻起扫描线程，pending 没有可观察的窗口
             "INSERT INTO scan (name, start_um, stop_um, count, settle_ms, status, created_at)"
-            " VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            " VALUES (?, ?, ?, ?, ?, 'running', ?)",
             (name, start_um, stop_um, count, settle_ms, time.time()),
         )
         return int(cur.lastrowid)
