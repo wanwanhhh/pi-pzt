@@ -20,11 +20,16 @@
 
 界面：http://127.0.0.1:8000
 
-## 上机自检
+## 测试
 
-    .venv\Scripts\python.exe tools\hwtest.py
+    .venv\Scripts\python.exe tools\hwtest.py     # 设备层，会真实驱动位移台
+    .venv\Scripts\python.exe tools\apitest.py    # 接口回归，需先启动服务，也会驱动位移台
+    node tools\uitest.js                          # 前端逻辑，假 DOM，不碰硬件
 
-会真实驱动位移台：连接、点到点、中途停止、急停、释放伺服。
+三个都不依赖测试框架，直接跑。`hwtest.py` 覆盖连接/点到点/中途停止/急停/释放；
+`apitest.py` 覆盖伺服、手动、扫描、暂停继续中止、停止中止扫描、急停收尾共 10 组；
+`uitest.js` 用假 DOM 把 `app.js` 真跑起来，覆盖点位载入状态机、乱序保护与按钮可用性
+（覆盖边界写在它的文件头，别当整页渲染回归用）。
 
 ## 结构
 
