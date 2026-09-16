@@ -1,0 +1,424 @@
+"""E-709 控制器封装：全进程唯一的设备访问入口。
+
+设计约束（见 AGENTS.md）：
+1. 只有一个 owner 线程调用 PIPython/DLL；其他线程通过命令队列提交任务，
+   避免并发访问 GCS DLL（它非线程安全）。
+2. 急停走旁路：置标志 + 丢弃排队命令，owner 线程在飞行中的调用返回后立即执行 STP。
+3. 限位从设备读取（TMN?/TMX?），不硬编码。
+4. 等待到位由调用方轮询完成；owner 线程只执行短命令，保证随时能响应停止。
+"""
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Optional
+
+from pipython import GCSDevice, GCSError
+
+from .config import (
+    AXIS,
+    DEVICE_NAME,
+    DEVICE_SERIAL,
+    FALLBACK_TRAVEL_MAX,
+    FALLBACK_TRAVEL_MIN,
+    MAX_VELOCITY,
+    SLOW_QUERY_EVERY,
+)
+
+log = logging.getLogger(__name__)
+
+
+class StageError(RuntimeError):
+    """设备层错误。"""
+
+
+class StageAborted(StageError):
+    """命令因急停被丢弃。"""
+
+
+class StageNotConnected(StageError):
+    """设备未连接。"""
+
+
+# GCS 错误码 10：控制器被命令停止。这是 STP 的正常回执，不是故障。
+ERR_STOPPED_BY_COMMAND = 10
+
+
+def stp(dev: GCSDevice) -> None:
+    """发送 STP。控制器以错误码 10 回执，属正常，不当作异常抛给调用方。"""
+    try:
+        dev.STP()
+    except GCSError as exc:
+        if exc.val != ERR_STOPPED_BY_COMMAND:
+            raise
+
+
+@dataclass
+class StageStatus:
+    connected: bool = False
+    position: float = 0.0
+    target: float = 0.0
+    velocity: float = 0.0
+    servo: bool = False
+    on_target: bool = False
+    overflow: bool = False
+    error_code: int = 0
+    travel_min: float = FALLBACK_TRAVEL_MIN
+    travel_max: float = FALLBACK_TRAVEL_MAX
+    axis: str = AXIS
+    serial: str = ""
+    stage_type: str = ""
+    updated_at: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {
+            "connected": self.connected,
+            "position": round(self.position, 4),
+            "target": round(self.target, 4),
+            "velocity": self.velocity,
+            "servo": self.servo,
+            "on_target": self.on_target,
+            "overflow": self.overflow,
+            "error_code": self.error_code,
+            "travel_min": self.travel_min,
+            "travel_max": self.travel_max,
+            "axis": self.axis,
+            "serial": self.serial,
+            "stage_type": self.stage_type,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
+class _Job:
+    fn: Callable[..., Any]
+    args: tuple = ()
+    kwargs: dict = field(default_factory=dict)
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    exc: Optional[BaseException] = None
+    cancelled: bool = False
+
+    def wait(self, timeout: Optional[float] = None) -> Any:
+        if not self.done.wait(timeout):
+            raise StageError("设备命令超时（owner 线程未响应）")
+        if self.exc is not None:
+            raise self.exc
+        return self.result
+
+
+class Stage:
+    """线程安全的 E-709 封装。所有公开方法都可以从任意线程调用。"""
+
+    def __init__(
+        self,
+        devname: str = DEVICE_NAME,
+        serial: str = DEVICE_SERIAL,
+        axis: str = AXIS,
+    ) -> None:
+        self._devname = devname
+        self._serial = serial
+        self._axis = axis
+        self._dev: Optional[GCSDevice] = None
+        self._jobs: "queue.Queue[Optional[_Job]]" = queue.Queue()
+        self._estop_flag = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._status = StageStatus(axis=axis)
+        self._status_lock = threading.Lock()
+        self._tick = 0
+
+    # ------------------------------------------------------------------ 生命周期
+    def start(self, timeout: float = 20.0) -> None:
+        """启动 owner 线程并连接控制器（失败抛异常）。"""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._owner_loop, name="pi-stage-owner", daemon=True
+        )
+        self._thread.start()
+        try:
+            self._call(self._open, timeout=timeout)
+        except BaseException:
+            self._running = False
+            self._jobs.put(None)
+            raise
+
+    def shutdown(self) -> None:
+        """断开设备并停 owner 线程。
+
+        不动伺服：位移台保持原位（定位仪器的正常状态）。要卸力请显式 release()。
+        """
+        if not self._running:
+            return
+        try:
+            self._call(self._close, timeout=5.0)
+        except Exception:
+            log.warning("关闭设备失败", exc_info=True)
+        self._running = False
+        self._jobs.put(None)
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    # ------------------------------------------------------------------ owner 线程
+    def _owner_loop(self) -> None:
+        while self._running:
+            try:
+                job = self._jobs.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            if self._estop_flag.is_set():
+                self._do_estop()
+            if job.cancelled:
+                continue
+            try:
+                job.result = job.fn(*job.args, **job.kwargs)
+            except GCSError as exc:
+                job.exc = StageError(f"控制器报错：{exc}")
+            except BaseException as exc:  # noqa: BLE001 - 必须传回调用方
+                job.exc = exc
+            finally:
+                job.done.set()
+        self._close_quiet()
+
+    def _submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> _Job:
+        if not self._running:
+            raise StageNotConnected("设备层未启动")
+        job = _Job(fn, args, kwargs)
+        self._jobs.put(job)
+        return job
+
+    def _call(self, fn: Callable[..., Any], *args: Any, timeout: float = 10.0, **kwargs: Any) -> Any:
+        return self._submit(fn, *args, **kwargs).wait(timeout)
+
+    # ------------------------------------------------------------------ 急停旁路
+    def estop(self) -> None:
+        """急停：丢弃排队命令，并让 owner 线程立即执行 STP（保持伺服）。"""
+        self._estop_flag.set()
+        while True:
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                break
+            if job is None:
+                self._jobs.put(None)
+                break
+            job.cancelled = True
+            job.exc = StageAborted("急停：命令已被丢弃")
+            job.done.set()
+        # 空任务用于把可能阻塞在 get() 上的 owner 线程叫醒
+        self._jobs.put(_Job(lambda: None))
+
+    def _do_estop(self) -> None:
+        """急停不允许抛异常：调用方在请求线程，不能被中断。"""
+        self._estop_flag.clear()
+        if self._dev is None:
+            return
+        try:
+            stp(self._dev)
+            log.warning("急停：已发送 STP")
+        except Exception:
+            log.error("急停 STP 失败", exc_info=True)
+
+    # ------------------------------------------------------------------ 设备操作（owner 线程内执行）
+    def _open(self) -> None:
+        dev = GCSDevice(self._devname)
+        target = self._serial
+        if not target:
+            found = list(dev.EnumerateUSB())
+            if not found:
+                raise StageNotConnected("未找到 PI 控制器（USB）")
+            if len(found) > 1:
+                log.warning("发现多台 PI 设备，使用第一台：%s", found)
+            target = found[0]
+        dev.ConnectUSB(target)
+        self._dev = dev
+        try:
+            idn = dev.qIDN()
+            serial = str(dev.qSSN()).strip()
+            stage_type = str(dev.qCST()[self._axis]).strip()
+            travel_min = float(dev.qTMN()[self._axis])
+            travel_max = float(dev.qTMX()[self._axis])
+            with self._status_lock:
+                st = self._status
+                st.serial = serial
+                st.stage_type = stage_type
+                st.travel_min = travel_min
+                st.travel_max = travel_max
+                st.axis = self._axis
+                st.connected = True
+            log.info("已连接：%s（位移台 %s，行程 %.3f–%.3f µm）",
+                     idn, stage_type, travel_min, travel_max)
+        except Exception:
+            self._close_quiet()
+            raise
+        self._refresh_fast()
+        self._refresh_slow()
+        # 本应用只用闭环。控制器上电默认是开环，这里按当前位置补开伺服
+        # （SVO 写目标寄存器，目标取当前位置，不会产生位移）。
+        if not self._status.servo:
+            log.info("控制器处于开环，按当前位置开启闭环保持")
+            self._set_servo(True)
+
+    def _close(self) -> None:
+        if self._dev is not None:
+            try:
+                self._dev.close()
+            finally:
+                self._dev = None
+        with self._status_lock:
+            self._status.connected = False
+
+    def _close_quiet(self) -> None:
+        try:
+            self._close()
+        except Exception:
+            log.warning("关闭设备时出错", exc_info=True)
+
+    def _require(self) -> GCSDevice:
+        if self._dev is None:
+            raise StageNotConnected("控制器未连接")
+        return self._dev
+
+    def _refresh_fast(self) -> None:
+        dev = self._require()
+        position = float(dev.qPOS()[self._axis])
+        on_target = bool(dev.qONT()[self._axis])
+        with self._status_lock:
+            self._status.position = position
+            self._status.on_target = on_target
+            self._status.updated_at = time.time()
+
+    def _refresh_slow(self) -> None:
+        dev = self._require()
+        servo = bool(dev.qSVO()[self._axis])
+        overflow = bool(dev.qOVF()[self._axis])
+        error_code = int(dev.qERR())
+        target = float(dev.qMOV()[self._axis])
+        velocity = float(dev.qVEL()[self._axis])
+        with self._status_lock:
+            st = self._status
+            st.servo = servo
+            st.overflow = overflow
+            st.error_code = error_code
+            st.target = target
+            st.velocity = velocity
+
+    def _tick_once(self) -> None:
+        self._refresh_fast()
+        self._tick += 1
+        if self._tick % SLOW_QUERY_EVERY == 0:
+            self._refresh_slow()
+
+    def _move(self, target: float) -> None:
+        self._require().MOV(self._axis, float(target))
+        with self._status_lock:
+            self._status.target = float(target)
+        self._refresh_fast()
+
+    def _jog(self, delta: float) -> float:
+        self._refresh_fast()
+        target = self.clamp(self._status.position + delta)
+        self._move(target)
+        return target
+
+    def _set_servo(self, on: bool) -> None:
+        self._require().SVO(self._axis, 1 if on else 0)
+        self._refresh_slow()
+
+    def _set_velocity(self, velocity: float) -> None:
+        self._require().VEL(self._axis, float(velocity))
+        self._refresh_slow()
+
+    def _stop(self) -> None:
+        stp(self._require())
+        self._refresh_fast()
+
+    # ------------------------------------------------------------------ 公开 API
+    def status(self) -> StageStatus:
+        """返回状态快照（不访问设备）。"""
+        with self._status_lock:
+            return replace(self._status)
+
+    def poll(self) -> StageStatus:
+        """让 owner 线程刷新一次状态，返回快照。"""
+        self._call(self._tick_once)
+        return self.status()
+
+    def clamp(self, target: float) -> float:
+        """把目标夹进设备行程范围。"""
+        st = self.status()
+        lo, hi = st.travel_min, st.travel_max
+        return max(lo, min(hi, float(target)))
+
+    def move(self, target: float) -> float:
+        """移动到绝对位置（µm），返回实际下发的目标值（已夹限位）。"""
+        value = self.clamp(target)
+        self._call(self._move, value)
+        return value
+
+    def jog(self, delta: float) -> float:
+        """相对移动（µm），从设备实时位置起算，返回实际下发的位置。"""
+        return self._call(self._jog, float(delta))
+
+    def set_servo(self, on: bool) -> None:
+        self._call(self._set_servo, bool(on))
+
+    def hold_here(self) -> float:
+        """开伺服并原地保持，返回当前（即新的目标）位置。
+
+        手册：SVO 改变伺服状态时会写目标寄存器，开伺服时目标取当前位置，
+        所以不会跳回上次 MOV 的目标。伺服关着时 MOV 会被控制器拒绝（错误码 5）。
+        """
+        return self._call(self._hold_here)
+
+    def _hold_here(self) -> float:
+        self._set_servo(True)
+        self._refresh_fast()
+        return self._status.position
+
+    def set_velocity(self, velocity: float) -> float:
+        value = max(1.0, min(MAX_VELOCITY, float(velocity)))
+        self._call(self._set_velocity, value)
+        return value
+
+    def stop_motion(self) -> None:
+        """停止运动，保持伺服（位姿保持）。"""
+        self._call(self._stop)
+
+    def release(self) -> None:
+        """关闭伺服（卸力）。台子会回弹到静止位，异常振动时使用。"""
+        self._call(self._set_servo, False)
+
+    def poll_on_target(self) -> bool:
+        """只查一次到位信号（省一次往返），用于等待稳定。"""
+        return bool(self._call(self._read_on_target))
+
+    def _read_on_target(self) -> bool:
+        on_target = bool(self._require().qONT()[self._axis])
+        with self._status_lock:
+            self._status.on_target = on_target
+            self._status.updated_at = time.time()
+        return on_target
+
+    def wait_on_target(
+        self, timeout: float, cancel: Optional[Callable[[], bool]] = None
+    ) -> bool:
+        """在调用方线程轮询等待到位。owner 线程保持可响应。
+
+        cancel 返回 True 时立即放弃等待（中止扫描用），返回 False。
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cancel is not None and cancel():
+                return False
+            if self.poll_on_target():
+                return True
+        return False

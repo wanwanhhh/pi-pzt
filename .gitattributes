@@ -1,0 +1,3 @@
+# 统一在仓库里存 LF；.bat 必须保持 CRLF，否则 cmd.exe 解析多行 if 块会出错
+* text=auto
+*.bat text eol=crlf

@@ -1,0 +1,6 @@
+# 直接依赖（版本为已在上机测试中验证过的组合）
+# 完整环境：Windows + Python 3.14，另需 PI Software Suite 2.8.2.0 提供 GCS DLL 与 USB 驱动
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.13.5
+PIPython==2.13.0.2
