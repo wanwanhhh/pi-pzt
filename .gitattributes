@@ -1,3 +1,6 @@
-# 统一在仓库里存 LF；.bat 必须保持 CRLF，否则 cmd.exe 解析多行 if 块会出错
-* text=auto
+# 仓库与工作区统一 LF，跨机器确定；.bat 例外，必须是 CRLF，
+# 否则 cmd.exe 解析多行 if 块会出错。
+# 只写 text=auto 是不够的：检出时仍会按 core.eol（Windows 上 native=CRLF）转换，
+# 于是同一份代码在不同机器上工作区行尾不一致。eol=lf 把这件事钉死。
+* text=auto eol=lf
 *.bat text eol=crlf
