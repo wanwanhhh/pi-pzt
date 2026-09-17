@@ -1,7 +1,7 @@
 """FastAPI 服务：REST 命令 + SSE 遥测 + 扫描控制。
 
 单进程单 worker：设备通道非线程安全（Windows 的 GCS DLL、Linux 的串口都一样），
-全进程只能有一个设备 owner 线程。所有设备访问都排队进入 pi_stage.Stage，
+全进程只能有一个设备 owner 线程。所有设备访问都排队进入设备层的 Stage 实现，
 HTTP 处理函数本身不碰设备。
 
 启动：run.sh（Linux）/ run.bat（Windows）
@@ -41,13 +41,13 @@ from .models import (
     ServoRequest,
     VelocityRequest,
 )
-from .pi_stage import Stage, StageError, StageNotConnected
 from .scanner import ScanError, Scanner
+from .stage_api import StageError, StageNotConnected, StageProto, create_stage
 
 log = logging.getLogger(__name__)
 
 store.init()
-stage = Stage()
+stage = create_stage()
 scanner = Scanner(stage, make_capture())
 
 # 心跳只表示"界面还在"，不参与任何控制（扫描独立于浏览器）
@@ -61,7 +61,7 @@ class Telemetry:
     这里统一轮询，SSE 只读快照。
     """
 
-    def __init__(self, stage_: Stage, scanner_: Scanner, hz: float, hz_scan: float) -> None:
+    def __init__(self, stage_: StageProto, scanner_: Scanner, hz: float, hz_scan: float) -> None:
         self._stage = stage_
         self._scanner = scanner_
         self._hz = hz
@@ -242,15 +242,19 @@ def api_servo(req: ServoRequest) -> dict:
 # ------------------------------------------------------------------ 停止 / 释放 / 急停
 @app.post("/api/stop")
 def api_stop() -> dict:
-    """停止运动并中止正在跑的扫描，保持伺服（位姿保持）。
+    """停止运动并中止正在跑的扫描。
 
     不中止扫描的话，扫描线程会一直在等到位，等满超时后按错位置采图、
     再继续走下一个点 —— 按了停止又自己动起来。
+
+    返回值里的 stop 说明这台设备实际做到了什么：hard = 立即停住并保持；
+    soft = 只能软停（不再发新目标 + 当前位置写回），慢一个帧间隔、可能过冲。
+    界面要按它说实话，别一律写「保持伺服」。
     """
     scan_aborted = scanner.busy()
     scanner.abort()
-    stage.stop_motion()
-    return {"ok": True, "scan_aborted": scan_aborted}
+    result = stage.stop_motion()
+    return {"ok": True, "scan_aborted": scan_aborted, "stop": result.value}
 
 
 @app.post("/api/release")

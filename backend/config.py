@@ -8,6 +8,9 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ---------------- 设备 ----------------
+# 启用哪一台：pi = PI E-709，xmt = 芯明天 E53.D1S-H。同一时刻只激活一台。
+# 具体类由 stage_api.create_stage() 延迟导入，不会被没选中的那台拖进依赖。
+DEVICE = os.getenv("PI_DEVICE", "pi").lower()
 DEVICE_NAME = os.getenv("PI_DEVNAME", "E-709")
 # USB 通道的序列号过滤（ConnectUSB 的参数），留空则自动枚举 USB 上唯一的控制器。
 # 只在 LINK=usb 时生效；串口通道按 /dev/serial/by-id 定位，不使用本项。

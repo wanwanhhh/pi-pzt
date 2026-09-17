@@ -4,3 +4,4 @@
 # 于是同一份代码在不同机器上工作区行尾不一致。eol=lf 把这件事钉死。
 * text=auto eol=lf
 *.bat text eol=crlf
+*.pdf binary

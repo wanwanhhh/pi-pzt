@@ -15,7 +15,7 @@ from . import store
 from .ccd import Capture
 from .config import APPROACH_OFFSET_UM, ON_TARGET_TIMEOUT_S, SOFT_LIMIT_MARGIN
 from .models import ScanRequest
-from .pi_stage import Stage, StageAborted, StageError
+from .stage_api import StageAborted, StageProto
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ class ScanError(RuntimeError):
 class Scanner:
     """单任务扫描执行器：同一时刻只允许一个扫描在跑。"""
 
-    def __init__(self, stage: Stage, capture: Capture) -> None:
+    def __init__(self, stage: StageProto, capture: Capture) -> None:
         self._stage = stage
         self._capture = capture
         self._thread: Optional[threading.Thread] = None
@@ -145,7 +145,7 @@ class Scanner:
                 image = self._capture.capture(scan_id, i, st.position)
                 store.add_point(
                     scan_id, i, target, st.position,
-                    (time.monotonic() - t0) * 1000.0, st.on_target, image,
+                    (time.monotonic() - t0) * 1000.0, st.on_target, st.settle_source, image,
                 )
                 with self._lock:
                     self._state.update(index=i + 1, target_um=target, actual_um=st.position)

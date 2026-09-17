@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import struct
 import zlib
-from pathlib import Path
 from typing import Protocol
 
 from .config import CCD_BACKEND, IMAGE_DIR

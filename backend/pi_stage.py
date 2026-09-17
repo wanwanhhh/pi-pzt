@@ -26,32 +26,38 @@ from .config import (
     AXIS,
     DEVICE_NAME,
     DEVICE_SERIAL,
-    FALLBACK_TRAVEL_MAX,
-    FALLBACK_TRAVEL_MIN,
     LINK,
     MAX_VELOCITY,
     SERIAL_BAUD,
     SERIAL_PORT,
     SLOW_QUERY_EVERY,
 )
+from .stage_api import (
+    RELEASE_SERVO_OFF,
+    SETTLE_DEVICE,
+    Caps,
+    StageAborted,  # noqa: F401  重新导出，老引用继续可用
+    StageError,  # noqa: F401
+    StageNotConnected,  # noqa: F401
+    StageStatus,
+    StopResult,
+)
 
 log = logging.getLogger(__name__)
 
-
-class StageError(RuntimeError):
-    """设备层错误。"""
-
-
-class StageAborted(StageError):
-    """命令因急停被丢弃。"""
-
-
-class StageNotConnected(StageError):
-    """设备未连接。"""
-
-
 # GCS 错误码 10：控制器被命令停止。这是 STP 的正常回执，不是故障。
 ERR_STOPPED_BY_COMMAND = 10
+
+# 本设备能力声明（见 stage_api.Caps）
+CAPS = Caps(
+    name="PI E-709",
+    platform="Windows + Linux",
+    has_on_target=True,
+    has_stop_command=True,
+    release_mode=RELEASE_SERVO_OFF,
+    has_setpoint_ack=True,
+    unit="µm",
+)
 
 # Linux 下 E-709 以 FTDI 虚拟串口出现（内核 ftdi_sio 直接驱动，不需要 PI 的 .so）。
 # 按 by-id 路径找，不写死 ttyUSB0：换 USB 口或插别的串口设备时编号会变。
@@ -89,42 +95,6 @@ def stp(dev: GCSDevice) -> None:
 
 
 @dataclass
-class StageStatus:
-    connected: bool = False
-    position: float = 0.0
-    target: float = 0.0
-    velocity: float = 0.0
-    servo: bool = False
-    on_target: bool = False
-    overflow: bool = False
-    error_code: int = 0
-    travel_min: float = FALLBACK_TRAVEL_MIN
-    travel_max: float = FALLBACK_TRAVEL_MAX
-    axis: str = AXIS
-    serial: str = ""
-    stage_type: str = ""
-    updated_at: float = 0.0
-
-    def as_dict(self) -> dict:
-        return {
-            "connected": self.connected,
-            "position": round(self.position, 4),
-            "target": round(self.target, 4),
-            "velocity": self.velocity,
-            "servo": self.servo,
-            "on_target": self.on_target,
-            "overflow": self.overflow,
-            "error_code": self.error_code,
-            "travel_min": self.travel_min,
-            "travel_max": self.travel_max,
-            "axis": self.axis,
-            "serial": self.serial,
-            "stage_type": self.stage_type,
-            "updated_at": self.updated_at,
-        }
-
-
-@dataclass
 class _Job:
     fn: Callable[..., Any]
     args: tuple = ()
@@ -145,6 +115,8 @@ class _Job:
 class Stage:
     """线程安全的 E-709 封装。所有公开方法都可以从任意线程调用。"""
 
+    caps: Caps = CAPS
+
     def __init__(
         self,
         devname: str = DEVICE_NAME,
@@ -159,7 +131,7 @@ class Stage:
         self._estop_flag = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        self._status = StageStatus(axis=axis)
+        self._status = StageStatus(settle_source=SETTLE_DEVICE, axis=axis)
         self._status_lock = threading.Lock()
         self._tick = 0
 
@@ -454,9 +426,10 @@ class Stage:
         self._call(self._set_velocity, value)
         return value
 
-    def stop_motion(self) -> None:
+    def stop_motion(self) -> StopResult:
         """停止运动，保持伺服（位姿保持）。"""
         self._call(self._stop)
+        return StopResult.HARD
 
     def release(self) -> None:
         """关闭伺服（卸力）。台子会回弹到静止位，异常振动时使用。"""

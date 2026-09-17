@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
 from .config import DATA_DIR, DB_PATH, IMAGE_DIR
+from .stage_api import SETTLE_UNKNOWN
 
 log = logging.getLogger(__name__)
 
@@ -36,11 +37,20 @@ CREATE TABLE IF NOT EXISTS point (
     actual_um   REAL,
     settled_ms  REAL,
     on_target   INTEGER,
+    settle_source TEXT,
     image_path  TEXT,
     taken_at    REAL,
     PRIMARY KEY (scan_id, idx)
 );
 """
+
+# 已有库的补列。CREATE TABLE IF NOT EXISTS 对已存在的表**什么都不做**，
+# 不加这一步，老 data/scans.db 上插点会因为缺列直接失败。
+# 表名/列名是模块常量，不是外部输入。
+MIGRATIONS = (
+    # (表, 列, 类型, 老行补什么值)
+    ("point", "settle_source", "TEXT", SETTLE_UNKNOWN),
+)
 
 # 终止态：进程启动时把这两个状态之外的残留扫描判为 aborted
 FINAL_STATUS = ("done", "aborted", "failed")
@@ -64,6 +74,15 @@ def init() -> None:
     with _db() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        for table, column, kind, backfill in MIGRATIONS:
+            have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+            # 回填放在 if **外面**、无条件跑：列可能是上一次启动补的，那时还没有回填逻辑，
+            # 老行会一直是 NULL。WHERE ... IS NULL 让它幂等，每次启动跑一遍不花钱。
+            conn.execute(
+                f"UPDATE {table} SET {column} = ? WHERE {column} IS NULL", (backfill,)
+            )
         # 上次进程被杀时留下的 running/paused 任务不可能再继续了
         conn.execute(
             "UPDATE scan SET status = 'aborted', message = '服务重启，任务中断',"
@@ -108,14 +127,17 @@ def add_point(
     actual_um: float,
     settled_ms: float,
     on_target: bool,
+    settle_source: str,
     image_path: Optional[str],
 ) -> None:
     with _db() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO point"
-            " (scan_id, idx, target_um, actual_um, settled_ms, on_target, image_path, taken_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (scan_id, idx, target_um, actual_um, settled_ms, int(on_target), image_path, time.time()),
+            " (scan_id, idx, target_um, actual_um, settled_ms, on_target, settle_source,"
+            "  image_path, taken_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (scan_id, idx, target_um, actual_um, settled_ms, int(on_target), settle_source,
+             image_path, time.time()),
         )
 
 
