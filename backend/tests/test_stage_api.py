@@ -64,6 +64,7 @@ def test_stop_motion_declares_its_guarantee():
 
 def test_pi_caps():
     assert CAPS.has_on_target and CAPS.has_stop_command and CAPS.has_setpoint_ack
+    assert CAPS.has_velocity
     assert CAPS.release_mode == RELEASE_SERVO_OFF
     assert Stage.caps is CAPS
 

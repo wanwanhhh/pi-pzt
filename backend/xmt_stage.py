@@ -65,6 +65,7 @@ CAPS = Caps(
     has_stop_command=False,
     release_mode=RELEASE_OPEN_LOOP_ZERO,
     has_setpoint_ack=False,
+    has_velocity=False,   # 协议表里没有速度指令，set_velocity 明确拒绝
     unit="µm",
 )
 

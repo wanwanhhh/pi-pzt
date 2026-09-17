@@ -115,6 +115,7 @@ def test_caps_declares_xmt_differences():
     assert CAPS.has_stop_command is False, "设备没有停止指令"
     assert CAPS.has_setpoint_ack is False, "设点无应答，必须读回校验"
     assert CAPS.release_mode == RELEASE_OPEN_LOOP_ZERO
+    assert CAPS.has_velocity is False, "本设备没有速度指令，能力声明里要说清楚"
     assert CAPS.unit == "µm"
 
 

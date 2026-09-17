@@ -56,6 +56,7 @@ CAPS = Caps(
     has_stop_command=True,
     release_mode=RELEASE_SERVO_OFF,
     has_setpoint_ack=True,
+    has_velocity=True,
     unit="µm",
 )
 

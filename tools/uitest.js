@@ -231,7 +231,7 @@ const count = (m) => calls.filter((c) => c === m).length;
   ok('表格是 #23 的点（迟到的 #22 没覆盖它）', htmlOf('points').indexOf('23.0000') >= 0);
 
   console.log('\n[H] renderStage：按钮可用性与表单播种');
-  run('seeded = false; scanActive = false; stageState = null;');
+  run('seeded = false; scanActive = false; stageState = null; stageCaps = null;');
   jogButtons.forEach((b) => { b.disabled = false; });
 
   driveStage({ connected: false, servo: false });
@@ -299,6 +299,49 @@ const count = (m) => calls.filter((c) => c === m).length;
   route = () => ({ body: [] });
   await run('loadHistory()'); await tick(); await tick();
   ok('空列表渲染 0 行', rowsOf('history') === 0);
+
+  console.log('\n[J] caps：界面按设备能力改文案与可用性');
+  const capsPI = { name: 'PI E-709', platform: 'Windows + Linux', has_on_target: true,
+    has_stop_command: true, release_mode: 'servo_off', has_setpoint_ack: true,
+    has_velocity: true, unit: 'µm' };
+  const capsXMT = { name: '芯明天 E53.D1S-H', platform: '仅 Windows', has_on_target: false,
+    has_stop_command: false, release_mode: 'open_loop_zero', has_setpoint_ack: false,
+    has_velocity: false, unit: 'µm' };
+  const driveCaps = (c) => run('renderCaps(' + JSON.stringify(c) + ')');
+
+  driveCaps(capsXMT);
+  driveStage({ connected: true, servo: true });
+  ok('无速度指令的设备：速度按钮变灰', read("$('btn-vel').disabled") === true);
+  ok('无速度指令的设备：速度输入框也禁用', read("$('vel').disabled") === true);
+  ok('停止按钮说明写"软停"', read("$('btn-stop').title").indexOf('软停') >= 0,
+     JSON.stringify(read("$('btn-stop').title").slice(0, 16)));
+  ok('急停按钮说明写"软停"而不是"+ STP"',
+     read("$('btn-estop').title").indexOf('软停') >= 0
+     && read("$('btn-estop').title").indexOf('+ STP') < 0,
+     JSON.stringify(read("$('btn-estop').title").slice(0, 20)));
+  ok('释放按钮说明写"切至开环"', read("$('btn-release').title").indexOf('开环') >= 0);
+  ok('状态灯说"闭环保持"', read("$('pill-servo').textContent") === '闭环保持',
+     JSON.stringify(read("$('pill-servo').textContent")));
+  driveStage({ connected: true, servo: false });
+  ok('释放后状态灯说"已切至开环（未保持）"',
+     read("$('pill-servo').textContent") === '已切至开环（未保持）',
+     JSON.stringify(read("$('pill-servo').textContent")));
+
+  route = (m, u) => u === '/api/stop'
+    ? { body: { ok: true, scan_aborted: false, stop: 'soft' } } : { body: [] };
+  await run("$('btn-stop').onclick()"); await tick();
+  ok('软停的提示语不说"保持伺服"', read("$('toast').textContent").indexOf('软停') >= 0
+     && read("$('toast').textContent").indexOf('保持伺服') < 0,
+     JSON.stringify(read("$('toast').textContent")));
+
+  driveCaps(capsPI);
+  driveStage({ connected: true, servo: true });
+  ok('有速度指令的设备：速度按钮可点', read("$('btn-vel').disabled") === false);
+  ok('有速度指令的设备：速度输入框可用', read("$('vel').disabled") === false);
+  ok('停止按钮说明写 STP', read("$('btn-stop').title").indexOf('STP') >= 0);
+  ok('释放按钮说明写"回弹"', read("$('btn-release').title").indexOf('回弹') >= 0);
+  ok('状态灯说"伺服保持"', read("$('pill-servo').textContent") === '伺服保持',
+     JSON.stringify(read("$('pill-servo').textContent")));
 
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');
   process.exit(failed ? 1 : 0);

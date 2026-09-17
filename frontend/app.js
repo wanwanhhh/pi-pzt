@@ -106,6 +106,7 @@ const DEV_WARN_NM = 200;
 
 let stageState = null;
 let scanActive = false;
+let stageCaps = null;          // 能力声明（后端发；没到之前按 PI 的文案与可用性走）
 let seeded = false;
 let viewScanId = null;         // 视图正在展示的扫描（只有成功渲染才写）
 let autoHandledScanId = null;  // 自动载入已处理过的扫描 id（成功失败都算处理过，防止每帧重试）
@@ -132,10 +133,39 @@ function openStream() {
     lastMsgAt = Date.now();
     let data;
     try { data = JSON.parse(ev.data); } catch (err) { return; }
+    if (data.caps) renderCaps(data.caps);
     if (data.stage) renderStage(data.stage);
     if (data.scan) renderScan(data.scan);
   };
   // 出错时 EventSource 自动重连，这里只让指示灯自己变红
+}
+
+/* 能力差异只改文案与可用性，不复制业务逻辑：真正的拒绝永远在后端（409 + 中文原因）。 */
+function releaseByServoOff() { return !stageCaps || stageCaps.release_mode === 'servo_off'; }
+function hasStopCommand() { return !stageCaps || stageCaps.has_stop_command; }
+function velocitySupported() { return !stageCaps || stageCaps.has_velocity; }
+
+function renderCaps(caps) {
+  stageCaps = caps;
+
+  $('btn-stop').title = hasStopCommand()
+    ? 'STP：立刻停止运动，保持伺服与当前位置。扫描中会同时中止扫描。'
+    : '软停：不再下发新目标，并把当前位置写回成新目标。设备没有停止指令，'
+      + '已在途的行程拦不住。扫描中会同时中止扫描。';
+  $('btn-estop').title = hasStopCommand()
+    ? '丢弃排队命令 + STP，并中止扫描。'
+    : '丢弃排队命令 + 软停（设备没有 STP，在途行程拦不住），并中止扫描。';
+  $('btn-release').title = releaseByServoOff()
+    ? '关伺服卸力，台子会回弹。异常振动时用（手册建议）。会同时中止扫描。'
+    : '切至开环（卸力）：输出写零，不保证停在原位。异常振动时用。会同时中止扫描。';
+
+  if (!velocitySupported()) {
+    $('vel').disabled = true;
+    $('btn-vel').title = '本设备没有速度指令：速度由闭环自身决定，后端会明确拒绝。';
+  } else {
+    $('vel').disabled = false;
+    $('btn-vel').title = '';
+  }
 }
 
 /* ==================== 渲染：设备 ==================== */
@@ -154,14 +184,16 @@ function renderStage(st) {
   setPill('pill-dev',
     st.connected ? ((st.stage_type || '控制器') + ' 已连接') : '设备未连接',
     st.connected ? 'ok' : 'bad');
+  const keep = releaseByServoOff() ? '伺服保持' : '闭环保持';
+  const down = releaseByServoOff() ? '已释放（未保持）' : '已切至开环（未保持）';
   setPill('pill-servo',
-    st.overflow ? '过冲 / 溢出' : (st.servo ? '伺服保持' : '已释放（未保持）'),
+    st.overflow ? '过冲 / 溢出' : (st.servo ? keep : down),
     st.overflow ? 'bad' : (st.servo ? 'ok' : 'warn'));
 
   // 按钮可用性只是提示；真正的拒绝在后端（409 + 中文原因）
   const canMove = st.connected && st.servo && !scanActive;
   $('btn-move').disabled = !canMove;
-  $('btn-vel').disabled = !(st.connected && !scanActive);
+  $('btn-vel').disabled = !(st.connected && !scanActive) || !velocitySupported();
   $('btn-servo-on').disabled = !st.connected || st.servo || scanActive;
   $('btn-release').disabled = !st.connected;
   $('btn-stop').disabled = !st.connected;
@@ -391,21 +423,34 @@ function wire() {
 
   $('btn-servo-on').onclick = async function () {
     const r = await post('/api/servo', { on: true });
-    if (r) toast('伺服已开，按当前位置 ' + fmt(r.position_um, 4) + ' µm 保持');
+    if (r) toast((releaseByServoOff() ? '伺服已开' : '闭环已开')
+      + '，按当前位置 ' + fmt(r.position_um, 4) + ' µm 保持');
   };
 
   $('btn-release').onclick = async function () {
-    if (await post('/api/release')) { toast('已释放：伺服关闭，台子回弹'); loadHistory(); }
+    if (await post('/api/release')) {
+      toast(releaseByServoOff() ? '已释放：伺服关闭，台子回弹'
+                                : '已释放：切至开环、输出写零（不保证停在原位）');
+      loadHistory();
+    }
   };
 
   $('btn-stop').onclick = async function () {
     const r = await post('/api/stop');
-    if (r) toast(r.scan_aborted ? '已停止，扫描同时被中止' : '已停止（保持伺服）');
+    if (r) {
+      // 后端返回 stop=hard/soft，界面按它说实话，别一律写"保持伺服"
+      const how = r.stop === 'soft' ? '软停：不再下发新目标（在途行程拦不住）'
+                                    : '已停止（保持伺服）';
+      toast(r.scan_aborted ? how + '，扫描同时被中止' : how);
+    }
     loadHistory();
   };
 
   $('btn-estop').onclick = async function () {
-    if (await post('/api/estop')) { toast('急停已发出'); loadHistory(); }
+    if (await post('/api/estop')) {
+      toast(hasStopCommand() ? '急停已发出' : '急停已发出（软停：在途行程拦不住）');
+      loadHistory();
+    }
   };
 
   $('btn-scan-start').onclick = async function () {

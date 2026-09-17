@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -105,6 +106,7 @@ class Telemetry:
             payload = {
                 "stage": st,
                 "scan": scan,
+                "caps": CAPS_DICT,
                 "frontend_online": time.time() - _last_heartbeat < HEARTBEAT_TIMEOUT_S,
                 "ts": time.time(),
             }
@@ -114,6 +116,10 @@ class Telemetry:
 
 
 telemetry = Telemetry(stage, scanner, TELEMETRY_HZ, TELEMETRY_HZ_SCAN)
+
+# 能力声明发给前端：界面文案与按钮可用性由它决定（AGENTS.md「能力标志只用来
+# 决定界面文案与上层策略」）。设备固定，算一次就够。
+CAPS_DICT = asdict(stage.caps)
 
 
 @asynccontextmanager
@@ -170,6 +176,7 @@ def api_status() -> dict:
     return {
         "stage": stage.poll().as_dict(),
         "scan": scanner.state(),
+        "caps": CAPS_DICT,
         "frontend_online": time.time() - _last_heartbeat < HEARTBEAT_TIMEOUT_S,
     }
 

@@ -54,6 +54,7 @@ class Caps:
     has_stop_command: bool    # 是否有专用停止指令
     release_mode: str         # RELEASE_SERVO_OFF / RELEASE_OPEN_LOOP_ZERO
     has_setpoint_ack: bool    # 设点是否有应答（无应答就必须读回校验）
+    has_velocity: bool        # 是否有速度设定指令（没有就必须明确拒绝，不能假装接受）
     unit: str                 # 设备原生单位；对外统一折算成 µm
 
 
