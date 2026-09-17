@@ -1,7 +1,8 @@
 """接口冒烟测试：假定服务已在 127.0.0.1:8000 运行。
 
 会真实驱动位移台，跑完整条链路：伺服 -> 手动移动 -> 扫描 -> 每点元数据与图像。
-用法：.venv\\Scripts\\python.exe tools\\apitest.py
+用法：.venv/bin/python tools/apitest.py
+      Windows：.venv\\Scripts\\python.exe tools\\apitest.py
 """
 from __future__ import annotations
 

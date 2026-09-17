@@ -1,6 +1,7 @@
 """设备层上机冒烟测试：真实驱动 P-621.1CD（行程 100 µm）。
 
-用法（项目根目录）：.venv\\Scripts\\python.exe tools\\hwtest.py
+用法（项目根目录）：.venv/bin/python tools/hwtest.py
+                    Windows：.venv\\Scripts\\python.exe tools\\hwtest.py
 """
 from __future__ import annotations
 

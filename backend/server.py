@@ -1,9 +1,12 @@
 """FastAPI 服务：REST 命令 + SSE 遥测 + 扫描控制。
 
-单进程单 worker：GCS DLL 非线程安全，全进程只能有一个设备 owner 线程。
-所有设备访问都排队进入 pi_stage.Stage，HTTP 处理函数本身不碰 DLL。
+单进程单 worker：设备通道非线程安全（Windows 的 GCS DLL、Linux 的串口都一样），
+全进程只能有一个设备 owner 线程。所有设备访问都排队进入 pi_stage.Stage，
+HTTP 处理函数本身不碰设备。
 
-启动：run.bat    等价于  .venv\\Scripts\\python.exe -m backend.server
+启动：run.sh（Linux）/ run.bat（Windows）
+      等价于  .venv/bin/python -m backend.server
+      Windows：.venv\\Scripts\\python.exe -m backend.server
 """
 from __future__ import annotations
 
