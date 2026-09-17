@@ -1,6 +1,6 @@
 """芯明天 E53.D1S-H 上机自检：只读，绝不发运动指令。
 
-回答这些还没验证的前提（AGENTS.md「设备 / XMT」）：
+回答这些还没验证的前提（实测与结论见 docs/xmt/设备认识账.xml）：
 
     阶段 1   设备认不认我们的帧     —— 波特率 × 地址 扫描 + 77 握手
     阶段 2   身份与行程             —— 47 地址 / 78 型号 / 53 单位 / 19 开闭环 / 27 35 行程
@@ -14,7 +14,7 @@
 让它动是另一件事，见 tools/xmt_move.py（有 19=='C' 硬门）。
 
 **单位尺度本脚本量不了**（要动才量得出），见 tools/xmt_scale.py：
-读回 ×0.75 = µm，设点与行程本来就是 µm。
+读回 ×0.75 = µm，设点是 µm；行程 27/35 的单位与它同等存疑（认识账 A2/B1），只当参考区间。
 
 用法：
     python tools/xmt_check.py                   # 自动找 VID_0483&PID_0002
@@ -285,7 +285,8 @@ def stage_identity(link: Link) -> dict:
 def stage_idle_reads(link: Link, n: int = 20, gap_s: float = 2.0) -> dict:
     """台子不动，连读两批各 n 次。
 
-    - 极差 = 读数噪声底（取两批较小的那个），这就是「停稳」门限的实测下限
+    - 极差 = 读数噪声底（取两批较小的那个），这就是「停稳」门限的实测下限。
+      **口径**：极差是**读回单位**，×0.75 才是 µm（见 docs/xmt/设备认识账.xml E11）
     - 是否逐次完全相同：闭环反馈是实时传感器，静止时也该有末位抖动；
       若两批都一字不差，要怀疑读回来的是目标寄存器而不是传感器。
       注意这个启发式**只是怀疑**：单位码粗（如 4=mm，1e-4 mm = 0.1 µm）时，
@@ -308,11 +309,13 @@ def stage_idle_reads(link: Link, n: int = 20, gap_s: float = 2.0) -> dict:
 
     spreads = [max(v) - min(v) for v in batches]
     for i, (v, s) in enumerate(zip(batches, spreads), 1):
-        print(f"  第 {i} 批 首值 {v[0]:g}  末值 {v[-1]:g}  极差 {s:g}")
+        print(f"  第 {i} 批 首值 {v[0]:g}  末值 {v[-1]:g}  极差 {s:g}"
+              f"（读回单位；≈ {s * 0.75:g} µm）")
     identical = all(len(set(v)) == 1 for v in batches)
     print("  " + ("两批都逐次完全相同 —— 可疑：可能读的是目标值而不是传感器"
                   if identical else "有末位抖动 —— 是活的传感器读数，正常"))
-    print(f"  → ε 的实测下限 = {min(spreads):g}（两批里最乐观的那个，是**下限**）")
+    print(f"  → ε 的实测下限 = {min(spreads):g} 读回单位"
+          f"（≈ {min(spreads) * 0.75:g} µm；两批里最乐观的那个，是**下限**）")
     print("     必须长时间静止后测；刚跑过运动时这个数偏大，方向偏松、不安全。")
     print("     设门限时必须乘系数（建议 ≥3×）：门限压到噪声底以下就永远判不出停稳，")
     print("     而停稳超时不是「多等一会儿」—— scanner 会把整个扫描判 failed 并停在中途。")
@@ -468,7 +471,8 @@ def summary(ident: dict, idle: dict, gap: dict, streams: dict, during: bool | No
     if "high" in ident:
         print(f"  行程        : {ident['low']} ~ {ident['high']}"
               f"（宽 {ident['high'] - ident['low']}）"
-              "   <-- 还要确认是真标定行程还是 ADC 满量程")
+              "   <-- 已查实：控制器没有标定数据，这是固件默认值，只能当参考区间；"
+              "可用区间见 docs/xmt/设备认识账.xml A3")
 
     loop = ident.get("loop")
     if loop is None:

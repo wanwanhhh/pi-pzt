@@ -1,6 +1,7 @@
 """芯明天 E53.D1S-H 设备层：自写协议 + pyserial 直连 USB CDC 虚拟串口（仅 Windows）。
 
-协议与实测结论见 docs/xmt/README.md。三处与 PI 的语义差写在 CAPS 里（见 stage_api）：
+协议速查见 docs/xmt/README.md，实测数字与踩坑经验见 docs/xmt/设备认识账.xml。
+三处与 PI 的语义差写在 CAPS 里（见 stage_api）：
 
 - **单位陷阱**：设点 `1` 与行程 `27/35` 是 µm，读回 `6` 是 4/3 µm ——
   读回乘 XMT_READBACK_TO_UM 才进上层，设点永远是 µm。**绝不让读回值原样流进设点**：
@@ -9,8 +10,10 @@
 - **没有停止 / 关伺服指令**：stop_motion 只能软停（当前真实位置写回成新目标），
   release 只能切开环 + 输出写零（卸力，**不保证停在原位**）。
 
-连接时从设备读回 19（开闭环）/ 53（单位码）/ 27 35（行程，µm），有一条不合就拒绝连接 ——
-**行程是软限位的唯一权威来源**，写死一个数比不连更危险。
+连接时从设备读回 19（开闭环）/ 53（单位码）/ 27 35（行程），有一条不合就拒绝连接。
+但**设备自报的行程不是可用行程**（控制器里没有标定数据，27/35 只是固件默认值，
+而且永不生效 —— 先到的是电压轨），实际按 XMT_USABLE_MIN_UM / MAX_UM 夹取，
+依据见设备认识账 A1/A3。
 """
 from __future__ import annotations
 
@@ -39,9 +42,14 @@ from .config import (
     XMT_PORT,
     XMT_READ_TIMEOUT,
     XMT_READBACK_TO_UM,
+    XMT_SCALE_CHECK_MIN_UM,
+    XMT_SCALE_NO_MOTION,
+    XMT_SCALE_TOL_FRACTION,
     XMT_SETTLE_EPS_UM,
     XMT_SETTLE_WINDOW,
     XMT_SETTLE_WINDOWS,
+    XMT_USABLE_MAX_UM,
+    XMT_USABLE_MIN_UM,
     XMT_USB_PID,
     XMT_USB_VID,
 )
@@ -189,6 +197,15 @@ class SettleJudge:
         self._settled = self._streak >= self.need and abs(mean - self._target) <= self.tol_um
         return self._settled
 
+    @property
+    def steady(self) -> bool:
+        """窗口均值连续 need 次都没动 —— 不含「落在目标附近」那一半。
+
+        比值自检要用它：设备一旦被重新标定，读数会稳定在错误的位置上，
+        「落在目标附近」永远不成立，只看 on_target 就查不出来。
+        """
+        return self._streak >= self.need
+
 
 @dataclass
 class _Job:
@@ -236,6 +253,11 @@ class XmtStage:
             XMT_SETTLE_WINDOW, XMT_SETTLE_WINDOWS, XMT_SETTLE_EPS_UM, XMT_ARRIVAL_TOL_UM
         )
         self._tick = 0
+        # 折算系数自检只做诊断，不拦截（见 _note_settled）：
+        # 可信采样点（判稳且落在目标附近）、是否正在怀疑、已经吵过的目标
+        self._scale_ref: Optional[tuple[float, float]] = None
+        self._scale_suspect = False
+        self._warned_target: Optional[float] = None
 
     # ------------------------------------------------------------------ 生命周期
     def start(self, timeout: float = 20.0) -> None:
@@ -377,7 +399,10 @@ class XmtStage:
         return False
 
     def _identify(self, link: Any) -> None:
-        """连接时把三件事读回来。任何一条不合就拒绝连接，不猜、不写死。"""
+        """连接时把三件事读回来。任何一条不合就拒绝连接 —— 不猜单位、不拿自报值当权威；
+
+        可用行程按实测常量夹取（见认识账 A3），不采信设备自报的 27/35。
+        """
         mode = self._read_loop_mode()
         if mode not in (LOOP_CLOSED, LOOP_OPEN):
             raise StageNotConnected(f"19 读开闭环回了看不懂的值 {mode!r}，拒绝连接")
@@ -391,12 +416,30 @@ class XmtStage:
                 "本仓库只按位移（µm）用它，拒绝连接。"
             )
 
-        lo = self._read_raw(xp.CMD_READ_POS_LIMIT_LOW)      # 行程本来就是 µm
+        # 27/35 的单位与设点/读回那一套同样存疑（见认识账 A2/B1），这里只当参考区间
+        lo = self._read_raw(xp.CMD_READ_POS_LIMIT_LOW)
         hi = self._read_raw(xp.CMD_READ_POS_LIMIT_HIGH)
         if not 0.0 <= lo < hi <= XMT_MAX_TRAVEL_UM:
             raise StageNotConnected(
                 f"行程读数 {lo} ~ {hi} µm 不合理（没标定好？），拒绝连接 —— "
-                "行程是软限位的唯一权威来源，不能拿一个可疑值上岗。"
+                "不能拿一个可疑值当行程。"
+            )
+        # 设备自报的行程**不是可用行程**：它里面没有任何标定数据（45/82/59 全空），
+        # 27/35 只是固件默认值，而且永不生效 —— 先到的是电压轨（设点 ≈159.4 µm 处
+        # 驱动量撞上 200，162 µm 就翻进「负位置 + 负驱动」）。下界同理：≲3 µm 报的不是
+        # 测量值。实测可用区间 ≈ 3.1~159 µm，见 docs/xmt/设备认识账.xml 的 A3 / A5。
+        usable_lo = max(lo, XMT_USABLE_MIN_UM)
+        usable_hi = min(hi, XMT_USABLE_MAX_UM)
+        if not usable_lo < usable_hi:
+            raise StageNotConnected(
+                f"设备自报行程 {lo} ~ {hi} µm 与实测可用区间 "
+                f"{XMT_USABLE_MIN_UM} ~ {XMT_USABLE_MAX_UM} µm 没有交集，拒绝连接"
+            )
+        if usable_lo != lo or usable_hi != hi:
+            log.warning(
+                "设备自报行程 %.4f ~ %.4f µm 超出实测可用区间，按 %.1f ~ %.1f µm 夹取"
+                "（自报值没有标定数据支撑，先到的是电压轨）",
+                lo, hi, usable_lo, usable_hi,
             )
 
         model = self._read_code(xp.CMD_MODEL)
@@ -405,7 +448,7 @@ class XmtStage:
             st = self._status
             st.connected = True
             st.servo = mode == LOOP_CLOSED
-            st.travel_min, st.travel_max = lo, hi
+            st.travel_min, st.travel_max = usable_lo, usable_hi
             st.serial = str(link.port)
             st.stage_type = (
                 f"E53.D1S-H 型号码 0x{model:02X}" if model is not None else "E53.D1S-H"
@@ -420,7 +463,7 @@ class XmtStage:
                 self._status.updated_at = time.time()
             log.info("已连接 %s：行程 %.4f ~ %.4f µm，位置 %.4f µm；"
                      "停稳判据 ε=%.2f µm / 窗 %d 样本 / 连续 %d 窗（旋钮动过就得重测）",
-                     link.port, lo, hi, pos, self._judge.eps_um,
+                     link.port, usable_lo, usable_hi, pos, self._judge.eps_um,
                      self._judge.window, self._judge.need)
         else:
             # 开环下读回不是位移，别拿它当位置用；要动先开伺服。
@@ -512,10 +555,48 @@ class XmtStage:
             return
         pos = self._position_um()
         on_target = self._judge.feed(pos)
+        self._note_settled(pos)
         with self._status_lock:
             self._status.position = pos
             self._status.on_target = on_target
             self._status.updated_at = time.time()
+
+    def _note_settled(self, position_um: float) -> None:
+        """判稳时记一个可信采样点；判稳却离目标很远，就把**原因说清楚**。
+
+        **这里不做任何拦截**，这是设计决定：真正兜住「折算系数被改过」的是到达容差 ——
+        系数一变，读数就再也落不到目标附近（4/3 变 1:1 的话，60 µm 处差 15 µm），
+        手动移动会一直显示未到位、扫描会判该点无效并中止，已经足够响。
+        再叠一层「比值不对就拒绝运动」只会多一个误判源：设点丢帧时台子停在上一目标，
+        拿它跟新目标算比值必然算错 —— 这个误判在本机上闩死过两次（真机复现），
+        比它要防的问题更糟。所以这一层只负责把「为什么没到位」讲清楚。
+        """
+        if not self._judge.steady:
+            return
+        target = self._status.target
+        if abs(position_um - target) <= self._judge.tol_um:
+            self._scale_ref = (target, position_um / XMT_READBACK_TO_UM)   # 可信采样点
+            self._scale_suspect = False
+            return
+        if self._scale_suspect and self._warned_target == target:
+            return                                       # 同一个目标只吵一次
+        self._scale_suspect = True
+        self._warned_target = target
+        hint = "先查这条设点有没有丢（设点无应答，丢了是静默的）"
+        prev = self._scale_ref
+        if prev is not None and abs(target - prev[0]) >= XMT_SCALE_CHECK_MIN_UM:
+            d_tgt = target - prev[0]
+            d_raw = position_um / XMT_READBACK_TO_UM - prev[1]
+            if abs(d_raw) < abs(d_tgt) * XMT_SCALE_NO_MOTION:
+                hint = ("读数几乎没动（%+.4f 原值 / %+.3f µm）—— 更像**设点丢帧**："
+                        "设备仍停在上一目标，按读回校验那条路处理" % (d_raw, d_tgt))
+            else:
+                ratio = d_raw / d_tgt
+                if abs(ratio * XMT_READBACK_TO_UM - 1.0) > XMT_SCALE_TOL_FRACTION:
+                    hint = ("位移 %+.3f µm 对应读数变化 %+.4f（原值）＝比值 %.4f，而不是 %.4f —— "
+                            "更像**折算系数变了**（设备被重新标定过？）"
+                            % (d_tgt, d_raw, ratio, 1.0 / XMT_READBACK_TO_UM))
+        log.error("判稳却离目标 %.3f µm（读数 %.3f µm）：%s", position_um - target, position_um, hint)
 
     def _refresh_slow(self) -> None:
         mode = self._read_loop_mode()
@@ -609,7 +690,7 @@ class XmtStage:
         return self.status()
 
     def clamp(self, target: float) -> float:
-        """把目标夹进设备行程范围（行程是连接时从 27/35 读回来的）。"""
+        """把目标夹进**可用行程**：连接时读到的 27/35 只作参考，实际用实测区间（认识账 A3）。"""
         st = self.status()
         return max(st.travel_min, min(st.travel_max, float(target)))
 

@@ -25,6 +25,10 @@ from backend.stage_api import (  # noqa: E402
     StageProto,
     StopResult,
 )
+from backend.config import (  # noqa: E402
+    XMT_SETTLE_WINDOWS,
+    XMT_SETTLE_WINDOW,
+)
 from backend.xmt_stage import CAPS, SettleJudge, XmtStage  # noqa: E402
 
 # 真机上量到的静止读回（此时真实位置 144.8785 × 0.75 = 108.6589 µm）
@@ -131,7 +135,8 @@ def test_connect_reads_limits_and_units_from_device():
     st = stage.status()
     assert st.connected is True
     assert st.servo is True
-    assert (st.travel_min, st.travel_max) == (0.0, 201.1799)
+    # 设备自报 0 ~ 201.1799，但那是固件默认值、不是可用行程：夹到实测区间 5 ~ 150
+    assert (st.travel_min, st.travel_max) == (5.0, 150.0)
     assert st.serial == "FAKE1"
     assert st.stage_type == "E53.D1S-H 型号码 0x42"
     stage.shutdown()
@@ -203,12 +208,93 @@ def test_soft_stop_writes_the_converted_position():
     stage.shutdown()
 
 
-def test_clamp_uses_device_travel():
+def test_clamp_uses_the_usable_range():
+    """夹取用**实测可用区间**，不是设备自报的 0 ~ 201.1799。"""
     stage, _ = connected()
-    assert stage.clamp(-5.0) == 0.0
-    assert stage.clamp(500.0) == 201.1799
+    assert stage.clamp(-5.0) == 5.0
+    assert stage.clamp(500.0) == 150.0
     assert stage.clamp(12.5) == 12.5
     stage.shutdown()
+
+
+def settle(stage, times: int = 14) -> None:
+    """读若干次，让判稳器把「连续几窗没动」立起来。"""
+    for _ in range(times):
+        stage.poll()
+
+
+def reply_raw(link: FakeLink, raw: float) -> None:
+    """换掉假设备的位移回包 —— 用来模拟「设备被重新标定过」。"""
+    link._replies[xp.CMD_READ_POSITION] = _data(raw)
+
+
+def test_settled_far_from_target_is_diagnosed_not_blocked():
+    """判稳却离目标很远：要报出来，但**绝不拦运动**。
+
+    真机上「比值不对就拒绝运动」闩死过两次（设点丢帧会被算成"标定被改"），
+    所以这一层只做诊断 —— 真正兜底的是到达容差：系数一变，读数再也落不到目标附近。
+    """
+    stage, link = connected()
+    reply_raw(link, 20.0 / 0.75)
+    stage.move(20.0)
+    settle(stage)
+    assert stage._scale_suspect is False
+    reply_raw(link, 60.0)                 # 读数停在"原值 = 设点"：离目标差 15 µm
+    stage.move(60.0)
+    settle(stage)
+    assert stage._scale_suspect is True, "离目标很远时应当被诊断为可疑"
+    assert stage.move(50.0) == 50.0, "诊断归诊断，不能拦运动"
+    stage.shutdown()
+
+
+def test_scale_check_accepts_a_clean_ratio():
+    """干净设备（差分比值 = 4/3）不能被误报 —— 真机有 ~90 nm 偏置与 30~50 nm 抖动。"""
+    stage, link = connected()
+    reply_raw(link, 20.0 / 0.75)
+    stage.move(20.0)
+    settle(stage)
+    reply_raw(link, 60.0 / 0.75)
+    stage.move(60.0)
+    settle(stage)
+    assert stage._scale_suspect is False
+    assert stage.move(50.0) == 50.0
+    stage.shutdown()
+
+
+def test_dropped_frame_does_not_block_motion():
+    """设点丢帧（台子没动）之后运动必须照常 —— 旧设计在这里闩死过（真机复现）。"""
+    stage, link = connected()
+    reply_raw(link, 20.0 / 0.75)
+    stage.move(20.0)
+    settle(stage)
+    stage.move(60.0)                       # 这一帧丢了：回包不变，台子没动
+    settle(stage)
+    assert stage.move(50.0) == 50.0
+    stage.shutdown()
+
+
+def test_usable_range_with_no_intersection_is_rejected():
+    """设备自报区间与实测可用区间没有交集时必须拒绝连接，不能夹成一个点。"""
+    try:
+        connected({xp.CMD_READ_POS_LIMIT_LOW: _data(160.0),
+                   xp.CMD_READ_POS_LIMIT_HIGH: _data(200.0)})
+    except StageNotConnected as exc:
+        assert "交集" in str(exc), str(exc)
+    else:
+        raise AssertionError("自报 160~200 与可用 5~150 无交集，必须拒绝连接")
+
+
+def test_judge_steady_ignores_target_distance():
+    """steady 只看「没动」，不看「在不在目标附近」—— 比值自检靠的就是这一半。"""
+    judge = SettleJudge(3, 2, 0.1, 0.2)
+    judge.reset(100.0)
+    for _ in range(6):
+        assert judge.feed(50.0) is False      # 稳定，但离目标 50 µm
+    assert judge.steady is True
+    for _ in range(3):
+        judge.feed(50.4)                      # 一个窗口内动了 0.4 > ε
+    assert judge.steady is False
+    assert judge.feed(50.0) is False
 
 
 def test_frames_use_the_negotiated_address():

@@ -55,8 +55,13 @@ def test_golden_limits():
 
 
 def test_golden_diagnostics():
-    """47 读地址必须用广播地址（指令表原文：[1]地址字节为0x00）"""
-    assert xp.frame(xp.CMD_READ_ADDRESS, addr=0).hex() == "aa00064700eb"
+    """47 读地址必须用广播地址（指令表原文：[1]地址字节为0x00）
+
+    0x2F：指令表里的「47」是**十进制** —— 写成 0x47 是另一条命令，
+    这条曾经写错，README 里「47 无回包 ✗」的结论就是这么来的。
+    """
+    assert xp.CMD_READ_ADDRESS == 0x2F
+    assert xp.frame(xp.CMD_READ_ADDRESS, addr=0).hex() == "aa00062f0083"
     assert xp.frame(xp.CMD_POWER_INFO).hex() == "aa01065000fd"
     assert xp.frame(xp.CMD_STAGE_INFO).hex() == "aa01065200ff"
 

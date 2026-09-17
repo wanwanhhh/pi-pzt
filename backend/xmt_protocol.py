@@ -39,7 +39,9 @@ CMD_READ_LOOP_MODE = 0x13
 CMD_READ_POS_LIMIT_HIGH = 0x1B  # 27
 CMD_READ_POS_LIMIT_LOW = 0x23   # 35
 CMD_READ_UNIT = 0x35            # 53
-CMD_READ_ADDRESS = 0x47         # 47 读地址；下发帧的地址字节必须写 0（广播）
+CMD_READ_ADDRESS = 0x2F         # 指令表里的「47 读地址」是**十进制** 47 = 0x2F；
+                                # 写成 0x47 是另一条命令（曾据此误判「无回包」）
+                                # 下发帧的地址字节必须写 0（广播）
 CMD_HANDSHAKE = 0x4D            # 77，回 b"OK"
 CMD_MODEL = 0x4E                # 78
 CMD_POWER_INFO = 0x50           # 80 电源信息读取1，回 61 字节，[24]..[55] 是命令能力位图
