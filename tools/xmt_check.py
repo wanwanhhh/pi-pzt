@@ -10,8 +10,11 @@
     阶段 5   流开着还能不能发别的命令   —— 流跑着的时候发 19
     阶段 6   设备自报能力             —— 80（含 256 条命令能力位图）/ 82
 
-安全边界：本脚本只发白名单里的只读命令。不写目标、不切开闭环、不写零。
-真机上可能压着样品，要让它动是另一件事，得单独开脚本、有人在旁边看着。
+安全边界：本脚本只发白名单里的只读命令。不写目标、不切开闭环、写零更不行。
+让它动是另一件事，见 tools/xmt_move.py（有 19=='C' 硬门）。
+
+**单位尺度本脚本量不了**（要动才量得出），见 tools/xmt_scale.py：
+读回 ×0.75 = µm，设点与行程本来就是 µm。
 
 用法：
     python tools/xmt_check.py                   # 自动找 VID_0483&PID_0002
@@ -47,11 +50,12 @@ FRAME_GAP = 0.05
 FRAME_JITTER = 0.015
 READ_WAIT = 0.5
 
-# 只读命令白名单：本脚本永远只发这些
+# 只读命令白名单：本脚本永远只发这些（send 的 allow 放行在**本文件里**一次都不许用）
 SAFE = frozenset((
     xp.CMD_READ_ADDRESS, xp.CMD_HANDSHAKE, xp.CMD_MODEL, xp.CMD_READ_UNIT,
-    xp.CMD_READ_LOOP_MODE, xp.CMD_READ_POS_LIMIT_HIGH, xp.CMD_READ_POS_LIMIT_LOW,
-    xp.CMD_STREAM_POSITION, xp.CMD_STOP_STREAM, xp.CMD_POWER_INFO, xp.CMD_STAGE_INFO,
+    xp.CMD_READ_LOOP_MODE, xp.CMD_READ_POSITION, xp.CMD_READ_POS_LIMIT_HIGH,
+    xp.CMD_READ_POS_LIMIT_LOW, xp.CMD_STREAM_POSITION, xp.CMD_STOP_STREAM,
+    xp.CMD_POWER_INFO, xp.CMD_STAGE_INFO,
 ))
 
 # 能力位图里要盯的命令：文档说「没有」或「仅他型号有」的那几条全在里面
@@ -64,6 +68,16 @@ MODEL_NAMES = {
     0x05: "E72", 0x06: "E63", 0x07: "长光机定制709", 0x08: "E70 4路",
     0x09: "E70-D3S-H5", 0x0A: "E80-D3S-k1", 0x0B: "E70-D3S-K1",
 }
+
+
+def find_port(explicit: str | None = None) -> str | None:
+    """按 VID:PID 找目标串口；显式指定了端口就直接用。会动的脚本也用它。"""
+    if explicit:
+        return explicit
+    for p in list_ports.comports():
+        if (p.vid, p.pid) == (VID, PID):
+            return p.device
+    return None
 
 
 class Link:
@@ -95,10 +109,18 @@ class Link:
         """静默之后补一次心跳，免得「上一条未返回后续不执行」把自己卡住。"""
         self.ask(self.cmd(xp.CMD_HANDSHAKE), xp.CMD_HANDSHAKE, wait=0.3)
 
-    def send(self, raw: bytes) -> None:
-        # 用 raise 不用 assert：assert 在 python -O 下会整个消失
-        if raw[3] not in SAFE:
-            raise RuntimeError(f"非只读命令，本脚本不允许发: {raw.hex()}")
+    def send(self, raw: bytes, allow: frozenset = frozenset()) -> None:
+        """默认只放只读白名单；写命令必须由调用方用 allow 显式点名。
+
+        allow 是给 tools/xmt_move.py、tools/xmt_scale.py 那两个会动的兄弟脚本用的，
+        它们的**调用点**写着 `allow=ALLOW`，一眼能看出这个脚本要动台子。
+        本文件（只读自检）一处都不许用 —— xmt_check_safety 测试会遍历所有 .send
+        调用，带第二个位置参数或 allow 关键字的一律判失败。
+
+        用 raise 不用 assert：assert 在 python -O 下会整个消失。
+        """
+        if raw[3] not in SAFE and raw[3] not in allow:
+            raise RuntimeError(f"不在白名单里，本脚本不允许发: {raw.hex()}")
         self.ser.write(raw)
 
     def gap(self) -> None:
@@ -159,14 +181,12 @@ def stage_port(args: argparse.Namespace) -> str | None:
         hit = (p.vid, p.pid) == (VID, PID)
         print(f"  {p.device:<8} {p.vid and format(p.vid, '04X')}:{p.pid and format(p.pid, '04X')}"
               f"  {p.description}{'   <-- 目标' if hit else ''}")
+    port = find_port(args.port)
     if args.port:
         print(f"  用 --port 指定的 {args.port}")
-        return args.port
-    for p in list_ports.comports():
-        if (p.vid, p.pid) == (VID, PID):
-            return p.device
-    print(f"  没找到 VID:PID={VID:04X}:{PID:04X}")
-    return None
+    elif port is None:
+        print(f"  没找到 VID:PID={VID:04X}:{PID:04X}")
+    return port
 
 
 def stage_handshake(port: str) -> Link | None:
@@ -365,8 +385,12 @@ def stage_stream(link: Link, seconds: float) -> dict:
                   f"  最大 {max(gaps):6.2f} ms{note}")
         else:
             print(f"  周期 {period:>3} ms → 只收到 1 包，无法测周期{note}")
-        if tail:
+        # 1 ms 档满流下 0.3 s 该收到约 300 包，停流后最多只剩在途的 1 包。
+        # 阈值取 >1，不是"收了就报警"：否则每档都会误报停流没生效。
+        if len(tail) > 1:
             print(f"      ! 发 11 之后又收到 {len(tail)} 包 —— 停流没生效")
+        elif len(tail) == 1:
+            print("      · 发 11 之后还有 1 包，是在途的那一包，正常")
         out[period] = {"n": len(sel),
                        "median": statistics.median(gaps) if len(gaps) > 1 else None}
     return out
@@ -419,6 +443,10 @@ def stage_capabilities(link: Link) -> dict:
         print(f"      好使（MSB 序）: {msb}")
         if lsb != msb:
             print(f"      两种位序不一致，需人工核对，差异 {sorted(set(lsb) ^ set(msb))}")
+        else:
+            nonzero = [i for i, b in enumerate(bm) if b != 0xFF]
+            print(f"      两种位序结论相同（这批数据分不出来）；非 0xFF 的字节下标 {nonzero}"
+                  f" → 覆盖命令 {[i * 8 for i in nonzero]} 起")
         out["bitmap"], out["lsb"], out["msb"] = bm.hex(), lsb, msb
 
     f = link.ask(link.cmd(xp.CMD_STAGE_INFO), xp.CMD_STAGE_INFO)
