@@ -84,29 +84,31 @@ def decode_value(b: bytes) -> float:
 
 # ---------------- 常用命令 ----------------
 
-def read_channel(b3: int, ch: int = 0) -> bytes:
+# 设备地址不是常量：手册允许设，且掉电保持。所以每个 helper 都能指定 addr ——
+# 用默认值 1 拼出来的帧发给别的地址会被设备**静默忽略**（连错误码都没有）。
+def read_channel(b3: int, ch: int = 0, addr: int = 1) -> bytes:
     """数据段只有一个通道号的读命令（5/6/19/27/35）。"""
-    return frame(b3, bytes((ch,)))
+    return frame(b3, bytes((ch,)), addr=addr)
 
 
-def set_position(pos: float, ch: int = 0) -> bytes:
+def set_position(pos: float, ch: int = 0, addr: int = 1) -> bytes:
     """闭环设点。"""
-    return frame(CMD_SET_POSITION, bytes((ch,)) + encode_value(pos))
+    return frame(CMD_SET_POSITION, bytes((ch,)) + encode_value(pos), addr=addr)
 
 
-def set_voltage(volts: float, ch: int = 0) -> bytes:
+def set_voltage(volts: float, ch: int = 0, addr: int = 1) -> bytes:
     """开环设电压。"""
-    return frame(CMD_SET_VOLTAGE, bytes((ch,)) + encode_value(volts))
+    return frame(CMD_SET_VOLTAGE, bytes((ch,)) + encode_value(volts), addr=addr)
 
 
-def set_loop_mode(mode: str, ch: int = 0) -> bytes:
+def set_loop_mode(mode: str, ch: int = 0, addr: int = 1) -> bytes:
     """mode: 'O' 开环 / 'C' 闭环。"""
-    return frame(CMD_LOOP_MODE, bytes((ch,)) + mode.encode("ascii"))
+    return frame(CMD_LOOP_MODE, bytes((ch,)) + mode.encode("ascii"), addr=addr)
 
 
-def stream_position(period_ms: int, ch: int = 0) -> bytes:
+def stream_position(period_ms: int, ch: int = 0, addr: int = 1) -> bytes:
     """启动周期推送位移。period_ms 手册给的范围是 1~255，真机下限待实测。"""
-    return frame(CMD_STREAM_POSITION, bytes((ch, period_ms)))
+    return frame(CMD_STREAM_POSITION, bytes((ch, period_ms)), addr=addr)
 
 
 # ---------------- 解析 ----------------

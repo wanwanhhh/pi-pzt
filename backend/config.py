@@ -27,6 +27,39 @@ LINK = os.getenv("PI_LINK", "auto")
 SERIAL_PORT = os.getenv("PI_SERIAL_PORT", "")
 SERIAL_BAUD = int(os.getenv("PI_SERIAL_BAUD", "115200"))
 
+# ---------------- 芯明天 E53.D1S-H（PI_DEVICE=xmt，仅 Windows） ----------------
+# USB CDC 虚拟串口，系统自带 usbser.sys，不需要厂家驱动。按 VID:PID 自动找，
+# 不写死 COM7：换 USB 口编号会变。
+XMT_USB_VID = 0x0483
+XMT_USB_PID = 0x0002
+XMT_PORT = os.getenv("PI_XMT_PORT", "")          # 留空则按 VID:PID 找
+XMT_BAUD = int(os.getenv("PI_XMT_BAUD", "115200"))
+XMT_ADDRESS = int(os.getenv("PI_XMT_ADDR", "1"))
+
+# **单位换算，实测出来的，别改**：设点 1 与行程 27/35 是 µm，
+# 读回 6/8 是 4/3 µm（×0.75 才是 µm）。53 只回「位移」，手册全书没写这个系数。
+# 读回值不折算就写回设点，台子会跑偏 4/3 倍（实测 108.66 → 144.95 µm）。
+XMT_READBACK_TO_UM = 0.75
+# 行程读数超出这个范围就认为读错了（设备没标定 / 串了口），拒绝连接
+XMT_MAX_TRAVEL_UM = 1000.0
+
+XMT_READ_TIMEOUT = 0.3      # 单条读命令等回包上限（s）
+XMT_CMD_TIMEOUT = 5.0       # 单个 owner 任务上限（s）
+
+# 停稳判据（设备没有到位信号，只能软件判；见 xmt_stage.SettleJudge）。
+# ε 与窗口长度一起决定判据：实测单次噪声 σ 0.040 µm，ε 取 2.5 倍。
+# 采样间隔基数。实际间隔 = max(这个值, 帧间隔 50 ms) + 抖动 —— 调到 50 以下不会更快。
+XMT_POLL_MS = 50
+XMT_POLL_JITTER_MS = 15     # 抖动上限：固定网格会与闭环振荡拍频，看起来纹丝不动
+XMT_SETTLE_WINDOW = 5       # 一窗几个样本（≈250~325 ms）
+XMT_SETTLE_WINDOWS = 2      # 连续几窗均值差都在 ε 内才算停稳
+XMT_SETTLE_EPS_UM = 0.1     # 窗口均值之间"算没动"的门限（µm）
+# 读回校验的容差：偏离目标超过它就判该点无效（设点无应答，丢帧是静默的）。
+# **必须远小于扫描步距**：丢帧的表现就是"整整差一个步距"，步距 ≤ 容差时这个校验
+# 形同虚设。实测定位误差 ±0.045 µm、真机 1 µm 步距扫描里最坏一次差 0.12 µm，
+# 所以取 0.2：既留了余量，又只要求步距 > 0.2 µm。
+XMT_ARRIVAL_TOL_UM = 0.2
+
 # 读不到设备限位时的兜底值（正常情况用不到，仅防御）
 FALLBACK_TRAVEL_MIN = 0.0
 FALLBACK_TRAVEL_MAX = 100.0
@@ -46,7 +79,8 @@ MAX_VELOCITY = 10000.0
 # 扫描进行中降到 TELEMETRY_HZ_SCAN，把带宽让给扫描本身。
 TELEMETRY_HZ = 10.0        # 空闲时的状态推送频率
 TELEMETRY_HZ_SCAN = 2.0    # 扫描进行中的推送频率
-SLOW_QUERY_EVERY = 10      # 每 N 次快查询做一次慢查询（SVO?/ERR?/OVF?/MOV?/VEL?）
+SLOW_QUERY_EVERY = 10      # 每 N 次快查询做一次慢查询（PI 是 SVO?/ERR?/OVF?/MOV?/VEL?；
+                           # XMT 只用它刷 19 开闭环）
 
 # ---------------- 扫描 ----------------
 DEFAULT_SETTLE_MS = 100    # ONT? 置位后的额外稳定延时

@@ -157,8 +157,8 @@ def create_stage(**kwargs: Any) -> StageProto:
             from .xmt_stage import XmtStage  # noqa: PLC0415
         except ImportError as exc:
             raise StageNotConnected(
-                "PI_DEVICE=xmt，但 backend/xmt_stage.py 还没实现；"
-                "先写设备层，或把 PI_DEVICE 设回 pi"
+                "PI_DEVICE=xmt，但 backend/xmt_stage.py 导入失败（多半是缺 pyserial）；"
+                "装依赖，或把 PI_DEVICE 设回 pi"
             ) from exc
         return XmtStage(**kwargs)
     if DEVICE != "pi":
