@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from pipython import GCSDevice, GCSError
+from pipython.pidevice.interfaces.pigateway import PIGateway
+from pipython.pidevice.interfaces.piserial import PISerial
 
 from .config import (
     AXIS,
@@ -24,7 +28,10 @@ from .config import (
     DEVICE_SERIAL,
     FALLBACK_TRAVEL_MAX,
     FALLBACK_TRAVEL_MIN,
+    LINK,
     MAX_VELOCITY,
+    SERIAL_BAUD,
+    SERIAL_PORT,
     SLOW_QUERY_EVERY,
 )
 
@@ -45,6 +52,31 @@ class StageNotConnected(StageError):
 
 # GCS 错误码 10：控制器被命令停止。这是 STP 的正常回执，不是故障。
 ERR_STOPPED_BY_COMMAND = 10
+
+# Linux 下 E-709 以 FTDI 虚拟串口出现（内核 ftdi_sio 直接驱动，不需要 PI 的 .so）。
+# 按 by-id 路径找，不写死 ttyUSB0：换 USB 口或插别的串口设备时编号会变。
+SERIAL_BY_ID = "/dev/serial/by-id"
+
+
+def resolve_link() -> str:
+    """实际使用的连接方式：'usb'（GCS DLL）或 'serial'（FTDI 虚拟串口）。"""
+    if LINK == "auto":
+        return "usb" if sys.platform == "win32" else "serial"
+    if LINK not in ("usb", "serial"):
+        raise StageError(f"PI_LINK 取值非法：{LINK!r}（应为 auto/usb/serial）")
+    return LINK
+
+
+def find_serial_port() -> str:
+    """找 PI 的串口设备路径；多个取第一个，一个都没有则报错。"""
+    found = sorted(Path(SERIAL_BY_ID).glob("usb-PI_*"))
+    if not found:
+        raise StageNotConnected(
+            f"{SERIAL_BY_ID}/usb-PI_* 下没有设备。确认控制器已上电、USB 线已插好。"
+        )
+    if len(found) > 1:
+        log.warning("发现多个 PI 串口，使用第一个：%s", [p.name for p in found])
+    return str(found[0])
 
 
 def stp(dev: GCSDevice) -> None:
@@ -229,16 +261,35 @@ class Stage:
 
     # ------------------------------------------------------------------ 设备操作（owner 线程内执行）
     def _open(self) -> None:
-        dev = GCSDevice(self._devname)
-        target = self._serial
-        if not target:
-            found = list(dev.EnumerateUSB())
-            if not found:
-                raise StageNotConnected("未找到 PI 控制器（USB）")
-            if len(found) > 1:
-                log.warning("发现多台 PI 设备，使用第一台：%s", found)
-            target = found[0]
-        dev.ConnectUSB(target)
+        # 连接前先清空 PIPython 的连接状态回调。它是 PIGateway 上的**类级**列表，
+        # 注册发生在 GCSDevice.__init__ 里、**早于**里面那次与设备通信的探测
+        # （_downcast_gcsdevice_if_necessary → isgcs30_by_qcsv → float(read('CSV?'))）。
+        # 所以构造中途抛异常时（串口被占、回包为空 → float('') 报 ValueError），
+        # 调用方拿不到对象，回调却已注册：它强引用该对象使其永不回收，串口 fd
+        # 一直开着，下次构造 gateway 时还会被调到已死的旧连接上（PortNotOpenError）。
+        # 本进程同一时刻只应有一个设备对象，清空是安全的。
+        PIGateway._connection_status_changed_callbacks.clear()
+        if resolve_link() == "usb":
+            dev = GCSDevice(self._devname)
+            target = self._serial
+            if not target:
+                found = list(dev.EnumerateUSB())
+                if not found:
+                    raise StageNotConnected("未找到 PI 控制器（USB）")
+                if len(found) > 1:
+                    log.warning("发现多台 PI 设备，使用第一台：%s", found)
+                target = found[0]
+            dev.ConnectUSB(target)
+        else:
+            port = SERIAL_PORT or find_serial_port()
+            try:
+                # gateway=PISerial：只走 PIPython 的纯 Python 命令层，不加载 GCS DLL
+                dev = GCSDevice(self._devname, gateway=PISerial(port, SERIAL_BAUD))
+            except Exception as exc:
+                raise StageNotConnected(
+                    f"打开串口 {port} 失败：{exc}"
+                    "（若为权限拒绝：sudo usermod -aG dialout $USER 后重新登录）"
+                ) from exc
         self._dev = dev
         try:
             idn = dev.qIDN()
@@ -261,8 +312,16 @@ class Stage:
             raise
         self._refresh_fast()
         self._refresh_slow()
-        # 本应用只用闭环。控制器上电默认是开环，这里按当前位置补开伺服
-        # （SVO 写目标寄存器，目标取当前位置，不会产生位移）。
+        # 本应用只用闭环。控制器上电默认是开环，这里按当前位置补开伺服。
+        # SVO 1 会把当前位置写进目标寄存器，故不产生位移。实测验证过（E-709，
+        # 固件 5.001）：开环下用 SVR 把轴挪到 +1.24 µm（MOV? 仍为 0）后 SVO 1，
+        # 轴停在原地，MOV? 随即变为 +1.2468。参见手册 PZ222E §3.7.1：
+        #   "SVO 1 1 ... this also writes the current axis position to the
+        #    target register, to avoid jumps of the mechanics."
+        # 唯一例外：当前位置在标定行程 [TMN?, TMX?] 之外时目标被夹到行程端点，
+        # 轴会走回范围内（曾见开环漂到 −4.04 µm 后开伺服回到 0）。
+        # 不要"先 MOV 到当前位置再 SVO"：伺服关闭时 MOV 被拒绝（错误码 5），
+        # 开环下只能用 SVA/SVR。
         if not self._status.servo:
             log.info("控制器处于开环，按当前位置开启闭环保持")
             self._set_servo(True)
@@ -270,7 +329,13 @@ class Stage:
     def _close(self) -> None:
         if self._dev is not None:
             try:
-                self._dev.close()
+                # 必须走 _cleanup() 而不是 close()：PIPython 的连接状态回调注册在
+                # PIGateway 的**类级**列表里（pigateway.py: _connection_status_changed_
+                # callbacks），close() 不注销它，而那个绑定方法持有本对象的强引用，
+                # 使引用计数永不归零、__del__ 不触发。残留回调会在下次构造 gateway
+                # 时被调用，打到已关闭的旧连接上，报 PortNotOpenError（实测复现）。
+                # _cleanup() = 注销回调 + close()，正是 GCSDevice.__exit__ 走的路。
+                self._dev._cleanup()
             finally:
                 self._dev = None
         with self._status_lock:

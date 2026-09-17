@@ -9,9 +9,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ---------------- 设备 ----------------
 DEVICE_NAME = os.getenv("PI_DEVNAME", "E-709")
-# 留空则自动枚举 USB 上唯一的 PI 控制器
+# USB 通道的序列号过滤（ConnectUSB 的参数），留空则自动枚举 USB 上唯一的控制器。
+# 只在 LINK=usb 时生效；串口通道按 /dev/serial/by-id 定位，不使用本项。
 DEVICE_SERIAL = os.getenv("PI_SERIAL", "")
 AXIS = os.getenv("PI_AXIS", "X")
+
+# 连接方式：auto | usb | serial
+#   auto   Linux 走串口，Windows 走 USB（见 AGENTS.md 技术栈）
+#   usb    强制 GCS DLL 通道（Windows 常规路径，需 PI Software Suite）
+#   serial 强制 FTDI 虚拟串口（Linux 常规路径，纯 Python，不需要 .so）
+LINK = os.getenv("PI_LINK", "auto")
+# 串口设备路径。留空则自动找 /dev/serial/by-id/usb-PI_*
+# （不写死 ttyUSB0：换 USB 口或插别的串口设备时编号会变）
+SERIAL_PORT = os.getenv("PI_SERIAL_PORT", "")
+SERIAL_BAUD = int(os.getenv("PI_SERIAL_BAUD", "115200"))
 
 # 读不到设备限位时的兜底值（正常情况用不到，仅防御）
 FALLBACK_TRAVEL_MIN = 0.0
