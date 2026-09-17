@@ -13,7 +13,12 @@ from typing import Any, Optional
 
 from . import store
 from .ccd import Capture
-from .config import APPROACH_OFFSET_UM, ON_TARGET_TIMEOUT_S, SOFT_LIMIT_MARGIN
+from .config import (
+    APPROACH_OFFSET_UM,
+    ON_TARGET_TIMEOUT_S,
+    SCAN_ARRIVAL_FRACTION,
+    SOFT_LIMIT_MARGIN,
+)
 from .models import ScanRequest
 from .stage_api import StageAborted, StageProto
 
@@ -142,6 +147,18 @@ class Scanner:
                     # 稳定延时内漂移/溢出，图像仍采但如实记录
                     log.warning("第 %d 点采图时已不在位：目标 %.4f µm，实际 %.4f µm",
                                 i, target, st.position)
+                # 设备层的到达容差是**绝对**的；步距 ≤ 容差时，设点丢帧（台子停在上一点，
+                # 正好差一个步距）会落进容差被判成到位 —— 静默错点。这里知道步距，补一道
+                # **相对**校验：偏差超过半个步距就判该点无效，不采图、不入库、中止扫描。
+                # 步距为 0（起终点相同）时不做这条：没有"上一点"可比。
+                if step and abs(st.position - target) > abs(step) * SCAN_ARRIVAL_FRACTION:
+                    status = "failed"
+                    message = (f"第 {i}/{req.count} 点偏差 {abs(st.position - target):.4f} µm"
+                               f"超过步距的 {SCAN_ARRIVAL_FRACTION:.0%}"
+                               f"（{abs(step) * SCAN_ARRIVAL_FRACTION:.4f} µm）："
+                               f"设点可能丢了，或台子没走到")
+                    log.error("扫描 %s %s", scan_id, message)
+                    break
                 image = self._capture.capture(scan_id, i, st.position)
                 store.add_point(
                     scan_id, i, target, st.position,
