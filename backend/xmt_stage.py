@@ -94,9 +94,12 @@ class _Link:
     服务对象不同，故意不共用：这里要静默、不能有交互输出，也不认白名单。
     """
 
-    def __init__(self, port: str, baud: int = XMT_BAUD, addr: int = XMT_ADDRESS) -> None:
+    def __init__(
+        self, port: str, baud: int = XMT_BAUD, addr: int = XMT_ADDRESS, ser: Any = None
+    ) -> None:
         self.port = port
-        self.ser = serial.Serial(port, baud, timeout=0)
+        # ser 只在离线测试里注入（假串口）；正常路径自己开真串口
+        self.ser = ser if ser is not None else serial.Serial(port, baud, timeout=0)
         self.parser = xp.Parser()
         self.addr = addr
         self.baud = baud

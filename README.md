@@ -40,10 +40,10 @@
 
     Windows 把 .venv/bin/python 换成 .venv\Scripts\python.exe
 
-上面三个都不依赖测试框架，直接跑。另有 5 个离线单测（不碰硬件，也不依赖测试框架，逐个直接跑）：
+上面三个都不依赖测试框架，直接跑。另有 6 个离线单测（不碰硬件，也不依赖测试框架，逐个直接跑）：
 `backend/tests/test_xmt_protocol.py` 协议编解码、`test_stage_api.py` 设备层契约、
 `test_store_migration.py` 库结构迁移、`test_xmt_check_safety.py` 自检脚本护栏、
-`test_xmt_stage.py` XMT 设备层（假串口）。`hwtest.py` 覆盖连接/点到点/中途停止/急停/释放；
+`test_xmt_stage.py` XMT 设备层（假串口）、`test_xmt_link.py` 帧收发与帧间隔（假串口）。`hwtest.py` 覆盖连接/点到点/中途停止/急停/释放；
 `apitest.py` 覆盖伺服、手动、扫描、暂停继续中止、停止中止扫描、急停收尾共 10 组；
 `uitest.js` 用假 DOM 把 `app.js` 真跑起来，覆盖点位载入状态机、乱序保护与按钮可用性
 （覆盖边界写在它的文件头，别当整页渲染回归用）。
