@@ -11,16 +11,19 @@ HTTP 处理函数本身不碰设备。
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from pathlib import Path
+from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import store
@@ -29,10 +32,14 @@ from .config import (
     DATA_DIR,
     HEARTBEAT_TIMEOUT_S,
     HOST,
+    IMAGE_DIR,
     PORT,
     STATIC_DIR,
     TELEMETRY_HZ,
     TELEMETRY_HZ_SCAN,
+    TRACE_BUFFER_S,
+    TRACE_MAX_S,
+    TRACE_MIN_S,
 )
 from .models import (
     JogRequest,
@@ -44,6 +51,7 @@ from .models import (
 )
 from .scanner import ScanError, Scanner
 from .stage_api import StageError, StageNotConnected, StageProto, create_stage
+from .trace import TraceBuffer
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +77,7 @@ class Telemetry:
         self._hz_scan = hz_scan
         self._lock = threading.Lock()
         self._latest: dict = {"stage": None, "scan": scanner_.state(), "ts": 0.0}
+        self._trace = TraceBuffer(TRACE_BUFFER_S)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="telemetry", daemon=True)
 
@@ -82,35 +91,49 @@ class Telemetry:
         with self._lock:
             return dict(self._latest)
 
+    def trace(self, from_ts: float, to_ts: float) -> list:
+        """位置曲线的一段窗口。**只读内存，不碰设备** —— 曲线与界面读数同源。"""
+        with self._lock:
+            return self._trace.window(from_ts, to_ts)
+
     def period(self) -> float:
         """当前推送间隔。扫描进行中降频，把设备带宽让给扫描。"""
         running = self._scanner.state()["status"] == "running"
         return 1.0 / (self._hz_scan if running else self._hz)
 
     def _loop(self) -> None:
-        degraded = False
+        fresh = True
         while not self._stop.is_set():
             t0 = time.monotonic()
             scan = self._scanner.state()
             try:
                 st = self._stage.poll().as_dict()
-                degraded = False
             except Exception as exc:
                 # 这里必须吞掉一切：轮询线程死了，界面会永远停在过期数据上，
                 # 看起来还在动，实际已经瞎了。
                 st = self._stage.status().as_dict()
                 st["error"] = str(exc)
-                if not degraded:
+                if fresh:
                     log.warning("遥测读取失败：%s", exc, exc_info=True)
-                    degraded = True
+                fresh = False
+            else:
+                fresh = True
+            now = time.time()
             payload = {
                 "stage": st,
                 "scan": scan,
                 "caps": CAPS_DICT,
-                "frontend_online": time.time() - _last_heartbeat < HEARTBEAT_TIMEOUT_S,
-                "ts": time.time(),
+                "frontend_online": now - _last_heartbeat < HEARTBEAT_TIMEOUT_S,
+                "ts": now,
             }
             with self._lock:
+                # 写样本必须和换最新帧在同一把锁里：trace() 是持这把锁迭代那个 deque 的
+                # （TraceBuffer.window 用 for 迭代），边迭代边 append/popleft 会抛
+                # RuntimeError: deque mutated during iteration —— 实测约 0.01%/次读，
+                # 表现为"记录曲线记到一半就 500"。
+                # 读失败或没连上时 status() 里是上一次的残留位置，记进曲线会把方差压低。
+                if fresh and st["connected"]:
+                    self._trace.add(now, st["position"], st["target"])
                 self._latest = payload
             self._stop.wait(max(0.0, self.period() - (time.monotonic() - t0)))
 
@@ -137,6 +160,12 @@ async def lifespan(_: FastAPI):
     finally:
         telemetry.stop()
         scanner.abort()
+        # 相机要在进程退出前显式放开：SDK 进程内只开一次、只关一次（见 thorlabs_ccd.py）。
+        # 没启用真相机时 _thorlabs 是 None，什么都不做。
+        from . import ccd as ccd_mod
+
+        if ccd_mod._thorlabs is not None:
+            ccd_mod._thorlabs.close()
         stage.shutdown()
 
 
@@ -207,6 +236,317 @@ def api_connect() -> dict:
     if not stage.status().connected:
         stage.start()
     return stage.poll().as_dict()
+
+
+# ------------------------------------------------------------------ 位置曲线
+# ------------------------------------------------------------------ 相机
+@app.get("/api/ccd/status")
+def ccd_status() -> dict:
+    """相机状态。没启用真相机时如实说，前端据此决定要不要显示预览。"""
+    from .ccd import CCD_BACKEND
+
+    if CCD_BACKEND != "thorlabs":
+        return {"backend": CCD_BACKEND, "preview": False, "available": False,
+                "message": f"CCD 后端是 {CCD_BACKEND}，没有真相机"}
+    from .ccd import thorlabs_camera
+
+    st = thorlabs_camera().status()
+    st["backend"] = CCD_BACKEND
+    st["available"] = True
+    return st
+
+
+def _ccd_idle() -> None:
+    """相机与位移台同一条规矩：扫描占着设备时，预览一律拒。"""
+    if scanner.state()["status"] in ("running", "paused"):
+        raise HTTPException(409, "扫描进行中，相机归扫描用；先暂停或中止再看预览")
+
+
+@app.post("/api/ccd/preview")
+async def ccd_preview(on: bool = Query(True)) -> dict:
+    """开/关连续预览。开的时候要打开相机，慢，所以丢到线程里。"""
+    _ccd_idle()
+    from .config import CCD_BACKEND
+
+    if CCD_BACKEND != "thorlabs":
+        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
+    from .ccd import thorlabs_camera
+
+    camera = thorlabs_camera()
+    try:
+        return await asyncio.to_thread(camera.preview, on)
+    except Exception as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+def _safe_image_path(path: str) -> Path:
+    """把请求里的相对路径夹在 data/ 里，并且必须真实存在。"""
+    root = DATA_DIR.resolve()
+    src = (root / path).resolve()
+    if not src.is_relative_to(root) or not src.exists():
+        raise HTTPException(404, "图像不存在")
+    return src
+
+
+@app.get("/api/grabs")
+def list_grabs(limit: int = Query(60, ge=1, le=500)) -> dict:
+    """**只列手动保存的采集帧**（「保存原生帧」存下的那些，按库里的登记表）。
+
+    扫描各点的图**不混进来** —— 它们属于各自的扫描，在「扫描」页的点位表里看，
+    一堆自动图会把手动存的那些淹掉。
+    """
+    # **以库里的登记为准**，不是"扫目录里叫 grab_* 的文件"：
+    # 登记只发生在手动保存那一条路上（save_raw），所以扫描采的图（哪怕改了名、
+    # 或者 index 号排到很大）都不会漏进来。
+    from .thorlabs_ccd import read_png_exposure
+
+    items = []
+    for row in store.list_grabs():
+        f = IMAGE_DIR / row["filename"]
+        if not f.exists():          # 文件被手工删了就跳过，免得点开 404
+            continue
+        items.append({
+            "name": f.name, "path": f"images/{f.name}",
+            "label": row["label"], "note": row["note"],
+            # 曝光从 PNG 自己的 tEXt 里读（不存库，文件自证）；老图没有就 None
+            "exposure_us": read_png_exposure(f),
+            "bytes": f.stat().st_size, "mtime": f.stat().st_mtime,
+        })
+    items.sort(key=lambda it: it["mtime"], reverse=True)
+    return {"total": len(items), "items": items[:limit]}
+
+
+def _clean_text(value: str, limit: int) -> str:
+    """去掉控制字符（含换行/制表）再截断。
+
+    换行不清掉的话，名字里贴一坨多行文本会把图库网格撑变形；
+    控制字符还可能被当成终端转义序列。
+    """
+    return "".join(ch for ch in value if ch >= " " and ch != "\x7f").strip()[:limit]
+
+
+def _grab_file(name: str) -> str:
+    """校验请求里的文件名：只能是文件名（不是路径），而且必须真实存在。"""
+    if Path(name).name != name:
+        raise HTTPException(400, "只接受文件名，不接受路径")
+    if not (IMAGE_DIR / name).exists():
+        raise HTTPException(404, "没有这一帧")
+    return name
+
+
+# Windows 文件名非法字符（反斜杠 / 斜杠 / 冒号 / 星号 / 问号 / 引号 / 尖括号 / 竖线）+ 控制字符
+_BAD_IN_NAME = set('\\/:*?"<>|')
+# Windows 保留设备名：CON.png 这种在 Windows 上建不出来（会被当成设备）
+_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+             *(f"LPT{i}" for i in range(1, 10))}
+
+
+def _safe_grab_name(raw: str, old: str) -> str:
+    """把用户输入整成一个安全的、带 .png 的**文件名**。
+
+    安全边界，别删：名字直接来自 HTTP 请求，而且要拿去在磁盘上创建文件 ——
+    路径分隔符、上跳、保留设备名、首尾点号全部挡掉。
+    """
+    base = _clean_text(raw, 80).strip().rstrip(". ")
+    if not base:
+        raise HTTPException(400, "新名字不能为空")
+    if any(ch in _BAD_IN_NAME for ch in base):
+        raise HTTPException(400, "名字里不能有 反斜杠 斜杠 冒号 星号 问号 引号 尖括号 竖线")
+    if not base.lower().endswith(".png"):
+        base += ".png"      # 内容仍是 16 位 PNG；用户写了 .tif 也保留那个后缀，不假装换格式
+    stem = base[:-4]
+    if stem.upper() in _RESERVED:
+        raise HTTPException(400, f"{stem} 是 Windows 保留名，换一个")
+    if base == old:
+        raise HTTPException(400, "新名字和现在一样")
+    if (IMAGE_DIR / base).exists():
+        raise HTTPException(409, f"{base} 已存在，换一个名字")
+    return base
+
+
+@app.post("/api/grabs/rename")
+def rename_grab(
+    name: str = Query(..., description="当前文件名，例如 grab_20260920_153222.png"),
+    new_name: str = Query("", alias="new_name", description="新名字（不带后缀会自动补 .png）"),
+) -> dict:
+    """**真正改文件名**：磁盘上 rename + 更新库里的记录，两件事一起做。
+
+    为什么必须一起做：图库按库里的记录列文件，只改文件不改库（或反过来）就会出现
+    "库里有记录、点开是 404"，或者"文件还在、列表里却没了"。
+    磁盘先动：失败就直接报错，不留半成品；库改失败则把文件改回去。
+    """
+    _grab_file(name)
+    new = _safe_grab_name(new_name, name)
+    src, dst = IMAGE_DIR / name, IMAGE_DIR / new
+    src.rename(dst)
+    try:
+        store.rename_grab(name, new)
+    except Exception:
+        dst.rename(src)
+        raise HTTPException(500, "改库失败，文件名已回滚") from None
+    for cache in (DATA_DIR / "thumbs").glob(f"{Path(name).stem}_*.jpg"):
+        cache.unlink(missing_ok=True)      # 缩略图缓存按文件名做键，旧的清掉
+    log.info("原始帧改名：%s → %s", name, new)
+    return {"ok": True, "name": new, "old": name}
+
+
+@app.post("/api/grabs/note")
+def note_grab(
+    name: str = Query(..., description="文件名"),
+    note: str = Query("", description="备注：实验条件、现象…；空串 = 清空"),
+) -> dict:
+    """给一帧写备注（曝光/增益/样品/光源这类实验条件）。同样只写库，不动文件。"""
+    _grab_file(name)
+    clean = _clean_text(note, 500)
+    store.set_grab_note(name, clean)
+    return {"ok": True, "name": name, "note": clean}
+
+
+@app.post("/api/grabs/purge")
+def purge_grabs(keep: int = Query(0, ge=0, description="只保留最近 N 张，其余全删；0 = 全删")) -> dict:
+    """批量清理手动保存的原始帧：**只保留最近 N 张**。
+
+    用途是收尾（比如一轮调试留下的十几张"能跑通"的帧，没必要留着）。
+    同样文件+记录+缩略图缓存一起删。
+    """
+    keep_set = {it["name"] for it in list_grabs(limit=500)["items"][:keep]}
+    removed = []
+    for row in store.list_grabs():
+        name = row["filename"]
+        if name in keep_set:
+            continue
+        (IMAGE_DIR / name).unlink(missing_ok=True)
+        for cache in (DATA_DIR / "thumbs").glob(f"{Path(name).stem}_*.jpg"):
+            cache.unlink(missing_ok=True)
+        removed.append(name)
+    store.delete_grabs(removed)
+    return {"ok": True, "removed": len(removed), "kept": sorted(keep_set)}
+
+
+@app.delete("/api/grabs/{name}")
+def delete_grab(name: str) -> dict:
+    """删掉一帧：文件和库里的记录一起删。"""
+    _grab_file(name)
+    src = IMAGE_DIR / name
+    if src.exists():
+        src.unlink()
+    for cache in (DATA_DIR / "thumbs").glob(f"{Path(name).stem}_*.jpg"):
+        cache.unlink(missing_ok=True)
+    store.delete_grab(name)
+    return {"ok": True}
+
+
+@app.get("/api/grabs/thumb")
+def grab_thumb(
+    path: str = Query(..., description="相对 data/ 的路径"),
+    max_side: int = Query(260, ge=64, le=2000, description="长边像素"),
+) -> Response:
+    """缩略图：走缓存（data/thumbs/），列表里几十张也打得开；弹窗里要更大就调 max_side。"""
+    from .thorlabs_ccd import thumb_jpeg
+
+    src = _safe_image_path(path)
+    return Response(content=thumb_jpeg(src, max_side), media_type="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.post("/api/ccd/exposure")
+async def ccd_exposure(
+    exposure_us: int = Query(..., gt=0, le=270_000_000, description="曝光（µs），预览与采图共用"),
+) -> dict:
+    """改曝光（**预览与采图一起改**），立刻生效。范围由相机层按设备自报值校验（安全边界）。
+
+    设完之后采的每一帧，元数据与 PNG 自带的 tEXt 里记的都是相机读回的实际曝光。
+    """
+    _ccd_idle()
+    from .config import CCD_BACKEND
+
+    if CCD_BACKEND != "thorlabs":
+        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
+    from .ccd import thorlabs_camera
+
+    try:
+        return await asyncio.to_thread(thorlabs_camera().set_exposure, exposure_us)
+    except Exception as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/api/ccd/gain")
+def ccd_gain_locked(gain: int = Query(0, description="已固定为 0")) -> dict:
+    """增益固定 0，不给改。"""
+    raise HTTPException(
+        400,
+        "增益固定为 0：它把信号和噪声一起放大，信噪比不会变好；亮度只用曝光调。",
+    )
+
+
+@app.post("/api/ccd/capture")
+async def ccd_capture() -> dict:
+    """采一帧原生全幅存盘（不裁剪）。走扫描采图同一段代码，但不属于任何扫描。
+
+    **登记放在这一层**：相机层在 store 之下，不许反向依赖它（见 AGENTS.md 分层）。
+    图库按登记表列，"存了盘"和"进图库"是两件事 —— 后者只有手动保存才有，
+    扫描各点的图归 point.image_path。
+    """
+    _ccd_idle()
+    from .config import CCD_BACKEND
+
+    if CCD_BACKEND != "thorlabs":
+        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
+    from .ccd import thorlabs_camera
+
+    try:
+        info = await asyncio.to_thread(thorlabs_camera().save_raw)
+    except Exception as exc:
+        raise HTTPException(503, str(exc)) from exc
+    store.register_grab(Path(info["path"]).name)
+    return info
+
+
+@app.get("/api/ccd/preview.jpg")
+def ccd_preview_jpg() -> Response:
+    """最近一帧预览。不排队等设备：没帧就 204，前端继续按自己的节奏拉。"""
+    from .ccd import thorlabs_camera
+
+    jpeg = thorlabs_camera().latest_jpeg()
+    if jpeg is None:
+        return Response(status_code=204)
+    return Response(
+        content=jpeg, media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/trace")
+def api_trace(
+    from_ts: Optional[float] = Query(None, alias="from"),
+    to_ts: Optional[float] = Query(None, alias="to"),
+    seconds: float = 10.0,
+) -> dict:
+    """遥测环形缓冲里的一段位置：界面用它画曲线、算标准差。
+
+    **只读内存，不查设备** —— 多一个轮询者就是从扫描和遥测手里抢设备带宽。
+    时刻是服务器墙钟（time.time()），与 SSE 每帧的 ts 同一把尺子：
+    前端把上一帧的 ts 当 from，正好落在样本边界上，不会漏一个点。
+    from 给了就按它，没给就取 to 之前的 seconds 秒；两端都是闭区间。
+
+    长度只管在最终解出来的窗口上判一次 —— 两条入口（seconds / from+to）走同一条规则，
+    前端填了荒唐的时长也是在这里被拒，不用它在界面上自己判。
+    """
+    now = time.time()
+    to = to_ts if to_ts is not None else now
+    frm = from_ts if from_ts is not None else to - seconds
+    span = to - frm
+    if not TRACE_MIN_S <= span <= TRACE_MAX_S:
+        raise HTTPException(422, f"窗口长度要在 {TRACE_MIN_S:g}~{TRACE_MAX_S:g} 秒之间")
+    items = telemetry.trace(frm, to)
+    return {
+        "from": frm,
+        "to": to,
+        "now": now,
+        "ts": [it[0] for it in items],
+        "position": [it[1] for it in items],
+        "target": [it[2] for it in items],
+    }
 
 
 # ------------------------------------------------------------------ 手动
@@ -282,7 +622,22 @@ def api_estop() -> dict:
 
 # ------------------------------------------------------------------ 扫描
 @app.post("/api/scans")
-def api_scan_start(req: ScanRequest) -> dict:
+async def api_scan_start(req: ScanRequest) -> dict:
+    """开始扫描前**由后端自己**把相机预览关掉。
+
+    互斥是后端的规定，不能靠界面先点一下"停预览"：界面可能根本不知道后端还在取帧
+    （刷新过、或另一个标签页开过预览），那样扫描就会和预览抢同一台相机。
+    关预览和之后的采图都排进相机自己的 owner 线程，顺序天然有保证。
+    """
+    from .config import CCD_BACKEND
+
+    if CCD_BACKEND == "thorlabs":
+        from .ccd import thorlabs_camera
+
+        try:
+            await asyncio.to_thread(thorlabs_camera().preview, False)
+        except Exception as exc:
+            log.warning("开始扫描前关预览失败（不影响扫描）：%s", exc)
     return scanner.start(req)
 
 

@@ -49,6 +49,30 @@ def main() -> int:
     print(f"    位移台 {stage['stage_type']} 行程 {stage['travel_min']}–{stage['travel_max']} µm"
           f" 位置 {stage['position']:.4f} 伺服 {stage['servo']}")
 
+    print("\n[0] 位置曲线（只读内存，不驱动台子）")
+    code, tr = call("GET", "/api/trace?seconds=3")
+    check("GET /api/trace", code == 200, f"HTTP {code}")
+    n_pts = len(tr.get("ts", []))
+    check("3 秒窗口里有样本（遥测 10 Hz）", n_pts >= 15, f"{n_pts} 点")
+    check("样本全落在窗口内",
+          all(tr["from"] <= t <= tr["to"] for t in tr["ts"]),
+          f"[{tr['from']:.3f}, {tr['to']:.3f}]")
+    check("位置与状态读数同源",
+          abs(tr["position"][-1] - stage["position"]) < 0.2,
+          f"{tr['position'][-1]:.4f} vs {stage['position']:.4f}")
+    # 前端就是拿 SSE 那帧的 ts 当锚点的：锚点必须正好落在样本上，
+    # 否则每次记录的开头都会缺一格
+    code, tr2 = call("GET", f"/api/trace?from={tr['ts'][0]}&to={tr['ts'][0] + 2}")
+    check("锚点落在样本边界上", bool(tr2.get("ts")) and tr2["ts"][0] == tr["ts"][0],
+          f"{tr2['ts'][0] if tr2.get('ts') else None} vs {tr['ts'][0]}")
+    tail = tr["ts"][-1]
+    time.sleep(1.2)
+    code, tr3 = call("GET", "/api/trace?seconds=3")
+    check("缓冲自己一直在攒（不靠界面来取数）", tr3["ts"][-1] > tail,
+          f"{tail:.3f} -> {tr3['ts'][-1]:.3f}")
+    code, body = call("GET", "/api/trace?seconds=0.5")
+    check("荒唐的窗口被拒（校验在后端）", code == 422, f"HTTP {code} {body.get('detail', '')}")
+
     print("\n[1] 伺服关着时应该拒绝运动")
     call("POST", "/api/servo", {"on": False})
     code, body = call("POST", "/api/move", {"target_um": 5.0})

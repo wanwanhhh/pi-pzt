@@ -6,7 +6,10 @@
  * 也可以喂别的文件，用来验证测试本身是否敏感：node tools/uitest.js 某个变体.js
  *
  * ---- 覆盖范围（别把它当整页回归）----
- * 覆盖：A-F 点位载入状态机；G 乱序返回保护；H renderStage 的按钮可用性、表单播种、状态文案。
+ * 覆盖：A-F 点位载入状态机；G 乱序返回保护；H renderStage 的按钮可用性、表单播种、状态文案；
+ *       I 历史列表转义；J caps 文案；K 位置曲线的窗口两端、统计口径、坐标范围钉住；
+ *       L 界面不许编数、状态可见性；M 两页视图的切换与重新量宽。
+ *       （相机预览那块只有"加载 app.js 不炸"这一层被覆盖，预览时序未测。）
  * 不覆盖：CSS 与布局、uPlot 的实际绘制、真实 SSE 时序与 EventSource 重连、拖拽与键盘交互。
  *         uPlot 对 setData([[],[]]) 的处理是静态阅读 vendor bundle 得出的结论，未在浏览器实跑。
  *         DOM 只模拟到"表格里有几行、每行 HTML 是什么"，不模拟样式与事件冒泡。
@@ -98,13 +101,21 @@ function fetchImpl(url, opts) {
 /* ---------- 其它桩 ---------- */
 function EventSource(url) { this.url = url; }
 function ResizeObserver() { this.observe = () => {}; }
-function uPlot(opts, data) { this.opts = opts; this.series = opts.series; this.data = data; }
+function uPlot(opts, data) {
+  this.opts = opts; this.series = opts.series; this.data = data;
+  this.scales = {};   // setScale 套用过的范围（真 uPlot 里是 u.scales[key].min/max）
+}
 uPlot.prototype.setData = function (d) { this.data = d; };
-uPlot.prototype.setSize = function () {};
+uPlot.prototype.setSize = function (s) { this.size = s; };   // 记下来：切页必须重新量宽
+uPlot.prototype.setScale = function (k, limits) { this.scales[k] = { min: limits.min, max: limits.max }; };
 
+/* window / performance 也要有：app.js 会在 window 上挂 beforeunload（关页面停预览），
+   预览帧率用 performance.now() 算。假 DOM 里它们不存在会在加载 app.js 那一下就 ReferenceError。 */
+const winStub = { addEventListener() {}, removeEventListener() {} };
 const sandbox = {
-  document: doc, fetch: fetchImpl, EventSource, ResizeObserver, uPlot,
-  setInterval: () => 0, setTimeout, clearTimeout, confirm: () => true, console,
+  document: doc, window: winStub, location: { hash: '' }, fetch: fetchImpl,
+  EventSource, ResizeObserver, uPlot, performance: { now: () => Date.now() },
+  setInterval: () => 0, clearInterval: () => {}, setTimeout, clearTimeout, confirm: () => true, console,
 };
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox);
@@ -342,6 +353,217 @@ const count = (m) => calls.filter((c) => c === m).length;
   ok('释放按钮说明写"回弹"', read("$('btn-release').title").indexOf('回弹') >= 0);
   ok('状态灯说"伺服保持"', read("$('pill-servo').textContent") === '伺服保持',
      JSON.stringify(read("$('pill-servo').textContent")));
+
+  console.log('\n[K] 位置曲线：窗口两端、统计口径、坐标范围');
+  // 一段已知数据：位置 20.0000 / .0010 / .0020 / .0030 µm，间隔 0.25 s
+  const POS = [20.0000, 20.0010, 20.0020, 20.0030];
+  const traceWin = (from, pos, tgt) => ({
+    from: from, to: from + 10, now: from + 10,
+    ts: pos.map((p, i) => from + i * 0.25),
+    position: pos,
+    target: (tgt || pos.map(() => 20)),
+  });
+  const traceRoute = (from, pos, tgt) => (m, u) => u.indexOf('/api/trace') === 0
+    ? { body: traceWin(from, pos, tgt) } : { body: [] };
+
+  run('traceActive = false; traceTimer = null; tracePinned = false; traceLast = null;');
+  ok('初始状态是"未记录"', read("$('trace-title').textContent") === '未记录',
+     JSON.stringify(read("$('trace-title').textContent")));
+  ok('初始统计是空的', read("$('tr-n').textContent") === '—' && read("$('tr-std').textContent") === '—');
+
+  route = traceRoute(1000, POS);
+  calls.length = 0;
+  run('lastServerTs = 1000; traceUntil = Date.now() + 1e6;');
+  run("$('trace-secs').value = '10'; traceStart()");
+  await tick(); await tick();
+
+  ok('记录中按钮变"停止记录"', read("$('btn-trace').textContent") === '停止记录',
+     JSON.stringify(read("$('btn-trace').textContent")));
+  ok('记录中锁住时长输入', read("$('trace-secs').disabled") === true);
+  ok('记录中报实采点数（不承诺采样率）',
+     read("$('trace-title').textContent").indexOf('已取') > 0,
+     JSON.stringify(read("$('trace-title').textContent")));
+  ok('请求两端都是绝对时刻', count('GET /api/trace?from=1000&to=1010') >= 1, calls.join(' | '));
+  ok('X 轴零点 = 服务器锚点（不是本地墙钟）', read('traceChart.data[0][1]') === 0.25,
+     String(read('traceChart.data[0][1]')));
+  ok('点数', read("$('tr-n').textContent") === '4', read("$('tr-n').textContent"));
+  ok('跨度', read("$('tr-span').textContent") === '0.75', read("$('tr-span').textContent"));
+  ok('平均间隔 250 ms', read("$('tr-dt').textContent") === '250', read("$('tr-dt').textContent"));
+  ok('均值', read("$('tr-mean').textContent") === '20.00150', read("$('tr-mean').textContent"));
+  ok('标准差按样本口径（除以 n−1）= 1.29 nm', read("$('tr-std').textContent") === '1.3',
+     read("$('tr-std').textContent"));
+  ok('峰峰值 3 nm', read("$('tr-pp').textContent") === '3', read("$('tr-pp').textContent"));
+  ok('目标没动过就显示目标值', read("$('tr-target').textContent") === '20.0000',
+     read("$('tr-target').textContent"));
+  ok('自动铺满：X 是 0~实际跨度', read('JSON.stringify(traceChart.scales.x)') === '{"min":0,"max":0.75}',
+     read('JSON.stringify(traceChart.scales.x)'));
+  // 这条抓的是真机上真会炸的地方：uPlot 绘制时把 points.show 当函数调，
+  // 事后改成布尔 → 下一帧抛 "points.show is not a function"，整张图从此不再重绘
+  ok('points.show 是函数（uPlot 会当函数调）',
+     read('typeof traceChart.series[1].points.show') === 'function',
+     read('typeof traceChart.series[1].points.show'));
+  ok('自动铺满：Y 罩住数据且留了余量',
+     read('traceChart.scales.y.min < 20 && traceChart.scales.y.max > 20.003'), read('JSON.stringify(traceChart.scales.y)'));
+
+  run("$('trace-ymin').value = '19.9'; $('trace-ymax').value = '20.1'; tracePinned = true; applyTraceRange();");
+  ok('手填的范围被套用', read('JSON.stringify(traceChart.scales.y)') === '{"min":19.9,"max":20.1}',
+     read('JSON.stringify(traceChart.scales.y)'));
+  run('renderTrace()');
+  ok('再取一帧也不会被自动铺满顶掉（两段记录好对比）',
+     read('JSON.stringify(traceChart.scales.y)') === '{"min":19.9,"max":20.1}',
+     read('JSON.stringify(traceChart.scales.y)'));
+  run("$('trace-xmin').value = '5'; $('trace-xmax').value = '1'; applyTraceRange();");
+  ok('范围填反了就不套用（画出来是空图）', read('JSON.stringify(traceChart.scales.x)') === '{"min":0,"max":0.75}',
+     read('JSON.stringify(traceChart.scales.x)'));
+  run("$('btn-trace-fit').onclick()");
+  ok('点「自动范围」恢复铺满', read('traceChart.scales.y.min < 20 && traceChart.scales.y.max > 20.003'),
+     read('JSON.stringify(traceChart.scales.y)'));
+
+  const before = count('GET /api/trace?from=1000&to=1010');
+  run('traceUntil = 0;');                     // 让"到点收工"立刻成立
+  await run('traceTick()'); await tick(); await tick();
+  ok('到点自动收工', read('traceActive') === false);
+  ok('到点那一帧取的就是完整窗口，不再重复取一次',
+     count('GET /api/trace?from=1000&to=1010') === before + 1,
+     before + ' -> ' + count('GET /api/trace?from=1000&to=1010'));
+  ok('收工后按钮复原', read("$('btn-trace').textContent") === '记录 10 秒',
+     JSON.stringify(read("$('btn-trace').textContent")));
+  ok('收工后时长输入解锁', read("$('trace-secs').disabled") === false);
+  ok('标题报出实际录到的一段', read("$('trace-title').textContent").indexOf('4 点') > 0,
+     JSON.stringify(read("$('trace-title').textContent")));
+
+  // 提前停：窗口里目标动过，标准差没有意义，界面得说实话
+  route = traceRoute(2000, [20, 21], [20, 21]);
+  run('traceUntil = Date.now() + 1e6; lastServerTs = 2000;');
+  run("$('trace-secs').value = '10'; traceStart()");
+  await tick(); await tick();
+  ok('窗口内目标动过就不给一个数', read("$('tr-target').textContent") === '窗口内有移动',
+     read("$('tr-target').textContent"));
+  await run("$('btn-trace').onclick()"); await tick(); await tick();
+  ok('可以提前停', read('traceActive') === false);
+  ok('提前停也会补取最后一段', calls[calls.length - 1] === 'GET /api/trace?from=2000&to=2010',
+     calls[calls.length - 1]);
+
+  // 还没收到遥测帧时：锚点必须问服务器要
+  route = (m, u) => u === '/api/trace?seconds=10'
+    ? { body: { from: 3000, to: 3010, now: 3000, ts: [], position: [], target: [] } }
+    : { body: { from: 3000, to: 3010, now: 3000, ts: [3000, 3000.25], position: [20, 20.001], target: [20, 20] } };
+  calls.length = 0;
+  run('traceActive = false; traceTimer = null; lastServerTs = null; traceUntil = Date.now() + 1e6;');
+  run("$('trace-secs').value = '10'; traceStart()");
+  await tick(); await tick();
+  ok('没有遥测帧时先探服务器时间', calls.indexOf('GET /api/trace?seconds=10') === 0, calls.join(' | '));
+  ok('锚点用服务器时间，不用本地墙钟', read('traceFrom') === 3000, String(read('traceFrom')));
+  ok('之后按锚点取窗口', calls.indexOf('GET /api/trace?from=3000&to=3010') > 0, calls.join(' | '));
+  await run('traceStop(true)'); await tick();
+  ok('停得住', read('traceActive') === false && read('traceTimer') === null);
+
+  // 后端拒绝（比如填了 600 秒）：提示一次就收工，别每 200 ms 弹一次，也别把已有曲线清掉
+  route = (m, u) => u.indexOf('/api/trace') === 0
+    ? { ok: false, status: 422, body: { detail: '窗口长度要在 1~60 秒之间' } } : { body: [] };
+  run('traceActive = true; traceTimer = 0; traceUntil = Date.now() + 1e6; traceLast = { ts: [1, 1.25], position: [20, 20.001], target: [20, 20] };');
+  await run('traceTick()'); await tick();
+  ok('取数被拒就收工（不刷屏）', read('traceActive') === false && read('traceTimer') === null);
+  ok('已有曲线不被清掉', read('traceLast.ts.length') === 2, String(read('traceLast.ts.length')));
+  ok('提示语用后端的原话', read("$('toast').textContent").indexOf('窗口长度') >= 0,
+     JSON.stringify(read("$('toast').textContent")));
+
+  // 点位曲线同一处：老代码在第二次渲染时把它改成了布尔，整张图会冻住
+  run('renderChart([{ idx: 0, target_um: 1, actual_um: 1.01 }, { idx: 1, target_um: 2, actual_um: 2.01 }])');
+  run('renderChart([{ idx: 0, target_um: 3, actual_um: 3.01 }, { idx: 1, target_um: 4, actual_um: 4.01 }])');
+  ok('点位曲线第二次渲染后 points.show 仍是函数',
+     read('typeof chart.series[1].points.show') === 'function',
+     read('typeof chart.series[1].points.show'));
+
+  console.log('\n[L] 界面不许编数、状态要看得见');
+  // XMT 没有速度指令：st.velocity 恒为 0，读数和输入框都不能出现这个编出来的 0
+  run('stageCaps = null;');
+  driveCaps(capsXMT);
+  driveStage({ connected: true, servo: true });
+  ok('无速度指令的设备：读数写"无此指令"', read("$('velocity').textContent") === '无此指令',
+     JSON.stringify(read("$('velocity').textContent")));
+  ok('无速度指令的设备：输入框清空并给占位',
+     read("$('vel').value") === '' && read("$('vel').placeholder") === '本设备无速度指令',
+     JSON.stringify([read("$('vel').value"), read("$('vel').placeholder")]));
+  run('seeded = false;');
+  driveStage({ connected: true, servo: true });
+  ok('播种也不会把 0 写进速度框', read("$('vel').value") === '',
+     JSON.stringify(read("$('vel').value")));
+  driveCaps(capsPI);
+  driveStage({ connected: true, servo: true });
+  ok('有速度指令的设备：读数照常显示', read("$('velocity').textContent") === '100',
+     JSON.stringify(read("$('velocity').textContent")));
+
+  // 曲线是冻住的一段：目标被改过要说明白（精确比目标，不用噪声阈值）
+  run('scanActive = false;');
+  driveStage({ connected: true, servo: true, target: 25.0 });
+  ok('目标改过就提示曲线是旧的',
+     read("$('trace-flag').hidden") === false
+     && read("$('trace-flag').textContent").indexOf('目标已改') === 0,
+     JSON.stringify(read("$('trace-flag').textContent")));
+  driveStage({ connected: true, servo: true, target: 20.0 });
+  ok('目标没改就不提示（噪声不算移动）', read("$('trace-flag').hidden") === true);
+  run('scanActive = true;');
+  driveStage({ connected: true, servo: true, target: 20.0 });
+  ok('扫描中直接说台子在动', read("$('trace-flag').textContent").indexOf('扫描进行中') === 0,
+     JSON.stringify(read("$('trace-flag').textContent")));
+  run('scanActive = false;');
+
+  // 钉住是个状态，得看得见；没数据时不留空图框
+  // 钉住是个状态，得看得见；空态也别留一块空图框
+  run('traceActive = false; traceTimer = null;');
+  // 先把空态推到「有数据」再推回「没数据」：只断言最终值的话，
+  // 「根本没同步过」（初值恰好等于期望值）会蒙混过关 —— 变异测试抓的就是这个
+  run('traceLast = { ts: [1, 2], position: [20, 20.001], target: [20, 20] }; tracePinned = false; syncTraceUI();');
+  ok('有数据时空态提示收起来', read("$('trace-empty').hidden") === true,
+     String(read("$('trace-empty').hidden")));
+  ok('没钉住时不显示钉住标记', read("$('trace-pin').hidden") === true);
+  run("$('trace-xmin').value = '1'; $('trace-xmin').oninput();");
+  ok('手填范围后钉住标记出现', read("$('trace-pin').hidden") === false);
+  run("$('btn-trace-fit').onclick()");
+  ok('点「自动范围」后钉住标记消失', read("$('trace-pin').hidden") === true);
+  run('traceLast = null; syncTraceUI();');
+  ok('没数据时空态提示可见', read("$('trace-empty').hidden") === false);
+
+  console.log('\n[M] 视图：三页分开，但拒绝永远在后端');
+  run("location.hash = ''; showView('');");
+  ok('没给视图名就落回「对准」', read('view') === 'align');
+  ok('对准页可见、扫描页与预览页藏起来',
+     read("$('view-align').hidden") === false && read("$('view-scan').hidden") === true &&
+     read("$('view-ccd').hidden") === true);
+  ok('对准页的标签高亮',
+     read("$('tab-align').className") === 'tab active' && read("$('tab-scan').className") === 'tab' &&
+     read("$('tab-ccd').className") === 'tab');
+
+  run("showView('scan')");
+  ok('切到扫描页：两页对调',
+     read("$('view-align').hidden") === true && read("$('view-scan').hidden") === false);
+  ok('扫描页的标签高亮', read("$('tab-scan').className") === 'tab active');
+  ok('视图写进 hash（刷新、双标签各停一页都靠它）', read('location.hash') === 'scan',
+     JSON.stringify(read('location.hash')));
+
+  run("showView('ccd')");
+  ok('切到预览页：只有预览页可见',
+     read("$('view-ccd').hidden") === false && read("$('view-align').hidden") === true &&
+     read("$('view-scan').hidden") === true);
+  ok('预览页的标签高亮', read("$('tab-ccd').className") === 'tab active');
+  ok('预览页也写 hash', read('location.hash') === 'ccd', JSON.stringify(read('location.hash')));
+
+  run("showView('瞎写的')");
+  ok('非法视图名落回「对准」', read('view') === 'align' && read("$('view-align').hidden") === false);
+
+  // 藏起来的容器宽度是 0：切回来不重新量宽，图就是压扁的
+  run('showView("scan")');
+  ok('切到扫描页会重新量点位图的宽度', read('chart.size && chart.size.width') === 600,
+     JSON.stringify(read('chart.size')));
+
+  // 开始扫描自动切到扫描页（之后用户切走就不再抢）
+  run('showView("align")');
+  route = (m, u) => u === '/api/scans' ? { body: { scan_id: 9 } } : { body: [] };
+  await run("$('btn-scan-start').onclick()"); await tick(); await tick();
+  ok('开始扫描自动切到扫描页', read('view') === 'scan', read('view'));
+
+  route = () => ({ body: [] });
 
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');
   process.exit(failed ? 1 : 0);

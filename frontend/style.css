@@ -37,15 +37,51 @@ body {
 .pill.bad  { background: #fee2e2; color: var(--bad); }
 .pill.run  { background: #dbeafe; color: var(--run); }
 
-/* ---------- 布局 ---------- */
-main {
-  display: grid; gap: 16px; padding: 16px 20px 40px;
-  grid-template-columns: 340px minmax(0, 1fr);
-  align-items: start;
+/* 视图切换：两种工作模式互斥（扫描占着设备时手动会被后端拒），所以分成两页显示。
+   这是显示状态，不是权限 —— 真正的拒绝永远在后端（409 + 中文原因）。 */
+.tabs { display: flex; gap: 4px; padding: 3px; background: #e2e8f0; border-radius: 9px; }
+.tab {
+  padding: 5px 18px; font-size: 13px; color: var(--muted);
+  background: transparent; border: 0; border-radius: 7px;
 }
-.span2 { grid-column: 1 / -1; }
+.tab:hover:not(.active) { background: #fff; color: var(--text); }
+.tab.active, .tab.active:hover {
+  background: var(--card); color: var(--text); font-weight: 600;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .12);
+}
+
+/* ---------- 布局 ---------- */
+/* 每个视图自己两栏（对准：左＝读数+手动，右＝曲线；扫描：左＝参数+历史，右＝点位）。
+   420px 是下限不是审美：曲线卡的表单与统计条要排 3 列，卡宽得 ≥416px（3×120+2×12+内边距）。
+   栏内 track 必须写 minmax(0,1fr)：漏了它卡片会按 max-content 撑开，直接溢出栏宽。 */
+main { padding: 16px 20px 40px; }
+.view {
+  display: grid; gap: 16px; align-items: start;
+  grid-template-columns: 420px minmax(0, 1fr);
+}
+.view[hidden] { display: none; }   /* 要显式写：.view 的 display 会盖掉 [hidden] 的默认值 */
+/* 扫描页左栏装的是历史列表（8 列），420 太挤 —— 那一列要宽一些；
+   对准页左栏是读数与控件，420 够用，而且曲线卡在 420 以上才排得下 3 列。 */
+#view-scan { grid-template-columns: 560px minmax(0, 1fr); }
+/* 预览页：左边预览、右边图库。图库卡整宽铺满，缩略图网格自己多行密排 ——
+   一排 3 个的话右边会空一大片（1440×1080 的图缩小后本来就看不清细节）。 */
+#view-ccd { grid-template-columns: 460px minmax(0, 1fr); }
+/* 窄屏（<=1180px）：图库掉到预览下面，仍然整宽 */
+@media (max-width: 1180px) {
+  #view-ccd { grid-template-columns: minmax(0, 1fr); }
+}
+.col {
+  display: grid; gap: 16px; align-content: start; min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+/* 窄屏回落成单列，卡片按 DOM 顺序排 —— 顺序与分两栏之前完全一致。
+   display:contents 之后 .col 不产生盒子，所以这里不能给它 padding 之类的视觉样式。 */
 @media (max-width: 900px) {
-  main { grid-template-columns: minmax(0, 1fr); }
+  .view { grid-template-columns: minmax(0, 1fr); }
+  .col { display: contents; }
+  /* 单列后按"参数 → 点位 → 历史"排：跑扫描时先看点位，历史垫底 */
+  #card-points { order: 1; }
+  #card-history { order: 2; }
 }
 
 .card {
@@ -54,7 +90,7 @@ main {
 }
 .card h2 {
   margin: 0 0 12px; font-size: 14px; font-weight: 600;
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 }
 .card h2 .sub { font-weight: 400; color: var(--muted); font-size: 12px; }
 
@@ -115,8 +151,10 @@ button.ghost { padding: 3px 10px; font-size: 12px; color: var(--muted); }
 
 /* ---------- 进度 ---------- */
 .progress { margin-top: 16px; }
-.bar { height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
-.bar > div { height: 100%; width: 0; background: var(--run); transition: width 0.2s; }
+/* 进度条不能也叫 .bar：那个类名是顶栏的（padding 12px），两个规则会互相改 ——
+   顶栏被压成 25px 的灰药丸、内容被 overflow:hidden 裁掉，进度条则被撑成 25px 高。 */
+.pbar { height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
+.pbar > div { height: 100%; width: 0; background: var(--run); transition: width 0.2s; }
 .ptext {
   display: flex; justify-content: space-between; gap: 12px;
   margin-top: 6px; font-size: 12px; color: var(--muted);
@@ -141,7 +179,72 @@ td.bad { color: var(--bad); }
 
 /* ---------- 曲线 ---------- */
 .chart { margin-top: 4px; min-height: 240px; }
+/* 还没建图（没有数据）时不要留一块 240px 的空白 */
+.chart:empty { min-height: 0; }
 .u-legend { font-size: 12px; }
+
+#trace-flag { color: var(--warn); }
+
+/* ---------- 相机预览 ---------- */
+.ccdview {
+  margin: 10px 0 0; min-height: 160px;
+  display: flex; align-items: center; justify-content: center;
+  background: #0b0f19; border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+}
+/* 预览是**缩小**显示的（1440 px 挤进约 600 px 宽的卡片），所以用平滑缩放：
+   pixelated 只适合放大看像素，用在缩小上会把邻域采样成噪点、细节全丢。 */
+/* 现在它独占一页，给个上限：4:3 的图撑满整栏会高到看不见下面的统计条 */
+#ccd-img { display: block; width: 100%; max-width: 900px; height: auto; margin: 0 auto; image-rendering: auto; }
+#ccd-img[hidden] { display: none; }
+/* 图片没来时提示文字居中占位 */
+.ccdview .hint { margin: 0; padding: 16px; text-align: center; }
+#ccd-img:not([hidden]) + .hint { display: none; }
+
+/* ---------- 已保存图像的列表 ---------- */
+/* 图库要多行排布、把横向空间用满：格子小一点、列多一点 */
+/* 一排能塞多少塞多少；格子只放"缩略图 + 两行字"，完整信息点开看弹窗。
+   早先把文件名/大小/备注全塞进格子，结果每行都被省略号截断 —— 信息等于没有。 */
+.gallery {
+  display: grid; gap: 10px; margin-top: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+}
+.gallery figure { margin: 0; position: relative; }
+.gallery img {
+  width: 100%; height: 92px; object-fit: contain; cursor: zoom-in;
+  background: #0b0f19; border: 1px solid var(--line); border-radius: 6px;
+}
+.gallery figure:hover img { border-color: var(--run); }
+/* 名称一行（可编辑）+ 曝光一行，都不截断 */
+.gallery .gname {
+  display: block; margin-top: 4px; padding: 1px 4px; border-radius: 4px;
+  color: var(--text); font-size: 12px; line-height: 1.4; cursor: text;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gallery .gname:hover { background: #eef2f7; }
+.gallery .gname:focus { outline: 2px solid #bfdbfe; background: #fff; white-space: normal; }
+/* 没起名时显示时间，灰一点，提示"这里可以点" */
+.gallery .gname.unnamed { color: var(--muted); font-style: italic; }
+.gallery figcaption { margin-top: 2px; padding-left: 4px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.gallery .gdel {
+  position: absolute; top: 4px; right: 4px; opacity: 0; transition: opacity .15s;
+  padding: 1px 6px; font-size: 12px; line-height: 1.5; border-radius: 4px;
+}
+.gallery figure:hover .gdel { opacity: 1; }
+
+/* ---------- 统计条（位置曲线） ---------- */
+.stats {
+  display: grid; gap: 8px 16px; margin: 14px 0 0;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+}
+.stats > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* 窄栏（预览卡只有 460px 宽）用这个：5 项按 90px 起排，两列刚好放得下 */
+.stats-tight { grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px 12px; }
+.stats-tight dd { font-size: 15px; }
+.stats dt { color: var(--muted); font-size: 12px; }
+.stats dd {
+  margin: 0; font-size: 16px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ---------- 提示 ---------- */
 #toast {

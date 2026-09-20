@@ -102,6 +102,15 @@ TELEMETRY_HZ_SCAN = 2.0    # 扫描进行中的推送频率
 SLOW_QUERY_EVERY = 10      # 每 N 次快查询做一次慢查询（PI 是 SVO?/ERR?/OVF?/MOV?/VEL?；
                            # XMT 只用它刷 19 开闭环）
 
+# ---------------- 位置曲线（观察稳定性） ----------------
+# 曲线取自遥测轮询的环形缓冲，**不额外轮询设备**：设备带宽是稀缺资源（见上面遥测一节）。
+# 缓冲时长要盖住「一次记录 + 迟到的最后一次取数」：浏览器把后台标签的定时器压到约
+# 1 次/分钟，窗口两端都是绝对时刻，所以迟到也能取回完整的那一段 —— 但样本得还在缓冲里。
+# 曲线密度 = 遥测频率：XMT 上实测约 9.2 Hz（间隔 108 ms），扫描中降到 2 Hz，点数会明显变少。
+TRACE_BUFFER_S = 120.0
+TRACE_MIN_S = 1.0
+TRACE_MAX_S = 60.0
+
 # ---------------- 扫描 ----------------
 # 单点偏差超过「步距 × 这个系数」就判该点无效：不采图、不入库、中止扫描。
 # 取 0.5 的理由：设点丢帧的表现是**整整差一个步距**，永远大于半个步距，所以这条
@@ -114,8 +123,39 @@ ON_TARGET_TIMEOUT_S = 10.0 # 单点等待到位上限
 SETTLE_MS_RANGE = (0, 5000)
 
 # ---------------- CCD ----------------
-# dummy = 生成灰度占位图（打通"每点到位->采图->写回元数据"链路）；接真相机时换实现
+# null  = 不采图        dummy = 生成灰度占位图（打通链路用）
+# thorlabs = 索雷博 CS165MU（Zelux），仅 Windows，见 backend/thorlabs_ccd.py
 CCD_BACKEND = os.getenv("PI_CCD", "dummy")
+
+# --- 索雷博 CS165MU ---
+# 原生 DLL 目录（SDK 包里 dlls\64_lib）。设备层会把 19 个厂商 DLL 按全路径预加载，
+# 所以**不要求**先把它塞进 PATH；run_camera.bat 里设 PATH 是给工具脚本兜底。
+# 细节与踩坑见 docs/thorlabs/设备认识账.xml 的 A2 / E1。
+# 没设 TL_SDK_DLLS 时按本机的 SDK 解压位置兜底：跟 run_camera.bat 的 %USERPROFILE% 同一个意思，
+# 不写死用户名。真找不到时设备层会明确报"缺哪个 DLL"，不会静默失败。
+TL_DLL_DIR = os.getenv("TL_SDK_DLLS") or str(
+    Path(os.getenv("USERPROFILE") or Path.home())
+    / "Desktop/pzt/Scientific_Camera_Interfaces/Scientific Camera Interfaces"
+      "/SDK/Python Toolkit/dlls/64_lib"
+)
+# **增益和曝光都是掉电保持的**：进程退出后相机自己记着上次的值。
+# 所以每次连接都必须显式写一遍并读回，绝不能假设默认是 0 ——
+# 实测踩过：上一个脚本把增益拉到 480 档没还原，后面几轮全被误判成"光太强、要加衰减片"。
+# 增益放大信号的同时放大噪声，信噪比不会变好，所以本机恒为 0，亮度只用曝光调。
+TL_GAIN = int(os.getenv("PI_CCD_GAIN", "0"))
+# 曝光：**预览与采图共用一个值**（分开的话"预览看着挺好"和"存下来的"就是两张亮度不同的图）。
+# 界面上可以实时调；每一帧保存时把**相机读回的实际曝光**写进元数据 —— 图像自证用了哪次参数。
+TL_EXPOSURE_US = int(os.getenv("PI_CCD_EXPOSURE_US", "12000"))
+TL_FULL_ROI = (0, 0, 1440, 1080)      # 原生全幅：保存一律用它，不裁剪
+# 预览 ROI：默认**原生全幅**，跟保存用的一样 —— 预览就该看到整个视场。
+# 早先为了跑得快设成左上角 520x520，结果预览只显示全幅的 18%，容易误以为"视野就这一块"。
+# 相机端裁剪确实能提帧率（实测 528x528 上限约 70 fps、全幅约 35 fps），
+# 真嫌慢再改这里（ROI 会被硬件对齐改写，所以一律按读回值记账）。
+TL_PREVIEW_ROI = (0, 0, 1440, 1080)
+TL_PREVIEW_FPS = float(os.getenv("PI_CCD_PREVIEW_FPS", "15"))
+TL_JPEG_QUALITY = int(os.getenv("PI_CCD_JPEG_QUALITY", "80"))
+TL_OPEN_TIMEOUT_S = 15.0     # 打开相机（含固件握手）的上限
+TL_CAPTURE_TIMEOUT_S = 30.0  # 单帧采集上限（含曝光）
 
 # ---------------- 存储 ----------------
 DATA_DIR = BASE_DIR / "data"

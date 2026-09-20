@@ -42,6 +42,20 @@ CREATE TABLE IF NOT EXISTS point (
     taken_at    REAL,
     PRIMARY KEY (scan_id, idx)
 );
+
+-- 手动保存的原始帧（「保存原生帧」存下的那些）。
+-- **与扫描各点的图分开**：扫描图归 point.image_path，和它自己的扫描绑在一起；
+-- 这里是独立的一张张帧，可以各自命名。
+-- filename 就是主键：改名时**磁盘文件名和这条记录必须一起改**（见 server.rename_grab），
+-- 只改一边就是"库里有、点开 404"或者"文件还在、列表里没了"。
+-- 保存时的撞名由调用方避开（thorlabs_ccd.save_raw 发现同名就加 _2），
+-- 下面的 ON CONFLICT 只是"同一张重复登记"的兜底，不是覆盖别人的入口。
+CREATE TABLE IF NOT EXISTS grab (
+    filename    TEXT PRIMARY KEY,
+    label       TEXT NOT NULL DEFAULT '',
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL
+);
 """
 
 # 已有库的补列。CREATE TABLE IF NOT EXISTS 对已存在的表**什么都不做**，
@@ -50,6 +64,9 @@ CREATE TABLE IF NOT EXISTS point (
 MIGRATIONS = (
     # (表, 列, 类型, 老行补什么值)
     ("point", "settle_source", "TEXT", SETTLE_UNKNOWN),
+    # 备注：给一帧记实验条件（曝光、增益、样品、光源…）。
+    # 加在 MIGRATIONS 里对**已有的库**才生效 —— CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做。
+    ("grab", "note", "TEXT", ""),
 )
 
 # 终止态：进程启动时把这两个状态之外的残留扫描判为 aborted
@@ -139,6 +156,47 @@ def add_point(
             (scan_id, idx, target_um, actual_um, settled_ms, int(on_target), settle_source,
              image_path, time.time()),
         )
+
+
+def register_grab(filename: str) -> None:
+    """记下这一帧；已经有记录就不动它的名字（重复保存同名文件时才走 upsert）。"""
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO grab (filename, label, created_at) VALUES (?, '', ?)"
+            " ON CONFLICT(filename) DO UPDATE SET created_at = excluded.created_at",
+            (filename, time.time()),
+        )
+
+
+def list_grabs() -> list[dict[str, Any]]:
+    with _db() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM grab ORDER BY created_at DESC")]
+
+
+def rename_grab(old: str, new: str) -> None:
+    """把一帧的**文件名**改成 new（磁盘上真改），同时更新库里的记录。
+
+    只改库不动文件，库里就会指向一个不存在的文件 —— 所以这两步必须一起做。
+    真正的改名动作（同名冲突、非法字符、路径穿越的检查）在 server 层，
+    因为那里才知道 IMAGE_DIR 在哪、以及要给用户报什么错。
+    """
+    with _db() as conn:
+        conn.execute("UPDATE grab SET filename = ? WHERE filename = ?", (new, old))
+
+
+def set_grab_note(filename: str, note: str) -> None:
+    with _db() as conn:
+        conn.execute("UPDATE grab SET note = ? WHERE filename = ?", (note, filename))
+
+
+def delete_grab(filename: str) -> None:
+    with _db() as conn:
+        conn.execute("DELETE FROM grab WHERE filename = ?", (filename,))
+
+
+def delete_grabs(filenames: list[str]) -> None:
+    with _db() as conn:
+        conn.executemany("DELETE FROM grab WHERE filename = ?", [(f,) for f in filenames])
 
 
 def list_scans(limit: int = 50) -> list[dict[str, Any]]:

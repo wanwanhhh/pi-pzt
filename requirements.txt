@@ -6,3 +6,12 @@ fastapi==0.141.1
 uvicorn==0.53.0
 pydantic==2.13.5
 PIPython==2.13.0.2
+
+# ---- 索雷博相机（可选；只有 PI_CCD=thorlabs 时才需要，仅 Windows）----
+# thorlabs_tsi_sdk **不在 PyPI 上**，pip install 这个名字必然失败。
+# 要从厂家安装包装出来的 SDK 里装本地包：
+#   .venv\Scripts\python.exe -m pip install "<SDK路径>\Scientific Camera Interfaces\SDK\Python Toolkit\thorlabs_tsi_camera_python_sdk_package.zip"
+# 装出来的版本是 0.0.8（py3-none-any，纯 Python，用 ctypes 调原生 DLL）。
+# 原生 DLL 不在包里，用环境变量 TL_SDK_DLLS 指向 SDK 的 dlls\64_lib。
+# 详见 README.md 的「相机」一节与 docs/thorlabs/设备认识账.xml。
+pillow==12.3.0

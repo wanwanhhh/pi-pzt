@@ -16,6 +16,10 @@ from .config import CCD_BACKEND, IMAGE_DIR
 
 log = logging.getLogger(__name__)
 
+# 真相机（索雷博 CS165MU）的对象。预览接口要用它，所以在这里建一次、全进程共用。
+# 开关相机本身由它自己的 owner 线程管（见 thorlabs_ccd.py 顶部四条硬约束）。
+_thorlabs = None
+
 
 class Capture(Protocol):
     def capture(self, scan_id: int, index: int, position_um: float) -> str | None:
@@ -62,9 +66,36 @@ class DummyCapture:
         return f"images/{name}"
 
 
+class ThorlabsCapture:
+    """索雷博 CS165MU：每点采一帧原生全幅、存 16 位 PNG。
+
+    **不裁剪**：保存一律用原生 1440x1080，预览的小 ROI 只是预览用。
+    实际动作全在 backend/thorlabs_ccd.py 的 owner 线程里，这里只做转发。
+    """
+
+    def __init__(self) -> None:
+        self.camera = thorlabs_camera()
+
+    def capture(self, scan_id: int, index: int, position_um: float) -> str | None:
+        return self.camera.capture(scan_id, index, position_um)
+
+
+def thorlabs_camera():
+    """取（必要时创建）全进程唯一的相机对象。不打开相机，只建对象。"""
+    global _thorlabs
+    if _thorlabs is None:
+        from .thorlabs_ccd import ThorlabsCamera   # 延迟导入：非 thorlabs 后端不拉 PIL/SDK
+
+        _thorlabs = ThorlabsCamera()
+    return _thorlabs
+
+
 def make_capture() -> Capture:
     if CCD_BACKEND == "null":
         log.info("CCD 后端：null（不采图）")
         return NullCapture()
+    if CCD_BACKEND == "thorlabs":
+        log.info("CCD 后端：thorlabs CS165MU（原生全幅，16 位 PNG）")
+        return ThorlabsCapture()
     log.info("CCD 后端：dummy（生成占位灰度图）")
     return DummyCapture()
