@@ -279,11 +279,18 @@ td.bad { color: var(--bad); }
 /* ---------- 大图 ---------- */
 #lightbox {
   position: fixed; inset: 0; background: rgba(15,23,42,.75);
-  display: flex; align-items: center; justify-content: center; z-index: 200;
-  cursor: zoom-out;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; z-index: 200; cursor: zoom-out;
 }
 #lightbox[hidden] { display: none; }
 #lightbox img {
-  max-width: 80vw; max-height: 80vh; background: #fff;
-  border-radius: 8px; image-rendering: pixelated;
+  max-width: 80vw; max-height: 76vh; background: #fff;
+  border-radius: 8px; image-rendering: auto;
 }
+/* 说明条：大图多是**缩小**显示（1440 px 挤进 80vw），pixelated 只适合放大看像素 */
+#lightbox-cap {
+  margin: 0; max-width: 80vw; cursor: auto; background: rgba(15,23,42,.9);
+  color: #e2e8f0; font-size: 13px; line-height: 1.5; padding: 8px 12px; border-radius: 8px;
+}
+#lightbox-cap[hidden] { display: none; }
+#lightbox-cap a { color: #93c5fd; }

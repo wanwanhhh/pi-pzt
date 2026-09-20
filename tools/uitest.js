@@ -661,6 +661,84 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('ccd-cross').hidden") === true && read("$('ccd-cen').textContent") === '—');
   route = () => ({ body: [] });
 
+  console.log('\n[O] 图库大图：走 8 位映射，不能直接给浏览器看 16 位 PNG');
+  run("showLightbox('images/对焦前.png')");
+  const bigSrc = read("$('lightbox-img').src");
+  ok('大图走缩略图接口（>>2 → JPEG），不是 /data 下的原始 PNG',
+     bigSrc.indexOf('/api/grabs/thumb?') === 0 && bigSrc.indexOf('max_side=1440') > 0 &&
+     bigSrc.indexOf('/data/') !== 0, JSON.stringify(bigSrc));
+  ok('路径编码过（文件名可能是中文）',
+     bigSrc.indexOf(encodeURIComponent('images/对焦前.png')) > 0, JSON.stringify(bigSrc));
+  ok('给出原始 16 位 PNG 的下载链接（定量用）',
+     read("$('lightbox-raw').href").indexOf('/data/images/') === 0 &&
+     read("$('lightbox-raw').href").indexOf('%E5%AF%B9%E7%84%A6%E5%89%8D') > 0,
+     JSON.stringify(read("$('lightbox-raw').href")));
+  ok('说明条写出来（告诉用户显示的是 8 位映射）',
+     read("$('lightbox-cap').hidden") === false && read("$('lightbox').hidden") === false);
+  run("showLightbox('', 'fallback.jpg')");
+  ok('没有原始路径时退回缩略图，且不显示说明条',
+     read("$('lightbox-img').src") === 'fallback.jpg' && read("$('lightbox-cap').hidden") === true);
+
+  console.log('\n[P] 图库格子：曝光一行 + 质心一行（都从文件自己身上读）');
+  route = (m, u) => (u.indexOf('/api/grabs') === 0
+    ? { body: { total: 2, items: [
+        { name: 'a.png', path: 'images/a.png', exposure_us: 11995, centroid: [719.5, 539.25], mtime: 1 },
+        { name: 'b.png', path: 'images/b.png', exposure_us: null, centroid: null, mtime: 0 },
+      ] } }
+    : { body: [] });
+  await run('loadGrabs()'); await tick(); await tick();
+  const capA = read("$('gallery').children[0].children[2].innerHTML");
+  const capB = read("$('gallery').children[1].children[2].innerHTML");
+  ok('有质心时按"质心 cx, cy"显示', capA.indexOf('质心 719.50, 539.25') >= 0, JSON.stringify(capA));
+  ok('曝光与质心各占一行（质心是新加的那一行）',
+     capA.indexOf('曝光 11.99 ms') >= 0 && capA.indexOf('<br>') > 0, JSON.stringify(capA));
+  ok('老图没有就写"未记录"，不猜值',
+     capB.indexOf('质心未记录') >= 0 && capB.indexOf('曝光未记录') >= 0, JSON.stringify(capB));
+
+  // 大图上也带一份（单张比对时最常用）
+  run("showLightbox('images/a.png', '', grabMeta('images/a.png'))");
+  ok('大图说明里也标出曝光与质心（写明是传感器坐标）',
+     read("$('lightbox-meta').textContent").indexOf('曝光 11.99 ms') >= 0 &&
+     read("$('lightbox-meta').textContent").indexOf('质心(传感器) 719.50, 539.25') >= 0,
+     JSON.stringify(read("$('lightbox-meta').textContent")));
+  route = () => ({ body: [] });
+
+  console.log('\n[Q] 点位表的图也走 8 位映射 + 大图说明条只有一个来源');
+  reset(); calls.length = 0;
+  route = (m, u) => (u.indexOf('/api/scans/') === 0
+    ? { body: { id: 40, name: 's40', status: 'done', start_um: 0, stop_um: 1, count: 1, message: '',
+                points: [{ idx: 0, target_um: 0, actual_um: 0, on_target: 1, settled_ms: 300,
+                           image_path: 'images/scan0040_00000.png' }] } }
+    : { body: [] });
+  driveScan(40, 'done'); await tick(); await tick();
+  const rowHtml = htmlOf('points');
+  ok('点位表的缩略图走 /api/grabs/thumb（真机扫描帧是 16 位 PNG，直连 /data 是黑的）',
+     rowHtml.indexOf('/api/grabs/thumb?path=') >= 0 && rowHtml.indexOf('src="/data/') < 0,
+     JSON.stringify(rowHtml.slice(rowHtml.indexOf('<img'), rowHtml.indexOf('<img') + 120)));
+  ok('带上 data-full，点开进同一套大图（含原始文件链接）',
+     rowHtml.indexOf('data-full="images/scan0040_00000.png"') >= 0);
+
+  // 说明条：图库里的帧立刻有；点位表的扫描帧要现问后端；没有路径时留空（不许留上一张的数字）
+  run("showLightbox('images/a.png', '', { exposure_us: 11995, centroid: [1, 2] })");
+  ok('图库的帧：说明条立刻写出来',
+     read("$('lightbox-meta').textContent").indexOf('曝光 11.99 ms') >= 0,
+     JSON.stringify(read("$('lightbox-meta').textContent")));
+  route = (m, u) => (u.indexOf('/api/image/meta') === 0
+    ? { body: { exposure_us: 8000, centroid: [10, 20] } } : { body: [] });
+  run("showLightbox('images/scan0040_00000.png', '')");     // 第三个参数缺省 = 图库列表里没有它
+  ok('扫描帧：先写"读取中…"（不猜）', read("$('lightbox-meta').textContent") === '读取中…',
+     JSON.stringify(read("$('lightbox-meta').textContent")));
+  await tick(); await tick();
+  ok('扫描帧：取回文件自己的元数据后写上去',
+     read("$('lightbox-meta').textContent").indexOf('曝光 8.00 ms') >= 0 &&
+     read("$('lightbox-meta').textContent").indexOf('质心(传感器) 10.00, 20.00') >= 0,
+     JSON.stringify(read("$('lightbox-meta').textContent")));
+  run("showLightbox('', '/data/images/x.png')");
+  ok('没有相对路径时说明条留空，也不留上一张的数字',
+     read("$('lightbox-cap').hidden") === true && read("$('lightbox-meta').textContent") === '',
+     JSON.stringify(read("$('lightbox-meta').textContent")));
+  route = () => ({ body: [] });
+
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');
   process.exit(failed ? 1 : 0);
 })();

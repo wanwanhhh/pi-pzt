@@ -243,7 +243,12 @@
 </main>
 
 <div id="toast"></div>
-<div id="lightbox" hidden><img id="lightbox-img" alt=""></div>
+<div id="lightbox" hidden>
+  <img id="lightbox-img" alt="">
+  <p id="lightbox-cap" hidden><b id="lightbox-meta">—</b><br>显示的是<b>8 位映射</b>（原始值 ÷4，与预览同一口径）。原始 16 位 PNG：<a
+      id="lightbox-raw" href="" download>下载 / 打开</a> —— 数据只占 0~1022，浏览器按 16 位满量程渲染就是黑的，
+    定量请看文件本身（ImageJ / Python）。</p>
+</div>
 
 
 <script src="/static/vendor/uPlot.iife.min.js"></script>

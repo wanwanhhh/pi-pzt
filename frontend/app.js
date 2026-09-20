@@ -369,8 +369,11 @@ function renderPoints(points) {
         (dev === null ? '—' : dev.toFixed(0)) + '</td>' +
       '<td>' + (p.on_target ? '是' : '否') + '</td>' +
       '<td>' + (p.settled_ms === null || p.settled_ms === undefined ? '—' : Math.round(p.settled_ms)) + '</td>' +
+      // 点位表的图也走 8 位映射：真机扫描帧同样是 16 位 PNG，直连 /data 会是一片黑
+      // （假相机的占位图是 8 位，所以以前看不出问题）。data-full 让点击能进同一套大图。
       '<td>' + (p.image_path
-        ? '<img class="thumb" loading="lazy" alt="" src="/data/' + esc(p.image_path) + '">'
+        ? '<img class="thumb" loading="lazy" alt="" data-full="' + esc(p.image_path) +
+          '" src="/api/grabs/thumb?path=' + encodeURIComponent(p.image_path) + '">'
         : '—') + '</td>';
     frag.appendChild(tr);
   }
@@ -851,6 +854,53 @@ function ccdLiveStop() {
   ccdPaintCentroid(null);      // 十字线和质心读数一起收起来（停预览后那个数是上一帧的残留）
 }
 
+function grabMeta(path) {
+  const items = (grabsData && grabsData.items) || [];
+  for (let i = 0; i < items.length; i++) if (items[i].path === path) return items[i];
+  return null;
+}
+
+/* 大图：**走 8 位映射**（后端 >>2 → JPEG，与预览同一条口径），不是直接给浏览器看 16 位 PNG ——
+   16 位 PNG 里的值只占 0~1022（满量程 65535 的 1.6%），浏览器按满量程渲染就是一片黑
+   （实测：均值 352 的帧在屏幕上只有 1.4/255）。要像素真值就走下面那个链接拿原始文件。 */
+/* 一行元数据文案（大图说明条用） */
+function metaLine(m) {
+  return (m && m.exposure_us ? '曝光 ' + (m.exposure_us / 1000).toFixed(2) + ' ms' : '曝光未记录') +
+    ' · ' +
+    (m && m.centroid
+      ? '质心(传感器) ' + m.centroid[0].toFixed(2) + ', ' + m.centroid[1].toFixed(2)
+      : '质心未记录');
+}
+
+let lightboxToken = 0;   // 慢响应回来时可能已经翻到别的图了：只认最后一次
+
+async function showLightbox(full, fallbackSrc, meta) {
+  const cap = $('lightbox-cap');
+  const raw = $('lightbox-raw');
+  const line = $('lightbox-meta');
+  lightboxToken++;
+  if (!full) {
+    // 没有相对路径（比如别处塞进来的图）：只显示给来的 src，说明条留空 ——
+    // **绝不能留上一张的数字**，那正是"不猜值"的反面
+    $('lightbox-img').src = fallbackSrc || '';
+    line.textContent = '';
+    cap.hidden = true;
+    $('lightbox').hidden = false;
+    return;
+  }
+  const enc = full.split('/').map(encodeURIComponent).join('/');
+  $('lightbox-img').src = '/api/grabs/thumb?path=' + encodeURIComponent(full) + '&max_side=1440';
+  raw.href = '/data/' + enc;        // 原始 16 位 PNG：下载/本地看，别指望浏览器显示
+  line.textContent = meta ? metaLine(meta) : '读取中…';
+  cap.hidden = false;
+  $('lightbox').hidden = false;
+  if (meta) return;                 // 图库里的帧：列表已经把它带回来了
+  // 点位表的扫描帧不在图库列表里：它的曝光/质心同样写在文件自己身上，去问后端要一份
+  const token = lightboxToken;
+  const m = await get('/api/image/meta?path=' + encodeURIComponent(full));
+  if (token === lightboxToken && !$('lightbox').hidden) line.textContent = metaLine(m);
+}
+
 /* 已保存的采集帧：**只管手动保存的那些**（后端登记表里的，不按文件名前缀猜）。
    扫描各点的图归「扫描」页的点位表，不混进来 —— 一堆自动图会把手动存的淹掉。 */
 async function loadGrabs() {
@@ -887,10 +937,14 @@ async function loadGrabs() {
     name.addEventListener('blur', function () { grabRename(name); });
 
     const cap = document.createElement('figcaption');
-    // 曝光是从图片自己身上读出来的（PNG 的 tEXt 块），不是猜的
-    cap.textContent = it.exposure_us
-      ? '曝光 ' + (it.exposure_us / 1000).toFixed(2) + ' ms'
-      : '曝光未记录';
+    // 曝光与质心都是从图片自己身上读出来的（PNG 的 tEXt 块），不是猜的；
+    // 质心是**传感器坐标**，与文件里的像素同一套（转预览不影响它，老图没有就写"未记录"）
+    cap.innerHTML =
+      (it.exposure_us ? '曝光 ' + (it.exposure_us / 1000).toFixed(2) + ' ms' : '曝光未记录') +
+      '<br>' +
+      (it.centroid
+        ? '质心 ' + it.centroid[0].toFixed(2) + ', ' + it.centroid[1].toFixed(2)
+        : '质心未记录');
 
     const del = document.createElement('button');
     del.className = 'gdel';
@@ -948,7 +1002,9 @@ async function ccdGrab() {
   const r = await post('/api/ccd/capture');
   if (!r) return;
   toast('已保存 ' + r.path + '（' + r.width + '×' + r.height + '，曝光 ' +
-    (r.exposure_us / 1000).toFixed(2) + ' ms，增益 ' + r.gain + '，均值 ' + r.mean.toFixed(1) + '）');
+    (r.exposure_us / 1000).toFixed(2) + ' ms，质心 ' +
+    (r.centroid ? r.centroid[0].toFixed(2) + ', ' + r.centroid[1].toFixed(2) : '—') +
+    '，增益 ' + r.gain + '，均值 ' + r.mean.toFixed(1) + '）');
   loadGrabs();     // 存完立刻出现在下面的列表里
   loadHistory();
 }
@@ -1133,10 +1189,7 @@ function wire() {
     if (t.dataset && t.dataset.del) { grabDelete(t.dataset.del); return; }
     if (t.classList && t.classList.contains('gname')) return;   // 点名字是改名，不是看大图
     if (t.classList && t.classList.contains('thumb')) {
-      // 直接看大图：**原始帧本身**（16 位 PNG，浏览器一般能直接解码；
-      // 万一显示不出来，再改成后端转 JPEG —— 后端已经有那条路）。
-      $('lightbox-img').src = t.dataset.full ? '/data/' + t.dataset.full : t.getAttribute('src');
-      $('lightbox').hidden = false;
+      showLightbox(t.dataset.full || '', t.getAttribute('src'), grabMeta(t.dataset.full || ''));
     } else if (t.id === 'lightbox' || t.id === 'lightbox-img') {
       $('lightbox').hidden = true;
       $('lightbox-img').src = '';

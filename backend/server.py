@@ -280,10 +280,14 @@ async def ccd_preview(on: bool = Query(True)) -> dict:
 
 
 def _safe_image_path(path: str) -> Path:
-    """把请求里的相对路径夹在 data/ 里，并且必须真实存在。"""
+    """把请求里的相对路径夹在 data/ 里，而且必须是一个**真实存在的文件**。
+
+    用 is_file() 而不是 exists()：目录也能 exists —— 空路径会落到 data/ 自己身上，
+    读元数据会静默返回 null、取缩略图会 500。这种"看起来成功其实什么都没做"最难查。
+    """
     root = DATA_DIR.resolve()
     src = (root / path).resolve()
-    if not src.is_relative_to(root) or not src.exists():
+    if not src.is_relative_to(root) or not src.is_file():
         raise HTTPException(404, "图像不存在")
     return src
 
@@ -298,17 +302,20 @@ def list_grabs(limit: int = Query(60, ge=1, le=500)) -> dict:
     # **以库里的登记为准**，不是"扫目录里叫 grab_* 的文件"：
     # 登记只发生在手动保存那一条路上（save_raw），所以扫描采的图（哪怕改了名、
     # 或者 index 号排到很大）都不会漏进来。
-    from .thorlabs_ccd import read_png_exposure
+    from .thorlabs_ccd import read_png_meta
 
     items = []
     for row in store.list_grabs():
         f = IMAGE_DIR / row["filename"]
         if not f.exists():          # 文件被手工删了就跳过，免得点开 404
             continue
+        # 曝光与质心都从 PNG 自己的 tEXt 里读（**不存库，文件自证**）；老图没有就是 None。
+        # 质心是**传感器坐标**，与文件里的像素同一套 —— 拿它对像素不用换算。
+        meta = read_png_meta(f)
         items.append({
             "name": f.name, "path": f"images/{f.name}",
-            # 曝光从 PNG 自己的 tEXt 里读（不存库，文件自证）；老图没有就 None
-            "exposure_us": read_png_exposure(f),
+            "exposure_us": meta["exposure_us"],
+            "centroid": meta["centroid"],
             "bytes": f.stat().st_size, "mtime": f.stat().st_mtime,
         })
     items.sort(key=lambda it: it["mtime"], reverse=True)
@@ -421,6 +428,18 @@ def delete_grab(name: str) -> dict:
         cache.unlink(missing_ok=True)
     store.delete_grab(name)
     return {"ok": True}
+
+
+@app.get("/api/image/meta")
+def image_meta(path: str = Query(..., description="相对 data/ 的路径，例如 images/scan0001_00000.png")) -> dict:
+    """任意一张 data/ 下图片**自己身上**记的元数据（曝光、质心）。
+
+    图库那批走 /api/grabs（一次列完），这里给**点位表的扫描帧**用：它们不在图库列表里，
+    但文件里同样写着曝光与质心（同一段保存代码写成 tEXt）。老图没有就是 None —— 不猜值。
+    """
+    from .thorlabs_ccd import read_png_meta
+
+    return read_png_meta(_safe_image_path(path))
 
 
 @app.get("/api/grabs/thumb")

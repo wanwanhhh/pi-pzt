@@ -147,7 +147,8 @@ class ThorlabsCamera:
         except CameraError as exc:
             log.error("PI_CCD_ROTATION 配置无效（%s），本次按 0°（传感器原始）走", exc)
             self._rotation = 0
-        self._shot: Optional[tuple] = None    # 最近一次整帧采集：(ndarray, 实际曝光 us, ROI)
+        # 最近一次整帧采集：(ndarray, 实际曝光 us, ROI, 质心 dict（传感器坐标）)
+        self._shot: Optional[tuple] = None
         self._thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------ 生命周期
@@ -468,14 +469,17 @@ class ThorlabsCamera:
         if img is None:
             raise CameraError(f"第 {index} 点没采到帧（目标 {position_um:.4f} µm）")
 
+        # 这一帧的质心（传感器坐标；口径与预览完全一样：不扣背景、不设阈值、不开窗）。
+        # 同一帧只算一次 —— 存盘写进文件自己身上，save_raw 也拿这一份。
+        cen = global_centroid(img)
         with self._lock:
-            self._shot = (img, shot_exposure, self._full_roi)
+            self._shot = (img, shot_exposure, self._full_roi, cen)
         if not save:
             log.info("采了一帧原生全幅（不落盘）：%dx%d，曝光 %d us，均值 %.1f",
                      img.shape[1], img.shape[0], shot_exposure, float(img.mean()))
             return None
         path = _image_path(scan_id, index)
-        size = _save_png16(path, img, shot_exposure)
+        size = _save_png16(path, img, shot_exposure, cen)
         log.info("第 %d 点采图：%s（%dx%d，%d 字节，曝光 %d us，均值 %.1f）",
                  index, path.name, img.shape[1], img.shape[0], size, shot_exposure,
                  float(img.mean()))
@@ -521,7 +525,7 @@ class ThorlabsCamera:
         shot = self.last_shot()
         if shot is None:
             raise CameraError("没有可保存的帧")
-        img, exposure_us, roi = shot
+        img, exposure_us, roi, cen = shot
         # 名字只到秒；同一秒里连点两次要各落一张，所以撞了就往后加 _2、_3…
         # （库那边的登记是 upsert：不换名的话第二张会覆盖第一张的文件，界面却报"已保存"）
         stem = f"grab_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -531,7 +535,7 @@ class ThorlabsCamera:
             name = f"{stem}_{n}.png"
             n += 1
         path = IMAGE_DIR / name
-        size = _save_png16(path, img, exposure_us)
+        size = _save_png16(path, img, exposure_us, cen)
         # **登记不在这里做**：本层在 store 之下，不许反向依赖（AGENTS.md 分层）。
         # 调用方（server 的 /api/ccd/capture）拿文件名去登记，图库只列登记过的。
         return {
@@ -539,6 +543,7 @@ class ThorlabsCamera:
             "width": int(img.shape[1]),
             "height": int(img.shape[0]),
             "exposure_us": int(exposure_us),   # 相机读回值，不是请求值
+            "centroid": [cen["cx"], cen["cy"]],   # 传感器坐标，与文件里写的是同一份
             "gain": int(self._gain),
             "roi": list(roi),
             "bytes": size,
@@ -603,11 +608,15 @@ def global_centroid(img) -> dict:
 
 # ---------------------------------------------------------------- 图像编码
 def thumb_jpeg(src: Path, max_side: int = 260) -> bytes:
-    """把 16 位 PNG 转成 JPEG，给列表当缩略图 / 给弹窗看个大概。
+    """把 PNG 转成 JPEG，给列表当缩略图 / 给弹窗看个大概。
 
-    **只为显示**：16 位 PNG 一张 1.3 MB，列表里塞几十张会让浏览器一直解码大图。
+    **只为显示**：16 位 PNG 一张 1~2 MB，列表里塞几十张会让浏览器一直解码大图。
     科学数据始终看原图（PNG），缩略图不参与任何测量。
     缓存落在 data/thumbs/，按"文件名 + 修改时间 + 尺寸"失效。
+
+    降到 8 位的口径**按位深决定**（图库的原始帧是 16 位，扫描占位图是 8 位）：
+    - 16 位：右移 2 位（本相机满量程实测 1022 → 8 位，与预览同一条口径）
+    - 8 位：原样。一刀切右移会把 8 位图压暗 4 倍 —— 那不是"映射"，那是毁图。
     """
     from PIL import Image
 
@@ -617,11 +626,14 @@ def thumb_jpeg(src: Path, max_side: int = 260) -> bytes:
     cache.parent.mkdir(parents=True, exist_ok=True)
     # **先读到 numpy、降到 8 位、再交给 PIL**：实测 16 位灰度 PNG 直接走
     # PIL 的 thumbnail()/point() 都会抛（L;16 模式没有对应实现）。
-    # >>2 与预览同一条口径（10 位满量程 1022 → 8 位）。
     import numpy as np
 
-    arr = (np.asarray(Image.open(src)) >> 2).astype("uint8")
-    img = Image.fromarray(arr, mode="L")
+    arr = np.asarray(Image.open(src))
+    if arr.dtype == np.uint16:
+        arr = arr >> 2          # 满量程 1022 → 8 位（与预览同一条口径）
+    elif arr.dtype != np.uint8:
+        arr = arr.astype("uint8")
+    img = Image.fromarray(arr.astype("uint8"), mode="L")
     img.thumbnail((max_side, max_side))
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=80)
@@ -645,6 +657,7 @@ def _to_jpeg(img, quality: int) -> bytes:
 
 
 EXPOSURE_KEY = b"ExposureUs"      # 写进 PNG 的 tEXt 块：这一帧是用多少 µs 采的
+CENTROID_KEY = b"CentroidPx"      # 同一个 tEXt：这一帧的质心 "cx,cy"（**传感器坐标**，与像素同一套）
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -654,18 +667,22 @@ def _png_chunk(tag: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
 
-def read_png_exposure(path: Path) -> Optional[int]:
-    """从 PNG 的 tEXt 块里读回曝光（µs）。没有就返回 None。
+def read_png_meta(path: Path) -> dict:
+    """从 PNG 的 tEXt 块里读回这一帧自带的元数据：曝光（µs）与质心（像素）。
 
-    这样"这张图是多长曝光采的"写在文件**自己**身上：把 PNG 拷到别处、
-    换个软件打开、甚至十年后翻出来，都还问得出来 —— 不依赖本仓库的数据库。
+    写在文件**自己**身上：把 PNG 拷到别处、换个软件打开、甚至十年后翻出来，都还问得出来
+    —— 不依赖本仓库的数据库。老图（加这个之前存的）没有这些块，两个字段都是 None
+    （调用方按字段取，**不要拿 None 当 0**）。
+
+    **只扫块头、不解码 IDAT**：1~2 MB 的文件读一遍就够，图库列几十张也不慢。
     """
     import struct
 
+    out = {"exposure_us": None, "centroid": None}
     try:
         data = path.read_bytes()
     except OSError:
-        return None
+        return out
     pos = 8
     while pos + 12 <= len(data):
         (length,) = struct.unpack(">I", data[pos:pos + 4])
@@ -675,19 +692,29 @@ def read_png_exposure(path: Path) -> Optional[int]:
             key, _, value = body.partition(b"\x00")
             if key == EXPOSURE_KEY:
                 try:
-                    return int(value.decode("ascii"))
+                    out["exposure_us"] = int(value.decode("ascii"))
                 except ValueError:
-                    return None
+                    pass
+            elif key == CENTROID_KEY:
+                try:
+                    cx, cy = value.decode("ascii").split(",")
+                    out["centroid"] = [float(cx), float(cy)]
+                except ValueError:
+                    pass
         elif tag == b"IEND":
             break
         pos += 12 + length
-    return None
+    return out
 
 
-def _save_png16(path: Path, img, exposure_us: Optional[int] = None) -> int:
+def _save_png16(path: Path, img, exposure_us: Optional[int] = None,
+                centroid: Optional[dict] = None) -> int:
     """16 位灰度 PNG，零依赖（与 tools/png16.py 同一实现，后端不能 import tools/）。
 
-    exposure_us 给了就写进 tEXt 块，让文件自带"这张图是怎么采的"。
+    给了就写进 tEXt 块：曝光（µs）与**质心**（"cx,cy"，传感器坐标）——
+    让文件自带"这张图是怎么采的、亮心在哪"，不依赖数据库。
+    质心在文件里只保留 2 位小数（够用且短），接口另外返回内存里那份全精度值 ——
+    **要对数就拿文件里的**，那才是跟着图走的那份。
     """
     import zlib
 
@@ -698,7 +725,10 @@ def _save_png16(path: Path, img, exposure_us: Optional[int] = None) -> int:
 
     text = b""
     if exposure_us is not None:
-        text = _png_chunk(b"tEXt", EXPOSURE_KEY + b"\x00" + str(int(exposure_us)).encode("ascii"))
+        text += _png_chunk(b"tEXt", EXPOSURE_KEY + b"\x00" + str(int(exposure_us)).encode("ascii"))
+    if centroid and centroid.get("cx") is not None:
+        pair = f"{centroid['cx']:.2f},{centroid['cy']:.2f}".encode("ascii")
+        text += _png_chunk(b"tEXt", CENTROID_KEY + b"\x00" + pair)
 
     data = (
         b"\x89PNG\r\n\x1a\n"

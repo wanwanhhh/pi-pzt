@@ -132,6 +132,73 @@ def test_rotation_only_accepts_quarter_turns():
         raise AssertionError(f"{bad} 应该被拒绝")
 
 
+def test_saved_png_carries_centroid_and_exposure():
+    """存盘时把**曝光与质心**写进文件自己身上（PNG 的 tEXt 块），读回来必须对得上 ——
+    图库那一行就是从这里来的，不查库。"""
+    import tempfile
+    from pathlib import Path
+
+    from backend.thorlabs_ccd import _save_png16, read_png_meta
+
+    img = np.zeros((20, 30), dtype=np.uint16)
+    img[5, 7] = 900
+    cen = global_centroid(img)
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.png"
+        _save_png16(p, img, 12345, cen)
+        meta = read_png_meta(p)
+    assert meta["exposure_us"] == 12345, meta
+    assert meta["centroid"] == [7.0, 5.0], meta
+
+
+def test_png_without_text_blocks_says_none():
+    """老图（加 tEXt 之前存的）没有这些块 → 界面显示"未记录"。
+    **不许猜一个值出来**：猜出来的质心比没有更糟。"""
+    import tempfile
+    from pathlib import Path
+
+    from backend.thorlabs_ccd import _save_png16, read_png_meta
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "old.png"
+        _save_png16(p, np.ones((4, 4), dtype=np.uint16))
+        meta = read_png_meta(p)
+    assert meta == {"exposure_us": None, "centroid": None}, meta
+
+
+def test_thumb_mapping_depends_on_bit_depth():
+    """缩略图降到 8 位的口径按位深决定：16 位图右移 2 位（满量程 1022），8 位图原样。
+
+    图库的原始帧是 16 位，扫描占位图（假相机）是 8 位 —— 一刀切右移会把后者压暗 4 倍。
+    """
+    import io as _io
+    import tempfile
+    from pathlib import Path
+
+    from PIL import Image
+
+    from backend.config import IMAGE_DIR
+    from backend.thorlabs_ccd import _save_png16, thumb_jpeg
+
+    caches = []
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p8 = Path(d) / "eight.png"
+            Image.fromarray(np.full((8, 8), 200, dtype=np.uint8), mode="L").save(p8)
+            p16 = Path(d) / "sixteen.png"
+            _save_png16(p16, np.full((8, 8), 800, dtype=np.uint16))   # 800 >> 2 == 200
+            # 缓存文件名里有 mtime：**趁文件还在**把路径记下来，出了临时目录就 stat 不到了
+            caches = [IMAGE_DIR.parent / "thumbs" / f"{p.stem}_{int(p.stat().st_mtime)}_260.jpg"
+                      for p in (p8, p16)]
+            m8 = float(np.asarray(Image.open(_io.BytesIO(thumb_jpeg(p8)))).mean())
+            m16 = float(np.asarray(Image.open(_io.BytesIO(thumb_jpeg(p16)))).mean())
+        assert abs(m8 - 200) < 3, m8       # 8 位原样（JPEG 允许几个数的偏差）
+        assert abs(m16 - 200) < 3, m16     # 16 位的 800 → 200
+    finally:
+        for cache in caches:               # 缩略图缓存落在 data/thumbs/，测试用完自己清掉
+            cache.unlink(missing_ok=True)
+
+
 def main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
