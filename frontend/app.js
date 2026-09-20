@@ -917,7 +917,12 @@ async function loadGrabs() {
     img.loading = 'lazy';
     img.alt = it.name;
     img.dataset.full = it.path;      // 点缩略图 = 直接看大图（原始帧本身）
-    img.src = '/api/grabs/thumb?path=' + encodeURIComponent(it.path);
+    // max_side=520 是**余量**，不是修复：格子里内容约 123×92 CSS px，按"源长边 ≥ 2× 设备像素"
+    // 算，DPR=1 时 260 就够、DPR=2 要约 490，取 520 覆盖到 DPR≈2。
+    // 实测（同一真帧、对理想面积平均算 RMSE）：260/520/1440 三档配浏览器**平滑**缩放都是
+    // 1.43~1.53 —— 档位本身差别很小；把格子里的图弄花的其实是 CSS 的
+    // image-rendering: pixelated（最近邻抽样，源图越大越糟），那个删掉了（见 style.css）。
+    img.src = '/api/grabs/thumb?path=' + encodeURIComponent(it.path) + '&max_side=520';
 
     // 名称：就是**文件名本身**，点一下改名 = 磁盘上真改（后端 rename + 改库记录）。
     // 还是默认名（grab_<时间戳>.png）时显示成时间，一眼知道是哪一帧。

@@ -607,6 +607,15 @@ def global_centroid(img) -> dict:
 
 
 # ---------------------------------------------------------------- 图像编码
+def _thumb_cache_name(src: Path, max_side: int) -> str:
+    """缩略图缓存键：文件名 + 修改时间 + 尺寸。
+
+    **三样都不能少**，少了哪样都是静默错误：少了尺寸会让大图与小图互相顶掉
+    （图库把 260 档当大图用），少了 mtime 则重存/改名之后还在看旧图。
+    """
+    return f"{src.stem}_{int(src.stat().st_mtime)}_{max_side}.jpg"
+
+
 def thumb_jpeg(src: Path, max_side: int = 260) -> bytes:
     """把 PNG 转成 JPEG，给列表当缩略图 / 给弹窗看个大概。
 
@@ -620,7 +629,7 @@ def thumb_jpeg(src: Path, max_side: int = 260) -> bytes:
     """
     from PIL import Image
 
-    cache = IMAGE_DIR.parent / "thumbs" / f"{src.stem}_{int(src.stat().st_mtime)}_{max_side}.jpg"
+    cache = IMAGE_DIR.parent / "thumbs" / _thumb_cache_name(src, max_side)
     if cache.exists():
         return cache.read_bytes()
     cache.parent.mkdir(parents=True, exist_ok=True)

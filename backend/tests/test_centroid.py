@@ -199,6 +199,24 @@ def test_thumb_mapping_depends_on_bit_depth():
             cache.unlink(missing_ok=True)
 
 
+def test_thumb_cache_key_covers_size_and_mtime():
+    """缓存键少了尺寸或 mtime 都是**静默**错误：前者让大图小图互相顶掉，后者让重存后还看旧图。"""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from backend.thorlabs_ccd import _thumb_cache_name
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.png"
+        p.write_bytes(b"x")
+        keys = {_thumb_cache_name(p, s) for s in (260, 520, 1440)}
+        assert len(keys) == 3, keys                       # 尺寸必须进键
+        before = _thumb_cache_name(p, 260)
+        os.utime(p, (p.stat().st_atime, p.stat().st_mtime + 5))
+        assert _thumb_cache_name(p, 260) != before, "mtime 变了键要跟着变"
+
+
 def main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

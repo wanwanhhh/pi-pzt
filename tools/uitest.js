@@ -690,6 +690,9 @@ const count = (m) => calls.filter((c) => c === m).length;
   const capA = read("$('gallery').children[0].children[2].innerHTML");
   const capB = read("$('gallery').children[1].children[2].innerHTML");
   ok('有质心时按"质心 cx, cy"显示', capA.indexOf('质心 719.50, 539.25') >= 0, JSON.stringify(capA));
+  ok('格子里的缩略图要 520（260 会把细结构平均成斑块，看着跟预览不是一张图）',
+     read("$('gallery').children[0].children[0].src").indexOf('max_side=520') > 0,
+     JSON.stringify(read("$('gallery').children[0].children[0].src")));
   ok('曝光与质心各占一行（质心是新加的那一行）',
      capA.indexOf('曝光 11.99 ms') >= 0 && capA.indexOf('<br>') > 0, JSON.stringify(capA));
   ok('老图没有就写"未记录"，不猜值',

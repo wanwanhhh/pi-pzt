@@ -174,8 +174,13 @@ td.bad { color: var(--bad); }
 .thumb {
   height: 34px; width: 34px; object-fit: cover; display: block;
   border: 1px solid var(--line); border-radius: 4px; cursor: zoom-in;
-  image-rendering: pixelated;
 }
+/* 缩略图一律**缩小**显示（几百 px 的图放进 34 px 或 92 px 的框），所以用平滑缩放。
+   pixelated = 最近邻抽样，只适合"放大看像素"。实测同一真帧缩到格子大小、对理想面积平均的
+   RMSE：最近邻 3.61（260 档）/ 5.99（520 档）/ 7.79（1440 档），平滑都是 1.4~1.5 ——
+   **源图越大、最近邻抽得越糟**。这里绝不能开 pixelated。
+   另注：图库那边 .gallery img（0,1,1）会盖掉 .thumb 的 width/height/object-fit/border，
+   要改图库样式请改 .gallery img，不要改这里。 */
 
 /* ---------- 曲线 ---------- */
 .chart { margin-top: 4px; min-height: 240px; }
