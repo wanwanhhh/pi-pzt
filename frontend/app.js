@@ -793,6 +793,7 @@ function ccdTick() {
   if (!ccdLive) return;
   // 顺带取一次状态：质心/ΣI/饱和这些读数就在状态里，跟着预览的节拍刷新（只读内存，不碰设备）
   ccdStatus();
+  if (profPoint.preview) profFetch('preview');   // 轮廓图：点在哪儿就一直跟着刷新
   const img = $('ccd-img');
   img.onload = function () {
     ccdFails = 0;
@@ -852,6 +853,95 @@ function ccdLiveStop() {
   $('ccd-empty').hidden = false;
   setText('ccd-fps', '—');
   ccdPaintCentroid(null);      // 十字线和质心读数一起收起来（停预览后那个数是上一帧的残留）
+  profClear('preview');        // 剖面同理：预览停了就没有"实时"，别留着上次的线
+}
+
+/* ==================== 轮廓图：过点的整行 / 整列 ====================
+   数据来自后端**原生 16 位**帧（预览那条路）或保存的 PNG（图库那条路），一律**不做处理**：
+   不平滑、不扣背景、不归一化 —— 画出来是什么就是什么。切线方向跟着预览朝向走（后端在旋转后的
+   视图上切），所以转了 90° 之后"水平"仍是你眼睛看到的水平。 */
+const PROF_HOSTS = {
+  preview: { h: 'prof-h', v: 'prof-v', cut: 'ccd-cut', cv: 'ccd-cut-v', ch: 'ccd-cut-h', where: 'prof-where' },
+  lightbox: { h: 'lb-prof-h', v: 'lb-prof-v', cut: 'lb-cut', cv: 'lb-cut-v', ch: 'lb-cut-h', where: null },
+};
+const profPoint = { preview: null, lightbox: null };   // {x, y}；大图那条另带 path
+const profCharts = {};                                 // host -> {h, v}
+const profSeq = { preview: 0, lightbox: 0 };           // 迟到的响应不许覆盖新的
+
+/* 点击位置 → 图像像素坐标（纯算术，便于测）：box 是图片在屏幕上的矩形，nw/nh 是它的像素尺寸 */
+function profPixel(clientX, clientY, box, nw, nh) {
+  if (!nw || !nh || !box || !box.width || !box.height) return null;
+  const fx = (clientX - box.left) / box.width;
+  const fy = (clientY - box.top) / box.height;
+  if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;      // 点在图上才算
+  return {
+    x: Math.min(nw - 1, Math.max(0, Math.round(fx * nw))),
+    y: Math.min(nh - 1, Math.max(0, Math.round(fy * nh))),
+  };
+}
+
+function profBuild(host) {
+  const cfg = PROF_HOSTS[host];
+  const mk = function (id, label, color) {
+    return new uPlot({
+      width: chartWidth($(id)),
+      height: 150,
+      scales: { x: { time: false } },
+      legend: { show: true },
+      cursor: { drag: { x: false, y: false } },
+      series: [{ label: label }, { label: 'ADU', stroke: color, width: 1 }],
+      axes: [
+        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
+        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
+      ],
+    }, [[], []], $(id));
+  };
+  profCharts[host] = {
+    h: mk(cfg.h, '水平（整行）像素', '#2563eb'),
+    v: mk(cfg.v, '垂直（整列）像素', '#0d9488'),
+  };
+}
+
+/* 把后端给的剖面上图：两张图各一条线，并在图上画出那两条切线 */
+function profApply(host, p) {
+  const cfg = PROF_HOSTS[host];
+  if (!p || !p.horizontal || !p.vertical) return;
+  if (!profCharts[host]) profBuild(host);
+  const xsH = [], ysH = [], xsV = [], ysV = [];
+  for (let i = 0; i < p.horizontal.length; i++) { xsH.push(i); ysH.push(p.horizontal[i]); }
+  for (let i = 0; i < p.vertical.length; i++) { xsV.push(i); ysV.push(p.vertical[i]); }
+  profCharts[host].h.setData([xsH, ysH]);
+  profCharts[host].v.setData([xsV, ysV]);
+  $(cfg.cut).hidden = false;
+  $(cfg.cv).style.left = (p.x + 0.5) / p.width * 100 + '%';    // 画在像素中心
+  $(cfg.ch).style.top = (p.y + 0.5) / p.height * 100 + '%';
+  if (cfg.where) {
+    setText(cfg.where, '(' + p.x + ', ' + p.y + ') · ' + p.width + '×' + p.height +
+      (p.rotation ? ' · 预览 ' + p.rotation + '°' : '') + ' · ' + p.bits + ' 位');
+  }
+}
+
+async function profFetch(host) {
+  const pt = profPoint[host];
+  if (!pt) return;
+  const seq = ++profSeq[host];
+  const url = host === 'lightbox'
+    ? '/api/image/profile?path=' + encodeURIComponent(pt.path) + '&x=' + pt.x + '&y=' + pt.y
+    : '/api/ccd/profile?x=' + pt.x + '&y=' + pt.y;
+  const p = await get(url);
+  if (seq !== profSeq[host]) return;        // 慢响应回来时可能已经点了别处
+  if (p) profApply(host, p);
+}
+
+function profClear(host) {
+  const cfg = PROF_HOSTS[host];
+  profPoint[host] = null;
+  $(cfg.cut).hidden = true;
+  if (profCharts[host]) {
+    profCharts[host].h.setData([[], []]);
+    profCharts[host].v.setData([[], []]);
+  }
+  if (cfg.where) setText(cfg.where, '在预览图上点一下');
 }
 
 function grabMeta(path) {
@@ -863,6 +953,12 @@ function grabMeta(path) {
 /* 大图：**走 8 位映射**（后端 >>2 → JPEG，与预览同一条口径），不是直接给浏览器看 16 位 PNG ——
    16 位 PNG 里的值只占 0~1022（满量程 65535 的 1.6%），浏览器按满量程渲染就是一片黑
    （实测：均值 352 的帧在屏幕上只有 1.4/255）。要像素真值就走下面那个链接拿原始文件。 */
+function closeLightbox() {
+  $('lightbox').hidden = true;
+  $('lightbox-img').src = '';
+  profClear('lightbox');
+}
+
 /* 一行元数据文案（大图说明条用） */
 function metaLine(m) {
   return (m && m.exposure_us ? '曝光 ' + (m.exposure_us / 1000).toFixed(2) + ' ms' : '曝光未记录') +
@@ -873,6 +969,7 @@ function metaLine(m) {
 }
 
 let lightboxToken = 0;   // 慢响应回来时可能已经翻到别的图了：只认最后一次
+let lightboxPath = '';   // 当前大图对应的 data/ 相对路径（点图取剖面要用）
 
 async function showLightbox(full, fallbackSrc, meta) {
   const cap = $('lightbox-cap');
@@ -889,6 +986,8 @@ async function showLightbox(full, fallbackSrc, meta) {
     return;
   }
   const enc = full.split('/').map(encodeURIComponent).join('/');
+  lightboxPath = full;              // 点图取剖面时要拿它去问后端
+  profClear('lightbox');            // 换了一张图：上一个点的剖面与切线都不算了
   $('lightbox-img').src = '/api/grabs/thumb?path=' + encodeURIComponent(full) + '&max_side=1440';
   raw.href = '/data/' + enc;        // 原始 16 位 PNG：下载/本地看，别指望浏览器显示
   line.textContent = meta ? metaLine(meta) : '读取中…';
@@ -1195,10 +1294,34 @@ function wire() {
     if (t.classList && t.classList.contains('gname')) return;   // 点名字是改名，不是看大图
     if (t.classList && t.classList.contains('thumb')) {
       showLightbox(t.dataset.full || '', t.getAttribute('src'), grabMeta(t.dataset.full || ''));
-    } else if (t.id === 'lightbox' || t.id === 'lightbox-img') {
-      $('lightbox').hidden = true;
-      $('lightbox-img').src = '';
+      return;
     }
+    if (t.id === 'lightbox-img') {
+      // 点大图 = 取过该点的整行/整列剖面（读的是保存的那个 16 位 PNG）
+      const img = $(t.id);
+      const pt = profPixel(ev.clientX, ev.clientY, img.getBoundingClientRect(),
+                           img.naturalWidth, img.naturalHeight);
+      if (pt && lightboxPath) {
+        profPoint.lightbox = { path: lightboxPath, x: pt.x, y: pt.y };
+        profFetch('lightbox');
+      }
+      return;
+    }
+    if (t.id === 'lightbox') closeLightbox();     // 点背景才关（点图现在是取剖面）
+  });
+
+  $('ccd-img').onclick = function (ev) {
+    if (!ccdLive) return;
+    const img = $('ccd-img');
+    const pt = profPixel(ev.clientX, ev.clientY, img.getBoundingClientRect(),
+                         img.naturalWidth, img.naturalHeight);
+    if (!pt) return;
+    profPoint.preview = pt;
+    profFetch('preview');
+  };
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !$('lightbox').hidden) closeLightbox();
   });
 
   const enterTo = function (id, btn) {

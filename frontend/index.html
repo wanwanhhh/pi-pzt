@@ -137,6 +137,7 @@
         <div class="ccdview">
           <div class="ccdstack" id="ccd-stack">
             <img id="ccd-img" alt="相机预览（原始灰度，未做任何处理）" hidden>
+            <div id="ccd-cut" class="cut" hidden><i id="ccd-cut-v" class="cutv"></i><i id="ccd-cut-h" class="cuth"></i></div>
             <div id="ccd-cross" class="cross" hidden></div>
           </div>
           <p class="hint" id="ccd-empty">点「开始预览」打开相机。画面是<b>原始灰度、不做任何处理</b>；
@@ -171,6 +172,18 @@
         <p class="hint">这里<b>只列手动保存的原始帧</b>（16 位、原生全幅）；扫描各点的图在「扫描」页的点位表里看。
           点缩略图看大图（就是原始帧本身，16 位 PNG）；<b>点名字改名 = 磁盘上真的改文件名</b>（后缀缺了会自动补 .png，
           重名或含非法字符会被后端拒绝）。</p>
+      </section>
+
+      <!-- 轮廓图：点预览图取"过该点的整行 / 整列"剖面。数据是后端原生 16 位帧上的原值，
+           不平滑、不扣背景；切线方向跟着预览朝向走。 -->
+      <section class="card" id="card-profile">
+        <h2>轮廓图 <span class="sub" id="prof-where">在预览图上点一下</span></h2>
+        <div class="chart prof" id="prof-h"></div>
+        <div class="chart prof" id="prof-v"></div>
+        <p class="hint" id="prof-note">在预览图上点一下：取过该点的<b>整行</b>（上）与<b>整列</b>（下）两条剖面，
+          数据是<b>原生 16 位</b>原值（0~1022 ADU）—— 不平滑、不扣背景、不归一化，画出来是什么就是什么。
+          横轴是<b>显示坐标</b>下的像素位置，切线方向跟着预览朝向走；实时跟着预览刷新。
+          图库里点开大图也能切（那读的是保存的 PNG 本身）。</p>
       </section>
 
     </div>
@@ -244,10 +257,19 @@
 
 <div id="toast"></div>
 <div id="lightbox" hidden>
-  <img id="lightbox-img" alt="">
-  <p id="lightbox-cap" hidden><b id="lightbox-meta">—</b><br>显示的是<b>8 位映射</b>（原始值 ÷4，与预览同一口径）。原始 16 位 PNG：<a
-      id="lightbox-raw" href="" download>下载 / 打开</a> —— 数据只占 0~1022，浏览器按 16 位满量程渲染就是黑的，
-    定量请看文件本身（ImageJ / Python）。</p>
+  <div class="lb-imgwrap">
+    <img id="lightbox-img" alt="">
+    <div id="lb-cut" class="cut" hidden><i id="lb-cut-v" class="cutv"></i><i id="lb-cut-h" class="cuth"></i></div>
+  </div>
+  <div id="lightbox-side">
+    <p id="lightbox-cap" hidden><b id="lightbox-meta">—</b><br>显示的是<b>8 位映射</b>（原始值 ÷4，与预览同一口径）。原始 16 位 PNG：<a
+        id="lightbox-raw" href="" download>下载 / 打开</a> —— 数据只占 0~1022，浏览器按 16 位满量程渲染就是黑的，
+      定量请看文件本身（ImageJ / Python）。</p>
+    <p class="hint">点大图取剖面：过该点的<b>整行</b>与<b>整列</b>，读的是保存的 16 位 PNG 原值。
+      点背景或按 Esc 关闭。</p>
+    <div class="chart prof" id="lb-prof-h"></div>
+    <div class="chart prof" id="lb-prof-v"></div>
+  </div>
 </div>
 
 

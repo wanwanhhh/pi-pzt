@@ -219,6 +219,14 @@ td.bad { color: var(--bad); }
 #ccd-cross::before { left: 12px; top: 0; width: 2px; height: 26px; }
 #ccd-cross::after { top: 12px; left: 0; height: 2px; width: 26px; }
 #ccd-cross[hidden] { display: none; }
+/* 取剖面的切线：画的就是"过点的整行 / 整列"这两条线本身（横贯整个画面），
+   与质心那个自动算出来的十字（#ccd-cross）区分开：这个是你点的，那个是后端算的。 */
+.cut { position: absolute; inset: 0; pointer-events: none; }
+.cut[hidden] { display: none; }
+.cutv { position: absolute; top: 0; bottom: 0; width: 1px; background: #22d3ee; box-shadow: 0 0 2px rgba(0, 0, 0, .85); }
+.cuth { position: absolute; left: 0; right: 0; height: 1px; background: #22d3ee; box-shadow: 0 0 2px rgba(0, 0, 0, .85); }
+/* 轮廓图：两张矮一点的图，排在卡片里 */
+.chart.prof { min-height: 150px; }
 /* 图片没来时提示文字居中占位（"有图就藏提示"由 JS 管：切帧、停止、失败三条路都要管，
    写在 CSS 里只能覆盖其中一条） */
 .ccdview .hint { margin: 0; padding: 16px; text-align: center; }
@@ -282,20 +290,24 @@ td.bad { color: var(--bad); }
 #toast.show.err { background: var(--bad); }
 
 /* ---------- 大图 ---------- */
+/* 左边是图（点它取剖面），右边是说明 + 两张轮廓图。点背景或 Esc 关闭。 */
 #lightbox {
-  position: fixed; inset: 0; background: rgba(15,23,42,.75);
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 10px; z-index: 200; cursor: zoom-out;
+  position: fixed; inset: 0; background: rgba(15,23,42,.85);
+  display: flex; align-items: center; justify-content: center;
+  gap: 14px; padding: 16px; z-index: 200;
 }
 #lightbox[hidden] { display: none; }
+.lb-imgwrap { position: relative; min-width: 0; cursor: crosshair; }
+/* 大图多是**缩小**显示（1440 px 挤进 56vw），所以平滑缩放；pixelated 只适合放大看像素 */
 #lightbox img {
-  max-width: 80vw; max-height: 76vh; background: #fff;
+  display: block; max-width: 56vw; max-height: 84vh; background: #fff;
   border-radius: 8px; image-rendering: auto;
 }
-/* 说明条：大图多是**缩小**显示（1440 px 挤进 80vw），pixelated 只适合放大看像素 */
-#lightbox-cap {
-  margin: 0; max-width: 80vw; cursor: auto; background: rgba(15,23,42,.9);
-  color: #e2e8f0; font-size: 13px; line-height: 1.5; padding: 8px 12px; border-radius: 8px;
+#lightbox-side {
+  width: 400px; max-width: 36vw; max-height: 88vh; overflow: auto;
+  background: var(--card); border-radius: 10px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 8px;
 }
+#lightbox-cap { margin: 0; cursor: auto; color: var(--text); font-size: 13px; line-height: 1.5; }
 #lightbox-cap[hidden] { display: none; }
-#lightbox-cap a { color: #93c5fd; }
+#lightbox-cap a { color: #2563eb; }

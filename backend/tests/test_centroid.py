@@ -1,4 +1,4 @@
-"""全局质心的离线自检：定义、边界、与暴力法一致、饱和计数。
+"""预览质心与轮廓图（剖面）的离线自检：定义、边界、与暴力法一致、饱和计数、切片。
 
 **这个质心按用户定的口径：整幅图的强度加权重心，不扣背景、不设阈值、不开窗。**
 不碰硬件、不碰数据库。直接跑：python backend/tests/test_centroid.py
@@ -215,6 +215,78 @@ def test_thumb_cache_key_covers_size_and_mtime():
         before = _thumb_cache_name(p, 260)
         os.utime(p, (p.stat().st_atime, p.stat().st_mtime + 5))
         assert _thumb_cache_name(p, 260) != before, "mtime 变了键要跟着变"
+
+
+def test_profile_cuts_the_whole_row_and_column():
+    """轮廓图 = 过点的**整行**与**整列**，原值返回（16 位、不处理）。
+    朝向为 0 时就是传感器的行/列 —— 转置了的话这条会红。"""
+    from backend.thorlabs_ccd import ThorlabsCamera
+
+    cam = ThorlabsCamera()
+    cam._rotation = 0
+    f = np.zeros((4, 6), dtype=np.uint16)
+    f[:, 3] = [1, 2, 3, 4]                    # 第 3 列
+    f[2, :] = [10, 20, 30, 40, 50, 60]        # 第 2 行；交叉点 (3,2) 最后写，所以两边都该是 40
+    cam._live = f
+    p = cam.profile(3, 2)
+    assert p["horizontal"] == [10, 20, 30, 40, 50, 60], p["horizontal"]
+    assert p["vertical"] == [1, 2, 40, 4], p["vertical"]      # 交叉点两条剖面里必须是同一个数
+    assert (p["width"], p["height"], p["bits"], p["full_scale"]) == (6, 4, 16, 1022), p
+    assert p["rotation"] == 0
+
+
+def test_profile_follows_rotation():
+    """转了 90° 之后"水平"要指**看到的**水平：显示水平 = 传感器的某一列（自下往上），
+    显示垂直 = 传感器的某一行（自左往右）。"""
+    from backend.thorlabs_ccd import ThorlabsCamera
+
+    cam = ThorlabsCamera()
+    f = np.arange(4 * 6, dtype=np.uint16).reshape(4, 6)      # frame[y, x] = y*6 + x
+    cam._live = f
+    cam._rotation = 90
+    p = cam.profile(0, 0)                                    # 显示坐标系左上角
+    assert (p["width"], p["height"]) == (4, 6), (p["width"], p["height"])   # 宽高互换
+    # 顺时针 90°：显示 (x', y') = (H-1-y, x)。显示第 0 行来自传感器第 0 列，自下往上
+    assert p["horizontal"] == [int(f[3, 0]), int(f[2, 0]), int(f[1, 0]), int(f[0, 0])], p["horizontal"]
+    assert p["vertical"] == [int(v) for v in f[3, :]], p["vertical"]
+
+
+def test_profile_refuses_bad_points_and_no_frame():
+    from backend.thorlabs_ccd import CameraError, ThorlabsCamera
+
+    cam = ThorlabsCamera()
+    try:
+        cam.profile(0, 0)
+    except CameraError as exc:
+        assert "先开预览" in str(exc), exc
+    else:
+        raise AssertionError("没有帧时应该明确报错，而不是返回空剖面")
+    cam._live = np.zeros((4, 6), dtype=np.uint16)
+    for bad in ((6, 0), (0, 4), (99, 99)):
+        try:
+            cam.profile(*bad)
+        except CameraError:
+            continue
+        raise AssertionError(f"{bad} 越界应该被拒")
+
+
+def test_png_profile_reads_the_saved_file():
+    """存下来的 PNG 也能切：坐标就是文件坐标（文件是传感器朝向，从不旋转）。"""
+    import tempfile
+    from pathlib import Path
+
+    from backend.thorlabs_ccd import _save_png16, png_profile
+
+    f = np.zeros((5, 7), dtype=np.uint16)
+    f[:, 2] = [11, 12, 13, 14, 15]
+    f[1, :] = [1, 2, 3, 4, 5, 6, 7]        # 交叉点最后写：水平里是 3，垂直里也是 3
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.png"
+        _save_png16(p, f, 1000)
+        got = png_profile(p, 2, 1)
+    assert got["horizontal"] == [1, 2, 3, 4, 5, 6, 7], got["horizontal"]
+    assert got["vertical"] == [11, 3, 13, 14, 15], got["vertical"]
+    assert (got["width"], got["height"], got["bits"], got["full_scale"]) == (7, 5, 16, 1022), got
 
 
 def main() -> int:

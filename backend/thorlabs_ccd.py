@@ -149,6 +149,9 @@ class ThorlabsCamera:
             self._rotation = 0
         # 最近一次整帧采集：(ndarray, 实际曝光 us, ROI, 质心 dict（传感器坐标）)
         self._shot: Optional[tuple] = None
+        # 最近一帧**原生 16 位**（未旋转、已 copy 脱离 SDK 缓冲）：轮廓图从这里切，
+        # 预览 JPEG 是对着屏幕用的，不能拿来画剖面（>>2 与 JPEG 都会动数）。
+        self._live: Optional[object] = None
         self._thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------ 生命周期
@@ -424,6 +427,9 @@ class ThorlabsCamera:
         # 不受预览朝向影响（要拿读数去对文件里的像素，不用做任何换算）。
         # 预览 JPEG 只是投递用的，别拿它算数。
         centroid = global_centroid(img)
+        # 留一份原生帧给轮廓图：**必须 copy** —— SDK 的 buffer 下一轮就覆写了，
+        # 而剖面是 HTTP 线程随时来取的（跨线程读 SDK 缓冲是数据竞争）。约 3 MB/帧，1 ms 级。
+        snapshot = img.copy()
         # 预览朝向**只在这之后**作用于显示：np.rot90 是视图（不复制、不重采样，90° 整数倍是精确置换）。
         # 取 -k 是因为界面上的 90° 要**顺时针**（多数看图软件的习惯），np.rot90 默认是逆时针。
         rotation = self._rotation
@@ -436,6 +442,7 @@ class ThorlabsCamera:
         with self._lock:
             self._jpeg = jpeg
             self._centroid = centroid
+            self._live = snapshot
             self._frames += 1
         # 每 60 帧报一次各段耗时：全幅预览慢在哪要让日志说得清，别靠猜
         if self._frames % 60 == 1:
@@ -484,6 +491,32 @@ class ThorlabsCamera:
                  index, path.name, img.shape[1], img.shape[0], size, shot_exposure,
                  float(img.mean()))
         return f"images/{path.name}"
+
+    def profile(self, x: int, y: int) -> dict:
+        """过 (x, y) 的两条**全长**剖面：水平取整行、垂直取整列。
+
+        **取自最近一帧的原生 16 位数据**（不是预览 JPEG），值就是相机给的那串整数（0~1022 ADU），
+        不做任何处理 —— 不做背景、不平滑、不归一化。
+        坐标是**显示坐标**：先按当前朝向转成视图再切，所以转向之后"水平"仍然是你眼睛看到的水平；
+        文件里的那个坐标是传感器坐标，两者在转了 90° 时会差一个转置（界面会写明当前朝向）。
+        """
+        import numpy as np
+
+        with self._lock:
+            frame = self._live
+            rotation = self._rotation
+        if frame is None:
+            raise CameraError("还没有帧：先开预览")
+        view = np.rot90(frame, -(rotation // 90)) if rotation else frame
+        h, w = view.shape
+        if not (0 <= x < w and 0 <= y < h):
+            raise CameraError(f"点 ({x}, {y}) 超出画面 {w}×{h}")
+        return {
+            "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+            "rotation": rotation, "bits": 16, "full_scale": TL_SATURATION_ADU,
+            "horizontal": [int(v) for v in view[y, :]],
+            "vertical": [int(v) for v in view[:, x]],
+        }
 
     def set_rotation(self, deg: int) -> dict:
         """改**预览显示朝向**（顺时针 0/90/180/270），立刻生效。
@@ -648,6 +681,29 @@ def thumb_jpeg(src: Path, max_side: int = 260) -> bytes:
     img.save(buf, "JPEG", quality=80)
     cache.write_bytes(buf.getvalue())
     return buf.getvalue()
+
+
+def png_profile(path: Path, x: int, y: int) -> dict:
+    """从**存下来的 PNG** 里过 (x, y) 取两条全长剖面（水平整行 + 垂直整列）。
+
+    文件永远是**传感器朝向**（保存从不旋转），大图显示的也是它，所以这里的坐标就是你在图上
+    点的那个位置。16 位值原样返回；假相机那种 8 位占位图也照实说（bits/full_scale 跟着变）。
+    """
+    import numpy as np
+    from PIL import Image
+
+    arr = np.asarray(Image.open(path))
+    h, w = arr.shape
+    if not (0 <= x < w and 0 <= y < h):
+        raise ValueError(f"点 ({x}, {y}) 超出画面 {w}×{h}")
+    bits = 16 if arr.dtype == np.uint16 else 8
+    return {
+        "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+        "rotation": 0, "bits": bits,
+        "full_scale": TL_SATURATION_ADU if bits == 16 else 255,
+        "horizontal": [int(v) for v in arr[y, :]],
+        "vertical": [int(v) for v in arr[:, x]],
+    }
 
 
 def _image_path(scan_id: int, index: int) -> Path:

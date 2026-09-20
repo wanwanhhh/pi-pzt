@@ -742,6 +742,53 @@ const count = (m) => calls.filter((c) => c === m).length;
      JSON.stringify(read("$('lightbox-meta').textContent")));
   route = () => ({ body: [] });
 
+  console.log('\n[R] 轮廓图：点图取整行/整列，原值上图，切线画在像素中心');
+  const box = { left: 10, top: 20, width: 600, height: 450 };     // 1440×1080 的图显示成 600×450
+  const boxJs = JSON.stringify(box);
+  ok('点正中 → 图心 (720, 540)',
+     read('JSON.stringify(profPixel(310, 245, ' + boxJs + ', 1440, 1080))') === '{"x":720,"y":540}',
+     read('JSON.stringify(profPixel(310, 245, ' + boxJs + ', 1440, 1080))'));
+  ok('点左上角 → (0, 0)',
+     read('JSON.stringify(profPixel(10, 20, ' + boxJs + ', 1440, 1080))') === '{"x":0,"y":0}');
+  ok('点右下角 → 最后一个像素 (1439, 1079)',
+     read('JSON.stringify(profPixel(610, 470, ' + boxJs + ', 1440, 1080))') === '{"x":1439,"y":1079}');
+  ok('点在图上边缘外 → null（不猜坐标）',
+     read('profPixel(9, 20, ' + boxJs + ', 1440, 1080)') === null &&
+     read('profPixel(310, 471, ' + boxJs + ', 1440, 1080)') === null);
+  ok('图还没有像素尺寸时不猜坐标', read('profPixel(100, 100, ' + boxJs + ', 0, 0)') === null);
+
+  const profPayload = {
+    x: 720, y: 540, width: 1440, height: 1080, rotation: 90, bits: 16, full_scale: 1022,
+    horizontal: [1, 2, 3], vertical: [4, 5],
+  };
+  run('profApply("preview", ' + JSON.stringify(profPayload) + ')');
+  ok('水平剖面原样上图（不做任何处理）',
+     read('JSON.stringify(profCharts.preview.h.data)') === '[[0,1,2],[1,2,3]]',
+     read('JSON.stringify(profCharts.preview.h.data)'));
+  ok('垂直剖面原样上图',
+     read('JSON.stringify(profCharts.preview.v.data)') === '[[0,1],[4,5]]',
+     read('JSON.stringify(profCharts.preview.v.data)'));
+  ok('切线画在那一行/列的**像素中心**',
+     read("$('ccd-cut').hidden") === false &&
+     read("$('ccd-cut-v').style.left") === ((720 + 0.5) / 1440 * 100) + '%' &&
+     read("$('ccd-cut-h').style.top") === ((540 + 0.5) / 1080 * 100) + '%',
+     read("$('ccd-cut-v').style.left") + ' / ' + read("$('ccd-cut-h').style.top"));
+  ok('读数写明坐标、尺寸、朝向、位深',
+     read("$('prof-where').textContent").indexOf('(720, 540)') >= 0 &&
+     read("$('prof-where').textContent").indexOf('1440×1080') >= 0 &&
+     read("$('prof-where').textContent").indexOf('预览 90°') >= 0 &&
+     read("$('prof-where').textContent").indexOf('16 位') >= 0,
+     JSON.stringify(read("$('prof-where').textContent")));
+  run('profApply("lightbox", ' + JSON.stringify(profPayload) + ')');
+  ok('大图那一套也能画（读保存的 PNG，同一套画法）',
+     read("$('lb-cut').hidden") === false &&
+     read('JSON.stringify(profCharts.lightbox.h.data)') === '[[0,1,2],[1,2,3]]');
+  run('profClear("preview")');
+  ok('清掉之后切线收起、数据清空、提示复位',
+     read("$('ccd-cut').hidden") === true &&
+     read('JSON.stringify(profCharts.preview.h.data)') === '[[],[]]' &&
+     read("$('prof-where').textContent") === '在预览图上点一下');
+
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');
   process.exit(failed ? 1 : 0);
 })();

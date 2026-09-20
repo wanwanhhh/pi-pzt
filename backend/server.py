@@ -430,6 +430,46 @@ def delete_grab(name: str) -> dict:
     return {"ok": True}
 
 
+@app.get("/api/ccd/profile")
+async def ccd_profile(
+    x: int = Query(..., ge=0, description="显示坐标（跟随预览朝向）"),
+    y: int = Query(..., ge=0),
+) -> dict:
+    """过 (x, y) 的两条**全长**剖面：水平整行 + 垂直整列，取自最近一帧**原生 16 位**数据。
+
+    坐标是**显示坐标** —— 先按当前朝向转成视图再切，所以转了 90° 之后"水平"仍是你看到的水平。
+    不做任何处理（不扣背景、不平滑），值就是相机的 0~1022 ADU。
+    """
+    _ccd_idle()
+    from .config import CCD_BACKEND
+
+    if CCD_BACKEND != "thorlabs":
+        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
+    from .ccd import thorlabs_camera
+
+    try:
+        return await asyncio.to_thread(thorlabs_camera().profile, x, y)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/image/profile")
+def image_profile(
+    path: str = Query(..., description="相对 data/ 的路径"),
+    x: int = Query(..., ge=0, description="文件坐标（保存的文件是传感器朝向）"),
+    y: int = Query(..., ge=0),
+) -> dict:
+    """存下来的 PNG 的剖面。文件不转朝向，所以这里的 (x, y) 就是你在图上点的位置。"""
+    from .thorlabs_ccd import png_profile
+
+    try:
+        return png_profile(_safe_image_path(path), x, y)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/image/meta")
 def image_meta(path: str = Query(..., description="相对 data/ 的路径，例如 images/scan0001_00000.png")) -> dict:
     """任意一张 data/ 下图片**自己身上**记的元数据（曝光、质心）。
