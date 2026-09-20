@@ -52,8 +52,6 @@ CREATE TABLE IF NOT EXISTS point (
 -- 下面的 ON CONFLICT 只是"同一张重复登记"的兜底，不是覆盖别人的入口。
 CREATE TABLE IF NOT EXISTS grab (
     filename    TEXT PRIMARY KEY,
-    label       TEXT NOT NULL DEFAULT '',
-    note        TEXT NOT NULL DEFAULT '',
     created_at  REAL NOT NULL
 );
 """
@@ -64,9 +62,6 @@ CREATE TABLE IF NOT EXISTS grab (
 MIGRATIONS = (
     # (表, 列, 类型, 老行补什么值)
     ("point", "settle_source", "TEXT", SETTLE_UNKNOWN),
-    # 备注：给一帧记实验条件（曝光、增益、样品、光源…）。
-    # 加在 MIGRATIONS 里对**已有的库**才生效 —— CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做。
-    ("grab", "note", "TEXT", ""),
 )
 
 # 终止态：进程启动时把这两个状态之外的残留扫描判为 aborted
@@ -162,7 +157,7 @@ def register_grab(filename: str) -> None:
     """记下这一帧；已经有记录就不动它的名字（重复保存同名文件时才走 upsert）。"""
     with _db() as conn:
         conn.execute(
-            "INSERT INTO grab (filename, label, created_at) VALUES (?, '', ?)"
+            "INSERT INTO grab (filename, created_at) VALUES (?, ?)"
             " ON CONFLICT(filename) DO UPDATE SET created_at = excluded.created_at",
             (filename, time.time()),
         )
@@ -182,11 +177,6 @@ def rename_grab(old: str, new: str) -> None:
     """
     with _db() as conn:
         conn.execute("UPDATE grab SET filename = ? WHERE filename = ?", (new, old))
-
-
-def set_grab_note(filename: str, note: str) -> None:
-    with _db() as conn:
-        conn.execute("UPDATE grab SET note = ? WHERE filename = ?", (note, filename))
 
 
 def delete_grab(filename: str) -> None:

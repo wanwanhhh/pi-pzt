@@ -307,7 +307,6 @@ def list_grabs(limit: int = Query(60, ge=1, le=500)) -> dict:
             continue
         items.append({
             "name": f.name, "path": f"images/{f.name}",
-            "label": row["label"], "note": row["note"],
             # 曝光从 PNG 自己的 tEXt 里读（不存库，文件自证）；老图没有就 None
             "exposure_us": read_png_exposure(f),
             "bytes": f.stat().st_size, "mtime": f.stat().st_mtime,
@@ -388,18 +387,6 @@ def rename_grab(
         cache.unlink(missing_ok=True)      # 缩略图缓存按文件名做键，旧的清掉
     log.info("原始帧改名：%s → %s", name, new)
     return {"ok": True, "name": new, "old": name}
-
-
-@app.post("/api/grabs/note")
-def note_grab(
-    name: str = Query(..., description="文件名"),
-    note: str = Query("", description="备注：实验条件、现象…；空串 = 清空"),
-) -> dict:
-    """给一帧写备注（曝光/增益/样品/光源这类实验条件）。同样只写库，不动文件。"""
-    _grab_file(name)
-    clean = _clean_text(note, 500)
-    store.set_grab_note(name, clean)
-    return {"ok": True, "name": name, "note": clean}
 
 
 @app.post("/api/grabs/purge")

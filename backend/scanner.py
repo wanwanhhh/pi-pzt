@@ -171,6 +171,10 @@ class Scanner:
         except StageAborted:
             status, message = "aborted", "急停，扫描已中止"
         except BaseException as exc:  # 执行器线程：必须落库，不能让任务悬着
+            # 相机报错也走这条：**扫描中相机出错就整条停下**（AGENTS.md 相机一节定的规矩）——
+            # 不重试、不"该点无效后继续"。相机取帧本身会等满 TL_CAPTURE_TIMEOUT_S 才放弃，
+            # 真报错时多半不是瞬时抖动；继续跑只会白采 + 白走行程。跑过的点都在库里，
+            # 半截的那条扫描由人在界面上手动删（DELETE /api/scans/{id}）。
             status, message = "failed", f"{type(exc).__name__}: {exc}"
             log.exception("扫描 %s 失败", scan_id)
         finally:
