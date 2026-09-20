@@ -154,6 +154,12 @@ TL_FULL_ROI = (0, 0, 1440, 1080)      # 原生全幅：保存一律用它，不�
 TL_PREVIEW_ROI = (0, 0, 1440, 1080)
 TL_PREVIEW_FPS = float(os.getenv("PI_CCD_PREVIEW_FPS", "15"))
 TL_JPEG_QUALITY = int(os.getenv("PI_CCD_JPEG_QUALITY", "80"))
+# 满量程：**实测值**（认识账 A3）——SDK 交出来的最大值是 1022，不是 4095 也不是 65535。
+# 饱和像素计数用它当门限；拿 4095 判会把过曝帧判成"没饱和"（踩过，白跑一轮）。
+TL_SATURATION_ADU = 1022
+# 预览显示朝向（0/90/180/270，顺时针）。**只转预览**：保存的文件永远是传感器原始朝向，
+# 质心的**读数**也永远是传感器坐标（在未旋转的那一帧上算）；只有十字线跟着预览朝向画。
+TL_PREVIEW_ROTATION = int(os.getenv("PI_CCD_ROTATION", "0"))
 TL_OPEN_TIMEOUT_S = 15.0     # 打开相机（含固件握手）的上限
 TL_CAPTURE_TIMEOUT_S = 30.0  # 单帧采集上限（含曝光）
 

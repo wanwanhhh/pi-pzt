@@ -325,6 +325,7 @@ function renderScan(sc) {
   if (scanActive && ccdLive) ccdLiveStop();
   $('btn-ccd-live').disabled = !ccdAvailable || scanActive;
   $('btn-ccd-grab').disabled = !ccdAvailable || scanActive;
+  $('btn-ccd-rot').disabled = !ccdAvailable || scanActive;
 
   syncTraceFlag();
 }
@@ -683,8 +684,16 @@ async function ccdStatus() {
   ccdAvailable = !!d.available;
   $('btn-ccd-live').disabled = !ccdAvailable || scanActive;
   $('btn-ccd-grab').disabled = !ccdAvailable || scanActive;
-  $('ccd-note').textContent = ccdAvailable
-    ? '保存的图一律用原生全幅 ' + d.full_roi[2] + '×' + d.full_roi[3] + '，不裁剪；预览也是全幅，看到的就是存下来的那一片。'
+  $('btn-ccd-rot').disabled = !ccdAvailable || scanActive;
+  // **这段文字只能在这里写一次**：以前 index.html 里也写了一份，结果被这一行整段覆盖，
+  // 界面上永远看不到新加的口径说明（评审抓到的）。数字一律取后端下发的值，别在 JS 里写死。
+  $('ccd-note').innerHTML = ccdAvailable
+    ? '保存一律<b>原生全幅</b> ' + d.full_roi[2] + '×' + d.full_roi[3] + '、16 位、不裁剪也不拉伸；' +
+      '预览也是全幅，看到的就是存下来的那一片。曝光（相机读回值）写在<b>图片自己身上</b>，列表里直接能看到。<br>' +
+      '质心是<b>整幅图的强度加权重心、不做任何处理</b>（不扣背景、不设阈值、不开窗）：' +
+      '背景也照权重参与，所以光斑占总强度越小，它越偏向背景的重心；峰值到 ' + d.saturation_adu + ' 就是饱和。<br>' +
+      '质心读数永远是<b>传感器坐标</b>（与保存的 PNG 同一套，<b>转预览不影响它</b>），' +
+      '十字线则跟着预览朝向画到当前画面上。'
     : (d.message || '当前后端没有接入真相机。');
   ccdPaint(d);
   return d;
@@ -706,9 +715,65 @@ function ccdPaintForm(st) {
   }
 }
 
+/* 后端给的质心永远是**传感器坐标**（与保存的 PNG 同一套），所以读数不受预览朝向影响 ——
+   拿这个数去对文件里的像素，不用做任何换算。十字线要画在"看到的那一帧"上，所以这里按当前
+   朝向做一次坐标换算（显示，不是计算）。映射与后端
+   test_clockwise_rotation_maps_the_centroid_this_way 是同一张表（顺时针）：
+     90°：(x', y') = (H-1-y, x)，显示尺寸 (H, W)；180°：(W-1-x, H-1-y)；270°：(y, W-1-x)。 */
+function ccdDisplayPoint(c, rotation) {
+  const k = (((rotation || 0) % 360) + 360) % 360;
+  const W = c.width, H = c.height;
+  if (k === 90) return { x: H - 1 - c.cy, y: c.cx, w: H, h: W };
+  if (k === 180) return { x: W - 1 - c.cx, y: H - 1 - c.cy, w: W, h: H };
+  if (k === 270) return { x: c.cy, y: W - 1 - c.cx, w: H, h: W };
+  return { x: c.cx, y: c.cy, w: W, h: H };
+}
+
+/* 十字线 + 读数。**坐标由后端在原生 16 位帧上算好**，这里只按比例摆到图上
+   （显示，不是计算）。left/top 用百分比：十字线的父元素与图片同尺寸，缩放不会偏。
+   后端给的是整幅图的强度加权重心，不扣背景 —— 这个口径写在 ccd-note 的提示里。 */
+function ccdPaintCentroid(st) {
+  const cross = $('ccd-cross');
+  const c = (ccdLive && st) ? st.centroid : null;
+  if (!c || c.cx === null || c.cx === undefined || !c.width || !c.height) {
+    cross.hidden = true;
+    setText('ccd-cen', '—'); setText('ccd-sum', '—'); setText('ccd-sat', '—');
+    $('ccd-sat').className = '';
+    $('ccd-stack').className = 'ccdstack';
+    return;
+  }
+  const p = ccdDisplayPoint(c, st.rotation);
+  // 90°/270° 时画面是竖的：给容器加个 class，由 CSS 按高度收宽度（详见 style.css）
+  $('ccd-stack').className = 'ccdstack' + ((st.rotation === 90 || st.rotation === 270) ? ' tall' : '');
+  cross.hidden = false;
+  cross.style.left = (p.x / p.w * 100).toFixed(3) + '%';
+  cross.style.top = (p.y / p.h * 100).toFixed(3) + '%';
+  setText('ccd-cen', c.cx.toFixed(2) + ', ' + c.cy.toFixed(2));
+  setText('ccd-sum', c.sum.toExponential(2));
+  // 峰值到满量程（1022）就是饱和：对称光斑削顶不偏，但落在强度梯度上时会往亮侧偏
+  const sat = $('ccd-sat');
+  sat.textContent = c.peak + ' / ' + c.saturated;
+  sat.className = c.saturated ? 'on' : '';
+}
+
+/* 旋转：转的是**看的方向**。后端把预览帧转过来显示（90° 整数倍是精确置换，不重采样、不丢数），
+   保存的原生帧永远是传感器朝向；质心读数跟着预览一起转（看到什么就读到什么）。
+   连点四下一圈：0 → 90 → 180 → 270 → 0。 */
+async function ccdRotate() {
+  const cur = (ccdInfo && ccdInfo.rotation) || 0;
+  const next = (cur + 90) % 360;
+  const st = await post('/api/ccd/rotation?deg=' + next);
+  if (!st) return;                       // 失败原因 request() 已经弹过
+  ccdInfo = st;
+  ccdPaint(st);
+  toast('预览朝向 ' + (next ? next + '°' : '0°（传感器原始）') + '；保存的文件不受影响');
+}
+
 function ccdPaint(st) {
   if (!st) return;
   ccdPaintForm(st);
+  setText('ccd-rot', st.rotation ? st.rotation + '°（仅预览）' : '0°（传感器原始）');
+  ccdPaintCentroid(st);
   $('ccd-sub').textContent = st.open
     ? (st.model || '已连接') + (st.serial ? ' · ' + st.serial : '')
     : (ccdAvailable ? '相机未打开' : '不可用');
@@ -723,6 +788,8 @@ function ccdPaint(st) {
    设成空串会取消上一张还没下完的请求。 */
 function ccdTick() {
   if (!ccdLive) return;
+  // 顺带取一次状态：质心/ΣI/饱和这些读数就在状态里，跟着预览的节拍刷新（只读内存，不碰设备）
+  ccdStatus();
   const img = $('ccd-img');
   img.onload = function () {
     ccdFails = 0;
@@ -781,6 +848,7 @@ function ccdLiveStop() {
   $('ccd-img').hidden = true;
   $('ccd-empty').hidden = false;
   setText('ccd-fps', '—');
+  ccdPaintCentroid(null);      // 十字线和质心读数一起收起来（停预览后那个数是上一帧的残留）
 }
 
 /* 已保存的采集帧：**只管手动保存的那些**（后端登记表里的，不按文件名前缀猜）。
@@ -1022,6 +1090,7 @@ function wire() {
 
   $('btn-ccd-live').onclick = function () { if (ccdLive) ccdLiveStop(); else ccdLiveStart(); };
   $('btn-ccd-grab').onclick = ccdGrab;
+  $('btn-ccd-rot').onclick = ccdRotate;
   $('btn-grabs-refresh').onclick = loadGrabs;
   // 曝光改完立刻生效（数字框用 change，回车或失焦才发，别每敲一个字符就打设备）
   $('ccd-preview-ms').onchange = ccdSetExposure;

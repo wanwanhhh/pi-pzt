@@ -46,6 +46,8 @@ from .config import (
     TL_OPEN_TIMEOUT_S,
     TL_PREVIEW_FPS,
     TL_PREVIEW_ROI,
+    TL_PREVIEW_ROTATION,
+    TL_SATURATION_ADU,
 )
 
 log = logging.getLogger(__name__)
@@ -136,6 +138,15 @@ class ThorlabsCamera:
         self._wake = threading.Event()
         self._lock = threading.Lock()
         self._jpeg: Optional[bytes] = None
+        self._centroid: Optional[dict] = None   # 最近一帧原生图的全局质心（不扣背景）
+        # 预览显示朝向（0/90/180/270，顺时针）。**只影响预览**：保存永远写传感器原始朝向。
+        # 环境变量写错（比如 45）只该退成 0 并说清楚 —— 一个显示偏好不该让相机对象建不起来，
+        # 那会把 /api/ccd/status 变成一直 500，反而看不出是配置写错了。
+        try:
+            self._rotation = _norm_rotation(TL_PREVIEW_ROTATION)
+        except CameraError as exc:
+            log.error("PI_CCD_ROTATION 配置无效（%s），本次按 0°（传感器原始）走", exc)
+            self._rotation = 0
         self._shot: Optional[tuple] = None    # 最近一次整帧采集：(ndarray, 实际曝光 us, ROI)
         self._thread: Optional[threading.Thread] = None
 
@@ -182,6 +193,9 @@ class ThorlabsCamera:
                 "exposure_max_us": self._exposure_range[1],
                 "preview_roi": list(self._preview_roi),
                 "full_roi": list(self._full_roi),
+                "centroid": self._centroid,     # None = 还没有帧；预览停了就是最后一帧的残留
+                "rotation": self._rotation,     # 预览朝向（保存的文件不受它影响）
+                "saturation_adu": TL_SATURATION_ADU,   # 满量程：界面拿它写"峰值到多少算饱和"
                 "opened_at": self._opened_at,
             }
 
@@ -405,10 +419,22 @@ class ThorlabsCamera:
         if frame is None:
             return
         img = frame.image_buffer
+        # 质心在**未旋转**的原生帧上算：它永远是**传感器坐标**，与保存的 PNG 同一套坐标，
+        # 不受预览朝向影响（要拿读数去对文件里的像素，不用做任何换算）。
+        # 预览 JPEG 只是投递用的，别拿它算数。
+        centroid = global_centroid(img)
+        # 预览朝向**只在这之后**作用于显示：np.rot90 是视图（不复制、不重采样，90° 整数倍是精确置换）。
+        # 取 -k 是因为界面上的 90° 要**顺时针**（多数看图软件的习惯），np.rot90 默认是逆时针。
+        rotation = self._rotation
+        if rotation:
+            import numpy as np      # 与本模块其它地方一样：用到才拉 numpy
+
+            img = np.rot90(img, -(rotation // 90))
         jpeg = _to_jpeg(img, self._jpeg_quality)
         t_enc = time.perf_counter()
         with self._lock:
             self._jpeg = jpeg
+            self._centroid = centroid
             self._frames += 1
         # 每 60 帧报一次各段耗时：全幅预览慢在哪要让日志说得清，别靠猜
         if self._frames % 60 == 1:
@@ -454,6 +480,17 @@ class ThorlabsCamera:
                  index, path.name, img.shape[1], img.shape[0], size, shot_exposure,
                  float(img.mean()))
         return f"images/{path.name}"
+
+    def set_rotation(self, deg: int) -> dict:
+        """改**预览显示朝向**（顺时针 0/90/180/270），立刻生效。
+
+        这不是设备设置，也不碰数据：只是取帧后把它转过来显示（np.rot90 是视图，不重采样）。
+        **保存的原生帧永远是传感器朝向**，**质心读数也永远是传感器坐标**（与文件同一套坐标）；
+        转的只是"看的方向" —— 前端按朝向把十字线画到显示帧上，换算属于显示。
+        """
+        with self._lock:
+            self._rotation = _norm_rotation(deg)
+        return self.status()
 
     def set_exposure(self, exposure_us: int) -> dict:
         """改曝光（预览与采图**一起改**），立刻生效：预览开着时不停流直接改，1~2 帧内就变。
@@ -525,6 +562,43 @@ class ThorlabsCamera:
                 log.warning("关 SDK 失败：%s", exc)
             self._sdk = None
         log.info("相机与 SDK 已释放")
+
+
+def _norm_rotation(deg: int) -> int:
+    """朝向只接受 0/90/180/270（顺时针），别的直接拒绝 —— 不"取个近似值"糊过去。"""
+    deg = int(deg) % 360
+    if deg % 90:
+        raise CameraError(f"预览朝向只能是 0/90/180/270 度，收到 {deg}")
+    return deg
+
+
+def global_centroid(img) -> dict:
+    """整幅图的**强度加权重心**：cx = Σ(I·x)/ΣI，cy = Σ(I·y)/ΣI。
+
+    **不做任何处理**：不扣背景、不设阈值、不开窗（这是用户定的口径）。所以它是
+    "整幅图的亮度重心"，背景也照权重参与；光斑占总强度越小，它离光斑越远
+    （实测：6 px 的小光斑放在 1440×1080、均值 400 ADU 的背景上，只占总强度 0.01%，
+    光斑走 1 px 全局质心只动 0.0001 px —— 见 docs/thorlabs/设备认识账.xml）。
+
+    算法上先按列/按行求和（int64，精确、不溢出），最后才除一次：
+    比"把整幅乘上坐标网格"省一个十几 MB 的临时数组，整幅也就几毫秒。
+    """
+    import numpy as np
+
+    arr = np.asarray(img)
+    h, w = arr.shape
+    col = arr.sum(axis=0, dtype=np.int64)
+    row = arr.sum(axis=1, dtype=np.int64)
+    total = int(col.sum())
+    peak = int(arr.max())
+    saturated = int((arr >= TL_SATURATION_ADU).sum())
+    if total <= 0:
+        return {"cx": None, "cy": None, "sum": 0, "peak": peak,
+                "saturated": saturated, "width": int(w), "height": int(h)}
+    cx = float((col * np.arange(w, dtype=np.int64)).sum() / total)
+    cy = float((row * np.arange(h, dtype=np.int64)).sum() / total)
+    return {"cx": cx, "cy": cy, "sum": total, "peak": peak,
+            "saturated": saturated, "width": int(w), "height": int(h)}
 
 
 # ---------------------------------------------------------------- 图像编码

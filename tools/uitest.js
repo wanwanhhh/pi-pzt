@@ -565,6 +565,102 @@ const count = (m) => calls.filter((c) => c === m).length;
 
   route = () => ({ body: [] });
 
+  console.log('\n[N] 预览质心：后端算好坐标，前端只按比例摆（不量像素、不做阈值/背景扣除）');
+  const cenBody = (centroid) => ({
+    available: true, open: true, model: 'CS165MU', serial: '1', frames: 7,
+    exposure_us: 12000, gain: 0, gain_locked: true,
+    exposure_min_us: 40, exposure_max_us: 26843432,
+    preview_roi: [0, 0, 1440, 1080], full_roi: [0, 0, 1440, 1080], saturation_adu: 1022, centroid,
+  });
+  const cen = (over) => Object.assign(
+    { cx: 718.2, cy: 540.0, sum: 6.339e8, peak: 463, saturated: 0, width: 1440, height: 1080 }, over || {});
+  let ccdBody = cenBody(cen());
+  route = (m, u) => (u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] });
+
+  run('showView("ccd")');
+  await run('ccdLiveStart(true)'); await tick(); await tick();
+  await run('ccdStatus()'); await tick();
+  ok('预览开着时十字线画出来', read("$('ccd-cross').hidden") === false);
+  // 718.2/1440 = 49.875%，540/1080 = 50% —— 百分比而不是像素：缩放/letterbox 都不会偏
+  ok('十字线按比例落在质心上（49.875% / 50%）',
+     Math.abs(parseFloat(read("$('ccd-cross').style.left")) - 49.875) < 1e-6 &&
+     Math.abs(parseFloat(read("$('ccd-cross').style.top")) - 50) < 1e-6,
+     read("$('ccd-cross').style.left") + ' / ' + read("$('ccd-cross').style.top"));
+  ok('质心读数（px）', read("$('ccd-cen').textContent") === '718.20, 540.00',
+     JSON.stringify(read("$('ccd-cen').textContent")));
+  // 口径说明只能有一个来源：index.html 里写过一份，被这里的 innerHTML 覆盖过（评审抓到的）
+  ok('口径说明由状态刷新写上（含传感器坐标与后端下发的饱和门限）',
+     read("$('ccd-note').innerHTML").indexOf('强度加权重心') >= 0 &&
+     read("$('ccd-note').innerHTML").indexOf('传感器坐标') >= 0 &&
+     read("$('ccd-note').innerHTML").indexOf('1022') >= 0,
+     JSON.stringify(read("$('ccd-note').innerHTML").slice(0, 80)));
+  ok('ΣI 用科学计数法', read("$('ccd-sum').textContent") === '6.34e+8',
+     JSON.stringify(read("$('ccd-sum').textContent")));
+  ok('没饱和时不标警告', read("$('ccd-sat').textContent") === '463 / 0' &&
+     read("$('ccd-sat').className") === '', JSON.stringify(read("$('ccd-sat').textContent")));
+
+  // 峰值顶到满量程 1022 就是饱和：对称光斑削顶不偏，落在强度梯度上才会往亮侧偏
+  ccdBody = cenBody(cen({ peak: 1022, saturated: 1234 }));
+  await run('ccdStatus()'); await tick();
+  ok('饱和时读数标出来并加警告样式',
+     read("$('ccd-sat').textContent") === '1022 / 1234' && read("$('ccd-sat').className") === 'on',
+     JSON.stringify(read("$('ccd-sat').textContent")) + ' ' + JSON.stringify(read("$('ccd-sat').className")));
+
+  // 后端还没出帧（刚开预览）：读数留空、十字线别画在 (0,0)
+  ccdBody = cenBody(null);
+  await run('ccdStatus()'); await tick();
+  ok('后端还没有帧时十字线收起、读数留空',
+     read("$('ccd-cross').hidden") === true && read("$('ccd-cen').textContent") === '—',
+     JSON.stringify(read("$('ccd-cen').textContent")));
+
+  ccdBody = cenBody(cen());
+  await run('ccdStatus()'); await tick();
+
+  // 朝向：只转"看的方向"，一次 90°，四下一圈；保存的文件不受影响
+  route = (m, u) => {
+    if (u.indexOf('/api/ccd/rotation') === 0) {
+      const deg = parseInt(u.split('deg=')[1], 10);
+      return { body: Object.assign(cenBody(cen()), { rotation: deg }) };
+    }
+    return u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] };
+  };
+  await run('ccdStatus()'); await tick();
+  ok('默认朝向写"传感器原始"', read("$('ccd-rot').textContent") === '0°（传感器原始）',
+     JSON.stringify(read("$('ccd-rot').textContent")));
+  await run('ccdRotate()'); await tick();
+  ok('点一下转 90°，并调了后端', read("$('ccd-rot').textContent") === '90°（仅预览）' &&
+     calls.indexOf('POST /api/ccd/rotation?deg=90') >= 0,
+     JSON.stringify(read("$('ccd-rot').textContent")));
+  await run('ccdRotate()'); await tick();
+  await run('ccdRotate()'); await tick();
+  await run('ccdRotate()'); await tick();
+  ok('连点四下转回 0°（一圈四档，不会越转越多）',
+     read('ccdInfo.rotation') === 0 && read("$('ccd-rot').textContent") === '0°（传感器原始）',
+     JSON.stringify(read('ccdInfo.rotation')));
+
+  // 读数永远是**传感器坐标**（与保存的 PNG 同一套），十字线按朝向换算到显示帧上。
+  // 期望值来自后端 test_clockwise_rotation_maps_the_centroid_this_way 那张表：
+  // 传感器质心 (718.2, 540.0)，W=1440 H=1080
+  const expectCross = async (deg, left, top) => {
+    ccdBody = Object.assign(cenBody(cen()), { rotation: deg });
+    await run('ccdStatus()'); await tick();
+    const L = read("$('ccd-cross').style.left"), T = read("$('ccd-cross').style.top");
+    ok('朝向 ' + deg + '°：十字线落在显示帧的正确位置', L === left && T === top, L + ' / ' + T);
+    ok('朝向 ' + deg + '°：读数仍是传感器坐标（拿去对文件不用换算）',
+       read("$('ccd-cen').textContent") === '718.20, 540.00', read("$('ccd-cen').textContent"));
+  };
+  await expectCross(90, '49.907%', '49.875%');
+  await expectCross(180, '50.056%', '49.907%');
+  await expectCross(270, '50.000%', '50.056%');
+  await expectCross(0, '49.875%', '50.000%');
+  route = (m, u) => (u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] });
+  await run('ccdStatus()'); await tick();
+
+  run('ccdLiveStop()');
+  ok('停预览后十字线收起（那个数是上一帧的残留，不该继续显示）',
+     read("$('ccd-cross').hidden") === true && read("$('ccd-cen').textContent") === '—');
+  route = () => ({ body: [] });
+
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');
   process.exit(failed ? 1 : 0);
 })();

@@ -128,13 +128,17 @@
         <div class="row tight">
           <button id="btn-ccd-live" class="primary" title="扫描运行中相机归扫描用，预览会被后端拒绝">开始预览</button>
           <button id="btn-ccd-grab" title="按采图曝光采一帧原生全幅（1440×1080，16 位），存 16 位 PNG">保存原生帧</button>
+          <button id="btn-ccd-rot" title="只转预览的显示朝向（顺时针 90° 一档，精确置换不重采样）。**保存的文件永远是传感器原始朝向**">旋转 90°</button>
         </div>
         <div class="form">
           <label>曝光 (ms)<input id="ccd-preview-ms" type="number" step="0.1" min="0.04"></label>
         </div>
         <p class="hint" id="ccd-exposure-hint">—</p>
         <div class="ccdview">
-          <img id="ccd-img" alt="相机预览（原始灰度，未做任何处理）" hidden>
+          <div class="ccdstack" id="ccd-stack">
+            <img id="ccd-img" alt="相机预览（原始灰度，未做任何处理）" hidden>
+            <div id="ccd-cross" class="cross" hidden></div>
+          </div>
           <p class="hint" id="ccd-empty">点「开始预览」打开相机。画面是<b>原始灰度、不做任何处理</b>；
             扫描进行中相机会被扫描占用，预览一律被后端拒绝。</p>
         </div>
@@ -144,9 +148,15 @@
           <div><dt>当前曝光 (ms)</dt><dd id="ccd-exp">—</dd></div>
           <div><dt>增益（固定）</dt><dd id="ccd-gain">—</dd></div>
           <div><dt>帧率 (fps)</dt><dd id="ccd-fps">—</dd></div>
+          <div><dt>质心 (传感器 px)</dt><dd id="ccd-cen">—</dd></div>
+          <div><dt>ΣI（整幅）</dt><dd id="ccd-sum">—</dd></div>
+          <div><dt>峰值 / 饱和</dt><dd id="ccd-sat">—</dd></div>
+          <div><dt>预览朝向</dt><dd id="ccd-rot">—</dd></div>
         </dl>
-        <p class="hint" id="ccd-note">保存一律<b>原生全幅</b> 1440×1080、16 位、不裁剪；
-          曝光（相机读回值）写在<b>图片自己身上</b>，列表里直接能看到。</p>
+        <!-- 连上相机后这段由 app.js 按后端实际值重写（含质心口径与坐标说明）；
+             这里只写"还没连上"时的兜底话术，别跟 JS 抢同一段文字 -->
+        <p class="hint" id="ccd-note">还没读到相机状态。接上后会显示：保存与预览的口径、
+          曝光记在图片自己身上、质心的口径（整幅强度加权重心，不扣背景）与坐标系（传感器坐标）。</p>
       </section>
 
     </div>

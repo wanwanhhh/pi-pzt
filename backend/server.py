@@ -457,6 +457,27 @@ async def ccd_exposure(
         raise HTTPException(503, str(exc)) from exc
 
 
+@app.post("/api/ccd/rotation")
+async def ccd_rotation(
+    deg: int = Query(..., description="预览显示朝向，顺时针 0/90/180/270；**只转预览，不动保存的文件**"),
+) -> dict:
+    """转预览的显示朝向。不是设备设置、更不是数据加工：取帧后转过来显示而已（90° 整数倍是精确置换）。
+
+    保存的原生帧永远是传感器朝向 —— 要"文件也转"是另一件事（会让像素坐标和传感器脱钩），没做。
+    """
+    _ccd_idle()
+    from .config import CCD_BACKEND
+
+    if CCD_BACKEND != "thorlabs":
+        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
+    from .ccd import thorlabs_camera
+
+    try:
+        return await asyncio.to_thread(thorlabs_camera().set_rotation, deg)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/ccd/gain")
 def ccd_gain_locked(gain: int = Query(0, description="已固定为 0")) -> dict:
     """增益固定 0，不给改。"""
