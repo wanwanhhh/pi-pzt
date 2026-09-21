@@ -147,9 +147,8 @@ class Scanner:
                     # 稳定延时内漂移/溢出，图像仍采但如实记录
                     log.warning("第 %d 点采图时已不在位：目标 %.4f µm，实际 %.4f µm",
                                 i, target, st.position)
-                # 设备层的到达容差是**绝对**的；步距 ≤ 容差时，设点丢帧（台子停在上一点，
-                # 正好差一个步距）会落进容差被判成到位 —— 静默错点。这里知道步距，补一道
-                # **相对**校验：偏差超过半个步距就判该点无效，不采图、不入库、中止扫描。
+                # 设备层的到达容差是**绝对**的，这里补一道**相对**校验（取半个步距的理由见
+                # config.SCAN_ARRIVAL_FRACTION）：超了就不采图、不入库、中止扫描。
                 # 步距为 0（起终点相同）时不做这条：没有"上一点"可比。
                 if step and abs(st.position - target) > abs(step) * SCAN_ARRIVAL_FRACTION:
                     status = "failed"
@@ -171,10 +170,9 @@ class Scanner:
         except StageAborted:
             status, message = "aborted", "急停，扫描已中止"
         except BaseException as exc:  # 执行器线程：必须落库，不能让任务悬着
-            # 相机报错也走这条：**扫描中相机出错就整条停下**（AGENTS.md 相机一节定的规矩）——
-            # 不重试、不"该点无效后继续"。相机取帧本身会等满 TL_CAPTURE_TIMEOUT_S 才放弃，
-            # 真报错时多半不是瞬时抖动；继续跑只会白采 + 白走行程。跑过的点都在库里，
-            # 半截的那条扫描由人在界面上手动删（DELETE /api/scans/{id}）。
+            # 相机报错也走这条：**扫描中相机出错就整条停下**（理由见 AGENTS.md 与
+            # docs/thorlabs/设备认识账.xml 的处置清单）—— 不重试、不"该点无效后继续"。
+            # 跑过的点都在库里，半截那条由人在界面上手动删（DELETE /api/scans/{id}）。
             status, message = "failed", f"{type(exc).__name__}: {exc}"
             log.exception("扫描 %s 失败", scan_id)
         finally:

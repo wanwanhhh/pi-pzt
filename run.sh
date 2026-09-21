@@ -18,6 +18,6 @@ if ! id -nG | tr ' ' '\n' | grep -qx dialout; then
     echo
 fi
 
-echo "界面地址：http://127.0.0.1:8000"
+echo "界面地址：http://127.0.0.1:${PI_PORT:-8000}"
 echo "关闭本窗口即停止服务；位移台保持原位不动（要卸力请点界面上的“释放”）。"
 exec .venv/bin/python -m backend.server

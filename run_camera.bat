@@ -25,7 +25,8 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-echo 界面地址：http://127.0.0.1:8000
+if not defined PI_PORT set "PI_PORT=8000"
+echo 界面地址：http://127.0.0.1:%PI_PORT%
 echo 相机：CS165MU（预览见 /api/ccd/preview.jpg，扫描中预览会被拒）
 echo 关闭本窗口即停止服务；位移台保持原位不动（要卸力请点界面上的"释放"）。
 ".venv\Scripts\python.exe" -m backend.server

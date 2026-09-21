@@ -18,7 +18,8 @@ rem error code 1，看着像"设备被占用"，其实是原生 SDK 自己的加
 if not defined TL_SDK_DLLS set "TL_SDK_DLLS=%USERPROFILE%\Desktop\pzt\Scientific_Camera_Interfaces\Scientific Camera Interfaces\SDK\Python Toolkit\dlls\64_lib"
 if exist "%TL_SDK_DLLS%\thorlabs_tsi_camera_sdk.dll" set "PATH=%TL_SDK_DLLS%;%PATH%"
 
-echo 界面地址：http://127.0.0.1:8000
+if not defined PI_PORT set "PI_PORT=8000"
+echo 界面地址：http://127.0.0.1:%PI_PORT%
 echo 关闭本窗口即停止服务；位移台保持原位不动（要卸力请点界面上的"释放"）。
 ".venv\Scripts\python.exe" -m backend.server
 pause

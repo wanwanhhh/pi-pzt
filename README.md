@@ -31,7 +31,7 @@ Windows：
 ## 环境
 
 - Windows 或 Linux，Python 3.12+
-- 控制器接 USB。**PIMikroMove 必须关闭** —— 设备同一时刻只能有一个占用者（相机同理，ThorCam 必须关）。
+- 控制器接 USB。**PIMikroMove 必须关闭** —— 设备同一时刻只能有一个占用者（相机同理，见下）。
 
 ### 位移台：PI E-709.CRG + P-621.1CD
 
@@ -143,11 +143,10 @@ Windows 把 `.venv/bin/python` 换成 `.venv\Scripts\python.exe`。相机另有�
 |---|---|---|
 | `PI_CCD` | `dummy` | `null` 不采图 / `dummy` 占位灰度图 / `thorlabs` 真实相机 |
 | `TL_SDK_DLLS` | 本机 SDK 路径 | 厂商原生 DLL 目录（`dlls\64_lib`） |
-| `PI_CCD_EXPOSURE_US` | `12000` | 曝光（µs）的启动默认值，界面上可实时改 |
-| `PI_CCD_GAIN` | `0` | 增益固定 0；改增益的接口一律拒绝 |
-| `PI_CCD_PREVIEW_FPS` | `15` | 预览取帧节拍。只影响预览，不碰采图 |
-| `PI_CCD_JPEG_QUALITY` | `80` | 预览 JPEG 质量。保存的 PNG 是无损 16 位，与它无关 |
-| `PI_CCD_ROTATION` | `0` | **预览**显示朝向（0/90/180/270，顺时针）。保存的文件永远是传感器朝向 |
+
+曝光、预览帧率、预览朝向这些**运行期参数**（`PI_CCD_EXPOSURE_US` / `PI_CCD_PREVIEW_FPS` /
+`PI_CCD_JPEG_QUALITY` / `PI_CCD_ROTATION` / `PI_CCD_GAIN`）在 `backend/config.py` 里，
+界面上也都能改 —— 这里不抄它们的默认值，免得改一处漏一处。
 
 ## 起不来时先看这几条
 
