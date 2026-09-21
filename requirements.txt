@@ -15,3 +15,7 @@ PIPython==2.13.0.2
 # 原生 DLL 不在包里，用环境变量 TL_SDK_DLLS 指向 SDK 的 dlls\64_lib。
 # 详见 README.md 的「相机」一节与 docs/thorlabs/设备认识账.xml。
 pillow==12.3.0
+# numpy：相机那一路（backend/thorlabs_ccd.py，用到才 import）与 backend/tests/test_centroid.py 都要它。
+# SDK 的本地包一般会把它带进来，但离线单测不该依赖「恰好装了相机」—— 不装就是 ModuleNotFoundError。
+# 2.5.3 是在 Linux + Python 3.12 上跑通 test_centroid.py（18/18）的版本。
+numpy==2.5.3
