@@ -38,7 +38,7 @@
         </div>
         <dl class="kv">
           <dt>目标</dt><dd id="target">—</dd>
-          <dt>到位</dt><dd id="ontarget">—</dd>
+          <dt title="PI：控制器给的到位信号。XMT：最近一次读数是否落在目标 ±到达容差内（读数与命令值的比较，不是「台子停没停」）。">到位</dt><dd id="ontarget">—</dd>
           <dt>速度</dt><dd id="velocity">—</dd>
           <dt>状态</dt><dd id="errcode">—</dd>
         </dl>
@@ -202,7 +202,7 @@
           <label>起点 (µm)<input id="scan-start" type="number" step="0.1"></label>
           <label>终点 (µm)<input id="scan-stop" type="number" step="0.1"></label>
           <label>点数<input id="scan-count" type="number" min="2" step="1"></label>
-          <label>稳定延时 (ms)<input id="scan-settle" type="number" min="0" step="10"></label>
+          <label title="PI：到位信号置位后再等这么久才采图。XMT：移动后固定等这么久，再读一次回确认。等待时长要覆盖「走完一步 + 整定」的时间；改了设备上的整定旋钮就得重设。填 0 等于不等：读数还没走到目标就会判该点无效。">稳定延时 (ms)<input id="scan-settle" type="number" min="0" step="10"></label>
           <button id="btn-scan-start" class="primary">开始扫描</button>
         </div>
         <div class="progress">
@@ -241,8 +241,11 @@
         <div class="tablewrap">
           <table id="points">
             <thead><tr>
-              <th>#</th><th>目标 (µm)</th><th>实际 (µm)</th><th>偏差 (nm)</th>
-              <th>到位</th><th>耗时 (ms)</th><th>图像</th>
+              <th>#</th><th>目标 (µm)</th><th>实际 (µm)</th>
+              <th title="相邻两点「实际」位置之差 —— 采图那一刻记下来的读数，看实际间距用。与命令间距的差见「目标」列。">间距 (µm)</th>
+              <th>偏差 (nm)</th>
+              <th title="PI：控制器给的到位信号。XMT：读回是否落在目标 ±到达容差内。">到位</th>
+              <th>耗时 (ms)</th><th>图像</th>
             </tr></thead>
             <tbody></tbody>
           </table>

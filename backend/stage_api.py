@@ -7,8 +7,9 @@
 
 - **停止**：PI 有专用停止指令，立即停住并保持伺服。XMT 没有停止指令，
   只能「不再下发新目标 + 把当前位置写回成新目标」——软停，慢一个帧间隔，可能有过冲。
-- **到位**：PI 是控制器给的硬件信号；XMT 只能是后端按读数判出来的软件结论。
-  两者都叫 on_target，保证级别不同，所以 `StageStatus.settle_source` 要写进每点元数据。
+- **到位**：PI 是控制器给的硬件信号（+ 一段固定延时）；XMT 没有到位信号，只能
+  「等满固定的稳定延时 + 读一次回，看落没落在到达容差内」。两者都叫 on_target，
+  保证级别不同，所以 `StageStatus.settle_source` 要写进每点元数据。
 - **释放**：PI 是关伺服，台子回弹；XMT 只能切开环 + 输出写零（卸力），不保证停在原位。
 
 能力标志**只用来决定界面文案与上层策略，绝不参与夹取与安全逻辑** ——
@@ -16,6 +17,7 @@
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
@@ -56,6 +58,7 @@ class Caps:
     has_setpoint_ack: bool    # 设点是否有应答（无应答就必须读回校验）
     has_velocity: bool        # 是否有速度设定指令（没有就必须明确拒绝，不能假装接受）
     unit: str                 # 设备原生单位；对外统一折算成 µm
+    default_settle_ms: int    # 界面「稳定延时」的默认值（PI：到位后的延时；XMT：唯一的等待）
 
 
 class StopResult(Enum):
@@ -69,8 +72,24 @@ class StopResult(Enum):
 # 「停稳」结论的来源，写进每点元数据：
 # 同一列 on_target 背后可能是两种不同级别的保证，数据要能自证。
 SETTLE_DEVICE = "device"      # 控制器自己的到位信号
-SETTLE_SOFTWARE = "software"  # 后端按读数判出来的结论
+SETTLE_SOFTWARE = "software"  # 后端按读数判出来的结论（XMT：等满稳定延时后读一次回、与目标比）
 SETTLE_UNKNOWN = "unknown"    # 加这一列之前入库的旧行
+
+
+def sleep_cancelable(seconds: float, cancel: Optional[Callable[[], bool]] = None) -> bool:
+    """睡 seconds，期间每 50 ms 看一次 cancel。取消返回 False。
+
+    稳定延时归设备层（wait_on_target 的 settle_s），两台设备都要睡同一段，
+    所以放在公共面里，不各写一份。
+    """
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return True
+        if cancel is not None and cancel():
+            return False
+        time.sleep(min(left, 0.05))
 
 
 @dataclass
@@ -142,7 +161,10 @@ class StageProto(Protocol):
     def release(self) -> None: ...
     def poll_on_target(self) -> bool: ...
     def wait_on_target(
-        self, timeout: float, cancel: Optional[Callable[[], bool]] = None
+        self,
+        timeout: float,
+        cancel: Optional[Callable[[], bool]] = None,
+        settle_s: float = 0.0,
     ) -> bool: ...
 
 

@@ -6,7 +6,8 @@
 - **单位陷阱**：设点 `1` 与行程 `27/35` 是 µm，读回 `6` 是 4/3 µm ——
   读回乘 XMT_READBACK_TO_UM 才进上层，设点永远是 µm。**绝不让读回值原样流进设点**：
   实测那样写回去，台子从 108.66 µm 跑到 144.95 µm（跑偏 4/3 倍）。
-- **没有到位信号**：停稳只能软件判（SettleJudge：不重叠窗口取均值 + 采样间隔抖动）。
+- **没有到位信号**：不判稳 —— 移动后等满调用方给的稳定延时，再读一次回，
+  落在到达容差内才算到位（见 wait_on_target）。等待时长由界面上设，是用户的责任。
 - **没有停止 / 关伺服指令**：stop_motion 只能软停（当前真实位置写回成新目标），
   release 只能切开环 + 输出写零（卸力，**不保证停在原位**）。
 
@@ -19,8 +20,6 @@ from __future__ import annotations
 
 import logging
 import queue
-import random
-import statistics
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -36,18 +35,14 @@ from .config import (
     XMT_ARRIVAL_TOL_UM,
     XMT_BAUD,
     XMT_CMD_TIMEOUT,
+    XMT_DEFAULT_SETTLE_MS,
     XMT_MAX_TRAVEL_UM,
-    XMT_POLL_JITTER_MS,
-    XMT_POLL_MS,
     XMT_PORT,
     XMT_READ_TIMEOUT,
     XMT_READBACK_TO_UM,
     XMT_SCALE_CHECK_MIN_UM,
     XMT_SCALE_NO_MOTION,
     XMT_SCALE_TOL_FRACTION,
-    XMT_SETTLE_EPS_UM,
-    XMT_SETTLE_WINDOW,
-    XMT_SETTLE_WINDOWS,
     XMT_USABLE_MAX_UM,
     XMT_USABLE_MIN_UM,
     XMT_USB_PID,
@@ -62,6 +57,7 @@ from .stage_api import (
     StageNotConnected,
     StageStatus,
     StopResult,
+    sleep_cancelable,
 )
 
 log = logging.getLogger(__name__)
@@ -75,6 +71,7 @@ CAPS = Caps(
     has_setpoint_ack=False,
     has_velocity=False,   # 协议表里没有速度指令，set_velocity 明确拒绝
     unit="µm",
+    default_settle_ms=XMT_DEFAULT_SETTLE_MS,
 )
 
 # 协议 §2.5 要求主机帧间隔最少 50 ms。实测不强制（背靠背连发两条都被处理），
@@ -155,57 +152,6 @@ class _Link:
                 time.sleep(min(left, 0.0005))
 
 
-class SettleJudge:
-    """软件停稳判据：判的是**台子不动了**，不是"到位精度"。
-
-    - 取 window 个读数算一个均值，窗口与窗口之间比：均值差 ≤ eps 才算这一窗没动；
-      连着 need 个这样的窗口 → 停稳。
-    - 窗口**不重叠**：滑动窗口（每次只挪一个样本）会把运动摊薄，匀速走时相邻均值
-      只差 v/window，等于把判据放宽了 window 倍。
-    - 采样间隔带抖动（见 wait_on_target）：参数与机理见 config.py 的停稳一节。
-    - 同时还要求落在目标附近：**设点无应答，丢帧是静默的**，不校验就会把
-      "没动的台子"当成到位采图。
-
-    已知限制（接受，不当 bug 查）：台子蠕变时读数变化极慢，会落进 eps 被判成停稳。
-    """
-
-    def __init__(self, window: int, need: int, eps_um: float, tol_um: float) -> None:
-        self.window = max(2, int(window))
-        self.need = max(2, int(need))   # need=1 时第一窗只立基线，等于没有运动检测
-        self.eps_um = float(eps_um)
-        self.tol_um = float(tol_um)
-        self.reset(0.0)
-
-    def reset(self, target_um: float) -> None:
-        self._target = float(target_um)
-        self._buf: list[float] = []
-        self._prev: Optional[float] = None
-        self._streak = 0
-        self._settled = False
-
-    def feed(self, position_um: float) -> bool:
-        """喂一个读数（µm），返回当前是否算停稳。窗口没满时保持上次结论。"""
-        self._buf.append(float(position_um))
-        if len(self._buf) < self.window:
-            return self._settled
-        mean = statistics.fmean(self._buf)
-        self._buf.clear()
-        moved = self._prev is not None and abs(mean - self._prev) > self.eps_um
-        self._streak = 0 if moved else self._streak + 1
-        self._prev = mean
-        self._settled = self._streak >= self.need and abs(mean - self._target) <= self.tol_um
-        return self._settled
-
-    @property
-    def steady(self) -> bool:
-        """窗口均值连续 need 次都没动 —— 不含「落在目标附近」那一半。
-
-        比值自检要用它：设备一旦被重新标定，读数会稳定在错误的位置上，
-        「落在目标附近」永远不成立，只看 on_target 就查不出来。
-        """
-        return self._streak >= self.need
-
-
 @dataclass
 class _Job:
     fn: Callable[..., Any]
@@ -248,12 +194,9 @@ class XmtStage:
         self._running = False
         self._status = StageStatus(settle_source=SETTLE_SOFTWARE)
         self._status_lock = threading.Lock()
-        self._judge = SettleJudge(
-            XMT_SETTLE_WINDOW, XMT_SETTLE_WINDOWS, XMT_SETTLE_EPS_UM, XMT_ARRIVAL_TOL_UM
-        )
         self._tick = 0
-        # 折算系数自检只做诊断，不拦截（见 _note_settled）：
-        # 可信采样点（判稳且落在目标附近）、是否正在怀疑、已经吵过的目标
+        # 折算系数自检只做诊断，不拦截（见 _note_missed）：
+        # 可信采样点（读回确认落在目标附近）、是否正在怀疑、已经吵过的目标
         self._scale_ref: Optional[tuple[float, float]] = None
         self._scale_suspect = False
         self._warned_target: Optional[float] = None
@@ -455,15 +398,13 @@ class XmtStage:
             st.axis = "X"
         if mode == LOOP_CLOSED:
             pos = self._position_um()
-            self._judge.reset(pos)
             with self._status_lock:
                 self._status.position = pos
                 self._status.target = pos
                 self._status.updated_at = time.time()
             log.info("已连接 %s：行程 %.4f ~ %.4f µm，位置 %.4f µm；"
-                     "停稳判据 ε=%.2f µm / 窗 %d 样本 / 连续 %d 窗（旋钮动过就得重测）",
-                     link.port, usable_lo, usable_hi, pos, self._judge.eps_um,
-                     self._judge.window, self._judge.need)
+                     "到位判据 = 稳定延时（界面设）+ 一次读回确认，容差 %.2f µm",
+                     link.port, usable_lo, usable_hi, pos, XMT_ARRIVAL_TOL_UM)
         else:
             # 开环下读回不是位移，别拿它当位置用；要动先开伺服。
             log.warning("设备当前是开环（19=%r）：位移设点会被拒绝，先在界面上开启伺服",
@@ -542,8 +483,10 @@ class XmtStage:
         self._require().send(xp.set_position(float(um), addr=self._addr))
 
     def _refresh_fast(self) -> None:
-        """读一次位移并喂给判稳器。
+        """读一次位移，并按「离目标多远」给 on_target。
 
+        这台设备没有到位信号，on_target 的含义就只有「这一次读数落在目标 ±到达容差内」——
+        界面上那一列是**读数与命令值的比较**，不是台子停没停的判断。
         开环（已释放）时**不发布位置**：那时读回的含义没有依据，宁可留着上一次
         闭环的值，也不编一个数出来。on_target 一律置 False。
         （从没连过闭环时它保持初值 0.0 —— 界面上是「0.0000 + 未保持」，不是真值。）
@@ -553,30 +496,25 @@ class XmtStage:
                 self._status.on_target = False
             return
         pos = self._position_um()
-        on_target = self._judge.feed(pos)
-        self._note_settled(pos)
         with self._status_lock:
+            on_target = abs(pos - self._status.target) <= XMT_ARRIVAL_TOL_UM
             self._status.position = pos
             self._status.on_target = on_target
             self._status.updated_at = time.time()
 
-    def _note_settled(self, position_um: float) -> None:
-        """判稳时记一个可信采样点；判稳却离目标很远，就把**原因说清楚**。
+    def _remember_confirmed(self, target_um: float, position_um: float) -> None:
+        """读回确认落在目标附近 → 记一个可信采样点（比值诊断的基准）。"""
+        self._scale_ref = (target_um, position_um / XMT_READBACK_TO_UM)
+        self._scale_suspect = False
 
-        **这里不做任何拦截**，这是设计决定：真正兜住「折算系数被改过」的是到达容差 ——
-        系数一变，读数就再也落不到目标附近（4/3 变 1:1 的话，60 µm 处差 15 µm），
-        手动移动会一直显示未到位、扫描会判该点无效并中止，已经足够响。
-        再叠一层「比值不对就拒绝运动」只会多一个误判源：设点丢帧时台子停在上一目标，
-        拿它跟新目标算比值必然算错 —— 这个误判在本机上闩死过两次（真机复现），
-        比它要防的问题更糟。所以这一层只负责把「为什么没到位」讲清楚。
+    def _note_missed(self, target: float, position_um: float) -> None:
+        """读回确认没落在目标附近，就把**原因说清楚**。
+
+        **这里不做任何拦截**，这是设计决定：真正拒绝的是调用方（手动移动显示未到位、
+        扫描判该点无效并中止），这里只解释。再叠一层「比值不对就拒绝运动」只会多一个
+        误判源：设点丢帧时台子停在上一目标，拿它跟新目标算比值必然算错 —— 这个误判在
+        本机上闩死过两次（真机复现），比它要防的问题更糟。
         """
-        if not self._judge.steady:
-            return
-        target = self._status.target
-        if abs(position_um - target) <= self._judge.tol_um:
-            self._scale_ref = (target, position_um / XMT_READBACK_TO_UM)   # 可信采样点
-            self._scale_suspect = False
-            return
         if self._scale_suspect and self._warned_target == target:
             return                                       # 同一个目标只吵一次
         self._scale_suspect = True
@@ -595,7 +533,8 @@ class XmtStage:
                     hint = ("位移 %+.3f µm 对应读数变化 %+.4f（原值）＝比值 %.4f，而不是 %.4f —— "
                             "更像**折算系数变了**（设备被重新标定过？）"
                             % (d_tgt, d_raw, ratio, 1.0 / XMT_READBACK_TO_UM))
-        log.error("判稳却离目标 %.3f µm（读数 %.3f µm）：%s", position_um - target, position_um, hint)
+        log.error("读回 %.3f µm 离目标 %.3f µm（差 %+.3f µm）：%s",
+                  position_um, target, position_um - target, hint)
 
     def _refresh_slow(self) -> None:
         mode = self._read_loop_mode()
@@ -612,15 +551,14 @@ class XmtStage:
     def _move(self, target: float) -> None:
         if not self._status.servo:
             raise StageError("设备在开环（已释放）状态，位移设点没有意义，先开启伺服")
-        if abs(target - self._status.position) <= self._judge.tol_um:
+        if abs(target - self._status.position) <= XMT_ARRIVAL_TOL_UM:
             # 设点丢帧与正常到位在这段距离上长得一样：读回校验失去了分辨力。
             log.warning(
                 "目标 %.4f µm 离当前位置 %.4f µm 不到到达容差 %.2f µm："
                 "这一段距离上，设点丢帧与正常到位分不出来（扫描步距要远大于容差）",
-                target, self._status.position, self._judge.tol_um,
+                target, self._status.position, XMT_ARRIVAL_TOL_UM,
             )
         self._write_target(target)
-        self._judge.reset(target)
         with self._status_lock:
             self._status.target = float(target)
             self._status.on_target = False
@@ -642,7 +580,6 @@ class XmtStage:
             return
         pos = self._position_um()
         self._write_target(pos)
-        self._judge.reset(pos)
         with self._status_lock:
             self._status.target = pos
             self._status.on_target = False
@@ -667,15 +604,26 @@ class XmtStage:
         self._require().send(xp.set_loop_mode("C", addr=self._addr))
         pos = self._position_um()      # 闭环下读回才是位移
         self._write_target(pos)        # 原地保持：别跳回上次的设点
-        self._judge.reset(pos)
         with self._status_lock:
             self._status.servo = True
             self._status.target = pos
         self._refresh_fast()
 
     def _read_on_target(self) -> bool:
+        """读一次回，问「落在目标附近吗」；没落在就顺手把原因讲清楚。
+
+        这是**到位确认**，不是停稳判据：设备没有到位信号，手上只有「这一次读数离目标
+        多远」这一个依据。确认通过时记下可信采样点，供比值诊断当基准。
+        """
         self._refresh_fast()
-        return self._status.on_target
+        if not self._status.servo:
+            return False       # 开环：读回不是位移，既不确认也不诊断（别拿陈旧值记假错）
+        target, pos = self._status.target, self._status.position
+        if self._status.on_target:
+            self._remember_confirmed(target, pos)
+            return True
+        self._note_missed(target, pos)
+        return False
 
     # ------------------------------------------------------------------ 公开 API
     def status(self) -> StageStatus:
@@ -737,26 +685,25 @@ class XmtStage:
         self._call(self._release_device)
 
     def poll_on_target(self) -> bool:
-        """只查一次停稳结论（软件判据，一次读数）。"""
+        """只查一次到位结论：读一次回，看落没落在目标 ±到达容差内。"""
         return bool(self._call(self._read_on_target))
 
     def wait_on_target(
-        self, timeout: float, cancel: Optional[Callable[[], bool]] = None
+        self,
+        timeout: float,
+        cancel: Optional[Callable[[], bool]] = None,
+        settle_s: float = 0.0,
     ) -> bool:
-        """在调用方线程轮询等待停稳。owner 线程保持可响应。
+        """等满 settle_s，再读一次回确认 —— **不做停稳判据**。
 
+        等待时长由调用方给（扫描传界面上设的「稳定延时」），等满之后一次读数说了算：
+        落在到达容差内 → 到位；否则 → False，上层判该点无效。
+        等多久是用户的责任：后面板那两个整定旋钮动过就得重设（见设备认识账 E7）。
+
+        timeout 对这台设备没有意义（读一次有 XMT_READ_TIMEOUT 兜着），留在签名里只是
+        为了两台设备对上层同一个形状。
         cancel 返回 True 时立即放弃等待（中止扫描用），返回 False。
-
-        采样间隔 = XMT_POLL_MS + 抖动：**抖动不是装饰**，固定网格会与闭环振荡
-        拍频，拍频极低时连续几次读数看起来纹丝不动，判据就瞎了。
         """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if cancel is not None and cancel():
-                return False
-            if self.poll_on_target():
-                return True
-            time.sleep(
-                (XMT_POLL_MS + random.uniform(0.0, XMT_POLL_JITTER_MS)) / 1000.0
-            )
-        return False
+        if not sleep_cancelable(settle_s, cancel):
+            return False
+        return bool(self._call(self._read_on_target))

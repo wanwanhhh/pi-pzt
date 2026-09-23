@@ -17,6 +17,7 @@ except ImportError:                      # 老版本退回私有属性
     def _members_of(proto):
         return proto.__protocol_attrs__
 
+from backend.config import DEFAULT_SETTLE_MS
 from backend.pi_stage import CAPS, Stage
 from backend.stage_api import (
     RELEASE_SERVO_OFF,
@@ -51,6 +52,7 @@ def test_signatures_used_by_callers():
     sig = inspect.signature(Stage.wait_on_target)
     assert "cancel" in sig.parameters
     assert sig.parameters["cancel"].default is None
+    assert sig.parameters["settle_s"].default == 0.0, "稳定延时必须能给，默认 0 = 不等"
 
     assert list(inspect.signature(Stage.move).parameters) == ["self", "target"]
     assert list(inspect.signature(Stage.stop_motion).parameters) == ["self"]
@@ -66,6 +68,7 @@ def test_pi_caps():
     assert CAPS.has_on_target and CAPS.has_stop_command and CAPS.has_setpoint_ack
     assert CAPS.has_velocity
     assert CAPS.release_mode == RELEASE_SERVO_OFF
+    assert CAPS.default_settle_ms == DEFAULT_SETTLE_MS
     assert Stage.caps is CAPS
 
 

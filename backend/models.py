@@ -5,9 +5,11 @@
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import DEFAULT_SETTLE_MS, MAX_VELOCITY, SETTLE_MS_RANGE
+from .config import MAX_VELOCITY, SETTLE_MS_RANGE
 
 
 class _Model(BaseModel):
@@ -36,8 +38,9 @@ class ScanRequest(_Model):
     start_um: float
     stop_um: float
     count: int = Field(ge=2, le=100_000)
-    settle_ms: int = Field(
-        default=DEFAULT_SETTLE_MS, ge=SETTLE_MS_RANGE[0], le=SETTLE_MS_RANGE[1]
+    # 不给就按当前设备的默认值（caps.default_settle_ms），见 scanner._settle_ms
+    settle_ms: Optional[int] = Field(
+        default=None, ge=SETTLE_MS_RANGE[0], le=SETTLE_MS_RANGE[1]
     )
 
 

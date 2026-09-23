@@ -24,6 +24,7 @@ from pipython.pidevice.interfaces.piserial import PISerial
 
 from .config import (
     AXIS,
+    DEFAULT_SETTLE_MS,
     DEVICE_NAME,
     DEVICE_SERIAL,
     LINK,
@@ -41,6 +42,7 @@ from .stage_api import (
     StageNotConnected,  # noqa: F401
     StageStatus,
     StopResult,
+    sleep_cancelable,
 )
 
 log = logging.getLogger(__name__)
@@ -58,6 +60,7 @@ CAPS = Caps(
     has_setpoint_ack=True,
     has_velocity=True,
     unit="µm",
+    default_settle_ms=DEFAULT_SETTLE_MS,
 )
 
 # Linux 下 E-709 以 FTDI 虚拟串口出现（内核 ftdi_sio 直接驱动，不需要 PI 的 .so）。
@@ -448,10 +451,15 @@ class Stage:
         return on_target
 
     def wait_on_target(
-        self, timeout: float, cancel: Optional[Callable[[], bool]] = None
+        self,
+        timeout: float,
+        cancel: Optional[Callable[[], bool]] = None,
+        settle_s: float = 0.0,
     ) -> bool:
         """在调用方线程轮询等待到位。owner 线程保持可响应。
 
+        控制器给出 ONT? 之后还要再等 settle_s —— 这是 AGENTS 定的 PI 语义
+        「到位信号 + 一段固定延时」，延时归设备层，所以放在这里而不是让上层再睡一次。
         cancel 返回 True 时立即放弃等待（中止扫描用），返回 False。
         """
         deadline = time.monotonic() + timeout
@@ -459,5 +467,5 @@ class Stage:
             if cancel is not None and cancel():
                 return False
             if self.poll_on_target():
-                return True
+                return sleep_cancelable(settle_s, cancel)
         return False

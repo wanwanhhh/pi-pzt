@@ -72,13 +72,14 @@ class Scanner:
             if not lo <= value <= hi:
                 raise ScanError(f"{label} {value} µm 超出可扫描范围 {lo}–{hi} µm")
 
+        settle_ms = self._settle_ms(req)
         with self._lock:
             # 锁内再判一次：上面放锁外之后这里才是唯一的占位点。
             # 这里直接读状态，不能用 busy()——它是加锁的，锁内调用会死锁。
             if self._state["status"] in ("running", "paused"):
                 raise ScanError("已有扫描在运行，请先中止或等待结束")
             scan_id = store.create_scan(
-                req.name, req.start_um, req.stop_um, req.count, req.settle_ms
+                req.name, req.start_um, req.stop_um, req.count, settle_ms
             )
             self._abort.clear()
             self._resume.set()
@@ -96,7 +97,7 @@ class Scanner:
             )
             self._thread.start()
         log.info("扫描 %s 启动：%.4f → %.4f µm，%d 点，稳定延时 %d ms",
-                 scan_id, req.start_um, req.stop_um, req.count, req.settle_ms)
+                 scan_id, req.start_um, req.stop_um, req.count, settle_ms)
         return dict(self._state)
 
     def pause(self) -> dict[str, Any]:
@@ -117,10 +118,21 @@ class Scanner:
             return dict(self._state)
 
     # ---------------------------------------------------------------- 执行
+    def _settle_ms(self, req: ScanRequest) -> int:
+        """没给稳定延时就用这台设备的默认值（caps.default_settle_ms）。
+
+        界面一定会给（框里预填的就是这个默认值），这里是 API 直调时的兜底：
+        PI 的默认是「到位后的延时」，XMT 的默认是「唯一的等待」，两者不能混用。
+        """
+        if req.settle_ms is not None:
+            return req.settle_ms
+        return int(self._stage.caps.default_settle_ms)
+
     def _run(self, scan_id: int, req: ScanRequest) -> None:
         step = (req.stop_um - req.start_um) / (req.count - 1)
+        settle_s = self._settle_ms(req) / 1000.0
         try:
-            self._approach_start(req, step)
+            self._approach_start(req, step, settle_s)
             for i in range(req.count):
                 self._resume.wait()
                 if self._abort.is_set():
@@ -129,22 +141,29 @@ class Scanner:
                 target = req.start_um + step * i
                 t0 = time.monotonic()
                 self._stage.move(target)
+                # 等待与判到位都归设备层：PI 等 ONT 信号 + 稳定延时，XMT 等满稳定延时
+                # 再读一次回（不判稳）。上层只要「到位 / 超时 / 中止」这一个结论。
                 if not self._stage.wait_on_target(
-                    ON_TARGET_TIMEOUT_S, cancel=self._abort.is_set
+                    ON_TARGET_TIMEOUT_S,
+                    cancel=self._abort.is_set,
+                    settle_s=settle_s,
                 ):
                     if self._abort.is_set():
                         status, message = "aborted", f"已中止于第 {i}/{req.count} 点"
                     else:
-                        # 没到位就不能采图、不能继续：宁可不跑，也不能入库错点
+                        # 没到位就不能采图、不能继续：宁可不跑，也不能入库错点。
+                        # 文案不提「多少秒」：PI 是超时（10 s），XMT 是等满延时后读回超差，
+                        # 两者的时间含义不同，说成超时会把用户引去查信号/通讯。
+                        pos = self._stage.status().position
                         status = "failed"
-                        message = (f"第 {i}/{req.count} 点 {ON_TARGET_TIMEOUT_S:.0f} s 内未到位"
-                                   f"（目标 {target:.4f} µm）")
+                        message = (f"第 {i}/{req.count} 点未确认到位"
+                                   f"（目标 {target:.4f} µm，读数 {pos:.4f} µm）")
                         log.error("扫描 %s %s", scan_id, message)
                     break
-                time.sleep(req.settle_ms / 1000.0)
+                # 这一读就是**采集时的位置**，连同命令值一起入库（点位表能看到实际间距）。
                 st = self._stage.poll()
                 if not st.on_target:
-                    # 稳定延时内漂移/溢出，图像仍采但如实记录
+                    # 确认到位之后又漂了/溢出了：图像仍采，但如实记录
                     log.warning("第 %d 点采图时已不在位：目标 %.4f µm，实际 %.4f µm",
                                 i, target, st.position)
                 # 设备层的到达容差是**绝对**的，这里补一道**相对**校验（取半个步距的理由见
@@ -188,7 +207,7 @@ class Scanner:
             log.info("扫描 %s 结束：%s %s", scan_id, status, message)
 
     # ---------------------------------------------------------------- 内部
-    def _approach_start(self, req: ScanRequest, step: float) -> None:
+    def _approach_start(self, req: ScanRequest, step: float, settle_s: float) -> None:
         """先退到起点外侧再逼近，让首点与后续点从同一侧过来。
 
         起点贴着行程端点时退不出去（例如从 0 往上的扫描），只能照常逼近，
@@ -200,7 +219,12 @@ class Scanner:
             log.warning("扫描起点 %.4f µm 贴行程端点，首点无法与其他点同侧逼近", req.start_um)
             return
         self._stage.move(pre)
-        self._stage.wait_on_target(ON_TARGET_TIMEOUT_S, cancel=self._abort.is_set)
+        if not self._stage.wait_on_target(
+            ON_TARGET_TIMEOUT_S,
+            cancel=self._abort.is_set,
+            settle_s=settle_s,
+        ):
+            log.warning("预逼近 %.4f µm 没确认到位：首点可能与其他点不同侧", pre)
 
     def _set_paused(self, paused: bool) -> dict[str, Any]:
         """一次持锁完成"判断 + 写入"，避免与扫描收尾抢状态。"""

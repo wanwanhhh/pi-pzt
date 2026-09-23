@@ -314,14 +314,26 @@ const count = (m) => calls.filter((c) => c === m).length;
   console.log('\n[J] caps：界面按设备能力改文案与可用性');
   const capsPI = { name: 'PI E-709', platform: 'Windows + Linux', has_on_target: true,
     has_stop_command: true, release_mode: 'servo_off', has_setpoint_ack: true,
-    has_velocity: true, unit: 'µm' };
+    has_velocity: true, unit: 'µm', default_settle_ms: 100 };
   const capsXMT = { name: '芯明天 E53.D1S-H', platform: '仅 Windows', has_on_target: false,
     has_stop_command: false, release_mode: 'open_loop_zero', has_setpoint_ack: false,
-    has_velocity: false, unit: 'µm' };
+    has_velocity: false, unit: 'µm', default_settle_ms: 300 };
   const driveCaps = (c) => run('renderCaps(' + JSON.stringify(c) + ')');
 
   driveCaps(capsXMT);
   driveStage({ connected: true, servo: true });
+  // 稳定延时的默认值每台设备不同，由 caps 下发，前端不写死
+  ok('XMT：稳定延时默认 300 ms', String(read("$('scan-settle').value")) === '300',
+     String(read("$('scan-settle').value")));
+  run("$('scan-settle').value = 250");      // 用户改过之后，后续 caps 不许再覆盖
+  driveCaps(capsXMT);
+  ok('重复下发 caps 不覆盖用户输入', String(read("$('scan-settle').value")) === '250',
+     String(read("$('scan-settle').value")));
+  run("$('scan-settle').value = 300");      // 回到「我们播的值、用户没改过」的样子
+  driveCaps(capsPI);                         // 换设备：要按新设备重播
+  ok('换设备后按新设备重播（PI 100 ms）', String(read("$('scan-settle').value")) === '100',
+     String(read("$('scan-settle').value")));
+  driveCaps(capsXMT);                        // 后面几条用例仍按 XMT 的文案走
   ok('无速度指令的设备：速度按钮变灰', read("$('btn-vel').disabled") === true);
   ok('无速度指令的设备：速度输入框也禁用', read("$('vel').disabled") === true);
   ok('停止按钮说明写"软停"', read("$('btn-stop').title").indexOf('软停') >= 0,
@@ -789,6 +801,32 @@ const count = (m) => calls.filter((c) => c === m).length;
      read('JSON.stringify(profCharts.preview.h.data)') === '[[],[]]' &&
      read("$('prof-where').textContent") === '在预览图上点一下');
 
+  console.log('\n[S] 点位表：列数对得上，「间距」= 相邻两点实际之差');
+  reset(); calls.length = 0;
+  route = (m, u) => (u.indexOf('/api/scans/') === 0
+    ? { body: { id: 42, name: 's42', status: 'done', start_um: 0, stop_um: 2, count: 3, message: '',
+                points: [
+                  { idx: 0, target_um: 0, actual_um: 0.02, on_target: 1, settled_ms: 300, image_path: null },
+                  { idx: 1, target_um: 1, actual_um: 1.05, on_target: 1, settled_ms: 300, image_path: null },
+                  { idx: 2, target_um: 2, actual_um: 2.01, on_target: 1, settled_ms: 300, image_path: null },
+                ] } }
+    : { body: [] });
+  driveScan(42, 'done'); await tick(); await tick();
+  const rows42 = read("$('points').tBodies[0].children.map(function(r){return r.innerHTML;})");
+  const firstRow = rows42[0] || '';
+  ok('每行 8 个格子', (rows42.join('').match(/<td/g) || []).length === 24,
+     (rows42.join('').match(/<td/g) || []).length + ' 个');
+  ok('第一行没有「上一点」，间距写「—」',
+     firstRow.split('</td>')[3].indexOf('—') >= 0, JSON.stringify(firstRow.split('</td>')[3]));
+  ok('间距 = 实际之差（1.05 − 0.02 = 1.0300）', rows42.join('').indexOf('1.0300') >= 0);
+  ok('间距 = 实际之差（2.01 − 1.05 = 0.9600）', rows42.join('').indexOf('0.9600') >= 0);
+  // 超过 MAX_ROWS 时补一行说明，它的 colspan 必须跟列数一致（否则表格会错位）
+  const many = [];
+  for (let i = 0; i < 2001; i++) many.push({ idx: i, target_um: i, actual_um: i, on_target: 1, settled_ms: 1, image_path: null });
+  run('renderPoints(' + JSON.stringify(many) + ')');
+  const cut = read("$('points').tBodies[0].children[2000].innerHTML");
+  ok('截断行的 colspan = 8（与列数一致）', cut.indexOf('colspan="8"') >= 0, JSON.stringify(cut.slice(0, 60)));
+  route = () => ({ body: [] });
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');
   process.exit(failed ? 1 : 0);
 })();

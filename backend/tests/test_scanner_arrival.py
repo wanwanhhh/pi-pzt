@@ -23,19 +23,33 @@ sys.path.insert(0, str(ROOT))
 from backend import store  # noqa: E402
 from backend.models import ScanRequest  # noqa: E402
 from backend.scanner import Scanner  # noqa: E402
-from backend.stage_api import SETTLE_SOFTWARE, StageStatus, StopResult  # noqa: E402
+from backend.stage_api import (  # noqa: E402
+    SETTLE_SOFTWARE,
+    Caps,
+    StageStatus,
+    StopResult,
+)
 
 
 class FakeStage:
     """只实现 scanner 用得到的那几个方法。"""
 
-    def __init__(self, travel: tuple[float, float] = (0.0, 100.0), lost: set | None = None):
+    caps = Caps(
+        name="假设备", platform="测试", has_on_target=True, has_stop_command=True,
+        release_mode="servo_off", has_setpoint_ack=True, has_velocity=True,
+        unit="µm", default_settle_ms=300,
+    )
+
+    def __init__(self, travel: tuple[float, float] = (0.0, 100.0), lost: set | None = None,
+                 wait_ok: bool = True):
         self._position = 0.0
         self._target = 0.0
         self.travel = travel
         self.lost = set(lost or ())    # 这些目标上的设点"丢了"：台子不动
+        self.wait_ok = wait_ok         # False = 设备层自己就确认不了到位（XMT 读回超差）
         self.moves: list[float] = []
         self.stops = 0
+        self.settle_s: list[float] = []      # 每次等待时调用方给的稳定延时
 
     def move(self, target: float) -> float:
         self.moves.append(target)
@@ -44,8 +58,9 @@ class FakeStage:
             self._position = target
         return target
 
-    def wait_on_target(self, timeout: float, cancel=None) -> bool:
-        return True
+    def wait_on_target(self, timeout: float, cancel=None, settle_s: float = 0.0) -> bool:
+        self.settle_s.append(settle_s)
+        return self.wait_ok
 
     def poll(self) -> StageStatus:
         return self.status()
@@ -128,6 +143,43 @@ def test_deviation_inside_half_a_step_is_accepted():
         st = run_scan(ScanRequest(start_um=10.0, stop_um=14.0, count=5, settle_ms=0), stage, capture)
         assert st["status"] == "done", st
         assert len(capture.taken) == 5
+
+
+def test_device_says_not_arrived_fails_without_capture():
+    """设备层没确认到位（XMT：等满延时后读回超差）→ 不采图、不入库、整条 failed。
+
+    这是本次「不判稳」改动新引入的失败路径：fixture 里 wait_on_target 默认恒真，
+    只有这条用例能钉住它 —— 顺带钉住文案（不能把 XMT 的读回超差说成「10 s 超时」）。
+    """
+    with with_temp_store():
+        stage, capture = FakeStage(wait_ok=False), FakeCapture()
+        st = run_scan(ScanRequest(start_um=10.0, stop_um=12.0, count=3, settle_ms=0),
+                      stage, capture)
+        assert st["status"] == "failed", st
+        assert capture.taken == [], f"没确认到位不该采图：{capture.taken}"
+        assert store.get_points(int(st["scan_id"])) == [], "没确认到位的点不该入库"
+        assert "10 s" not in st["message"], f"XMT 上没有 10 s 这回事：{st['message']}"
+        assert "未确认到位" in st["message"], st["message"]
+
+
+def test_settle_delay_goes_to_the_device_layer():
+    """界面上的稳定延时必须原样传给设备层 —— 等待现在只有这一处，漏传就是不等。"""
+    with with_temp_store():
+        stage, capture = FakeStage(), FakeCapture()
+        st = run_scan(ScanRequest(start_um=10.0, stop_um=12.0, count=3, settle_ms=250),
+                      stage, capture)
+        assert st["status"] == "done", st
+        # 预逼近 + 3 个点：每次都拿到同一个延时
+        assert stage.settle_s == [0.25] * (len(capture.taken) + 1), stage.settle_s
+
+
+def test_missing_settle_falls_back_to_the_device_default():
+    """API 直调没给稳定延时 → 用这台设备的默认值（caps.default_settle_ms），不是写死的 100。"""
+    with with_temp_store():
+        stage, capture = FakeStage(), FakeCapture()
+        st = run_scan(ScanRequest(start_um=10.0, stop_um=11.0, count=2), stage, capture)
+        assert st["status"] == "done", st
+        assert set(stage.settle_s) == {0.3}, stage.settle_s
 
 
 def test_zero_step_scan_skips_the_check():

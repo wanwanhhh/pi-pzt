@@ -138,6 +138,8 @@ const DEV_WARN_NM = 200;
 let stageState = null;
 let scanActive = false;
 let stageCaps = null;          // 能力声明（后端发；没到之前按 PI 的文案与可用性走）
+let settleSeededFor = '';      // 「稳定延时」是按哪台设备播的种（换设备要重播）
+let settleSeededValue = null;  // 播下去的值：框里还是它，说明用户没改过
 let seeded = false;
 let viewScanId = null;         // 视图正在展示的扫描（只有成功渲染才写）
 let autoHandledScanId = null;  // 自动载入已处理过的扫描 id（成功失败都算处理过，防止每帧重试）
@@ -193,6 +195,18 @@ function velocitySupported() { return !stageCaps || stageCaps.has_velocity; }
 
 function renderCaps(caps) {
   stageCaps = caps;
+
+  // 默认等待时长**每台设备不一样**（PI = 到位后的延时，XMT = 唯一的等待），值随 caps 下发。
+  // 换设备要重播（不然会留着上一台的默认值）；但框里要是用户改过的值，就不动它。
+  const dev = caps.name || '';
+  if (dev !== settleSeededFor && typeof caps.default_settle_ms === 'number') {
+    const box = $('scan-settle');
+    if (String(box.value) === '' || String(box.value) === String(settleSeededValue)) {
+      box.value = caps.default_settle_ms;
+      settleSeededValue = caps.default_settle_ms;
+    }
+    settleSeededFor = dev;
+  }
 
   $('btn-stop').title = hasStopCommand()
     ? 'STP：立刻停止运动，保持伺服与当前位置。扫描中会同时中止扫描。'
@@ -264,7 +278,11 @@ function renderStage(st) {
     $('scan-start').value = st.travel_min;
     $('scan-stop').value = Math.min(st.travel_max, st.travel_min + 10);
     $('scan-count').value = 11;
-    $('scan-settle').value = 100;
+    // caps 还没到时先按 PI 的默认值预填，等 caps 到了再按设备改（XMT 是 300）
+    if (String($('scan-settle').value) === '') {
+      $('scan-settle').value = 100;
+      settleSeededValue = 100;
+    }
   }
 }
 
@@ -360,11 +378,16 @@ function renderPoints(points) {
     const p = points[i];
     const has = p.actual_um !== null && p.actual_um !== undefined;
     const dev = has ? (p.actual_um - p.target_um) * 1000 : null;
+    // 间距 = 相邻两点「实际」之差：实际走了多少，一眼能看出来（显示，不是判断）
+    const prev = i > 0 ? points[i - 1] : null;
+    const gap = has && prev && prev.actual_um !== null && prev.actual_um !== undefined
+      ? p.actual_um - prev.actual_um : null;
     const tr = document.createElement('tr');
     tr.innerHTML =
       '<td>' + p.idx + '</td>' +
       '<td>' + fmt(p.target_um, 4) + '</td>' +
       '<td>' + fmt(p.actual_um, 4) + '</td>' +
+      '<td>' + (gap === null ? '—' : fmt(gap, 4)) + '</td>' +
       '<td' + (dev !== null && Math.abs(dev) > DEV_WARN_NM ? ' class="bad"' : '') + '>' +
         (dev === null ? '—' : dev.toFixed(0)) + '</td>' +
       '<td>' + (p.on_target ? '是' : '否') + '</td>' +
@@ -379,7 +402,7 @@ function renderPoints(points) {
   }
   if (points.length > n) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="7" class="hint">只显示前 ' + n + ' 点，共 ' + points.length + ' 点</td>';
+    tr.innerHTML = '<td colspan="8" class="hint">只显示前 ' + n + ' 点，共 ' + points.length + ' 点</td>';
     frag.appendChild(tr);
   }
   tb.innerHTML = '';

@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import logging
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,11 +26,8 @@ from backend.stage_api import (  # noqa: E402
     StageProto,
     StopResult,
 )
-from backend.config import (  # noqa: E402
-    XMT_SETTLE_WINDOWS,
-    XMT_SETTLE_WINDOW,
-)
-from backend.xmt_stage import CAPS, SettleJudge, XmtStage  # noqa: E402
+from backend.config import XMT_ARRIVAL_TOL_UM  # noqa: E402
+from backend.xmt_stage import CAPS, XmtStage  # noqa: E402
 
 # 真机上量到的静止读回（此时真实位置 144.8785 × 0.75 = 108.6589 µm）
 READBACK = 144.8785
@@ -121,6 +119,7 @@ def test_caps_declares_xmt_differences():
     assert CAPS.release_mode == RELEASE_OPEN_LOOP_ZERO
     assert CAPS.has_velocity is False, "本设备没有速度指令，能力声明里要说清楚"
     assert CAPS.unit == "µm"
+    assert CAPS.default_settle_ms == 300, "XMT 的等待要覆盖走完+整定，默认比 PI 长"
 
 
 def test_settle_source_is_software():
@@ -217,10 +216,9 @@ def test_clamp_uses_the_usable_range():
     stage.shutdown()
 
 
-def settle(stage, times: int = 14) -> None:
-    """读若干次，让判稳器把「连续几窗没动」立起来。"""
-    for _ in range(times):
-        stage.poll()
+def confirm(stage) -> bool:
+    """走一次采集前的到位确认（读一次回 + 顺手跑比值诊断）。"""
+    return stage.poll_on_target()
 
 
 def reply_raw(link: FakeLink, raw: float) -> None:
@@ -228,8 +226,8 @@ def reply_raw(link: FakeLink, raw: float) -> None:
     link._replies[xp.CMD_READ_POSITION] = _data(raw)
 
 
-def test_settled_far_from_target_is_diagnosed_not_blocked():
-    """判稳却离目标很远：要报出来，但**绝不拦运动**。
+def test_far_from_target_is_diagnosed_not_blocked():
+    """读回离目标很远：要报出来（确认返回 False），但**绝不拦运动**。
 
     真机上「比值不对就拒绝运动」闩死过两次（设点丢帧会被算成"标定被改"），
     所以这一层只做诊断 —— 真正兜底的是到达容差：系数一变，读数再也落不到目标附近。
@@ -237,11 +235,11 @@ def test_settled_far_from_target_is_diagnosed_not_blocked():
     stage, link = connected()
     reply_raw(link, 20.0 / 0.75)
     stage.move(20.0)
-    settle(stage)
+    assert confirm(stage) is True
     assert stage._scale_suspect is False
     reply_raw(link, 60.0)                 # 读数停在"原值 = 设点"：离目标差 15 µm
     stage.move(60.0)
-    settle(stage)
+    assert confirm(stage) is False, "离目标 15 µm 不能算到位"
     assert stage._scale_suspect is True, "离目标很远时应当被诊断为可疑"
     assert stage.move(50.0) == 50.0, "诊断归诊断，不能拦运动"
     stage.shutdown()
@@ -252,10 +250,10 @@ def test_scale_check_accepts_a_clean_ratio():
     stage, link = connected()
     reply_raw(link, 20.0 / 0.75)
     stage.move(20.0)
-    settle(stage)
+    confirm(stage)
     reply_raw(link, 60.0 / 0.75)
     stage.move(60.0)
-    settle(stage)
+    confirm(stage)
     assert stage._scale_suspect is False
     assert stage.move(50.0) == 50.0
     stage.shutdown()
@@ -266,9 +264,9 @@ def test_dropped_frame_does_not_block_motion():
     stage, link = connected()
     reply_raw(link, 20.0 / 0.75)
     stage.move(20.0)
-    settle(stage)
+    confirm(stage)
     stage.move(60.0)                       # 这一帧丢了：回包不变，台子没动
-    settle(stage)
+    confirm(stage)
     assert stage.move(50.0) == 50.0
     stage.shutdown()
 
@@ -284,17 +282,39 @@ def test_usable_range_with_no_intersection_is_rejected():
         raise AssertionError("自报 160~200 与可用 5~150 无交集，必须拒绝连接")
 
 
-def test_judge_steady_ignores_target_distance():
-    """steady 只看「没动」，不看「在不在目标附近」—— 比值自检靠的就是这一半。"""
-    judge = SettleJudge(3, 2, 0.1, 0.2)
-    judge.reset(100.0)
-    for _ in range(6):
-        assert judge.feed(50.0) is False      # 稳定，但离目标 50 µm
-    assert judge.steady is True
-    for _ in range(3):
-        judge.feed(50.4)                      # 一个窗口内动了 0.4 > ε
-    assert judge.steady is False
-    assert judge.feed(50.0) is False
+def test_wait_on_target_waits_then_confirms():
+    """等待时长是调用方给的：等满 settle_s 再读一次回，落在容差内才算到位。"""
+    stage, _ = connected()
+    t0 = time.monotonic()
+    assert stage.wait_on_target(10.0, settle_s=0.12) is True
+    assert time.monotonic() - t0 >= 0.12, "没等满就确认了"
+    stage.shutdown()
+
+
+def test_wait_on_target_rejects_a_lost_setpoint():
+    """台子停在别处（设点丢了）→ 不算到位，扫描据此判该点无效、不采图。"""
+    stage, _ = connected()
+    stage.move(POSITION_UM + 5.0)     # 假串口固定回包：读回不动
+    assert stage.wait_on_target(10.0, settle_s=0.0) is False
+    stage.shutdown()
+
+
+def test_wait_on_target_honours_cancel():
+    """中止扫描时要立刻放弃等待，不能等满。"""
+    stage, _ = connected()
+    t0 = time.monotonic()
+    assert stage.wait_on_target(10.0, cancel=lambda: True, settle_s=1.0) is False
+    assert time.monotonic() - t0 < 0.4, f"取消没生效：等了 {time.monotonic() - t0:.2f} s"
+    stage.shutdown()
+
+
+def test_on_target_is_readback_against_target():
+    """on_target = 这一次读数落没落在目标容差内 —— 不是"台子停没停"。"""
+    stage, _ = connected()
+    assert stage.poll().on_target is True          # 连接时 target = 读回
+    stage.move(POSITION_UM + XMT_ARRIVAL_TOL_UM * 3)
+    assert stage.poll().on_target is False
+    stage.shutdown()
 
 
 def test_frames_use_the_negotiated_address():
@@ -327,9 +347,10 @@ def test_signatures_match_the_contract():
     """Protocol 只查属性在不在、不查签名，这里把调用方真正用的形状钉死。"""
     assert list(inspect.signature(XmtStage.move).parameters) == ["self", "target"]
     assert list(inspect.signature(XmtStage.stop_motion).parameters) == ["self"]
-    assert list(inspect.signature(XmtStage.wait_on_target).parameters) == [
-        "self", "timeout", "cancel"]
-    assert inspect.signature(XmtStage.wait_on_target).parameters["cancel"].default is None
+    wa = inspect.signature(XmtStage.wait_on_target).parameters
+    assert list(wa) == ["self", "timeout", "cancel", "settle_s"]
+    assert wa["cancel"].default is None
+    assert wa["settle_s"].default == 0.0, "等待时长必须能给，默认 0 = 不等"
     ann = inspect.signature(XmtStage.stop_motion).return_annotation
     assert ann in (StopResult, "StopResult"), ann
 
@@ -371,61 +392,6 @@ def test_velocity_is_refused():
         raise AssertionError("本设备没有速度指令，必须明确拒绝而不是假装接受")
     stage.shutdown()
 
-
-# ---------------- 停稳判据（纯逻辑） ----------------
-
-def _judge() -> SettleJudge:
-    return SettleJudge(window=5, need=2, eps_um=0.1, tol_um=0.5)
-
-
-def test_judge_needs_need_plus_one_windows():
-    j = _judge()
-    j.reset(10.0)
-    for i in range(5):                       # 第一窗：只立基线
-        assert j.feed(10.0 + (0.01 if i % 2 else 0.0)) is False
-    for _ in range(4):                       # 第二窗还没填满
-        assert j.feed(10.0) is False
-    assert j.feed(10.0) is True              # 第二窗确认
-
-
-def test_judge_rejects_steady_motion():
-    """匀速走必须被判成"还在动" —— 不重叠窗口才做得到。"""
-    j = _judge()
-    j.reset(100.0)
-    settled = False
-    for i in range(30):
-        settled = j.feed(100.0 + 0.03 * i)   # 每样本 0.03 µm < ε，但一窗走 0.15 µm
-    assert settled is False
-
-
-def test_judge_rejects_far_from_target():
-    """不动，但停在离目标很远的地方（设点丢了）→ 不能算到位。"""
-    j = _judge()
-    j.reset(50.0)
-    for _ in range(20):
-        settled = j.feed(10.0)
-    assert settled is False
-
-
-def test_judge_is_sticky_until_a_window_contradicts():
-    j = _judge()
-    j.reset(10.0)
-    for _ in range(10):
-        j.feed(10.0)
-    assert j.feed(10.0) is True              # 窗口没满，保持上次结论
-    for _ in range(5):
-        j.feed(10.0 + 1.0)                   # 跳了 1 µm，远超 ε
-    assert j.feed(10.0 + 1.0) is False
-
-
-def test_judge_reset_forgets_the_past():
-    j = _judge()
-    j.reset(10.0)
-    for _ in range(10):
-        j.feed(10.0)
-    assert j.feed(10.0) is True
-    j.reset(80.0)
-    assert j.feed(80.0) is False
 
 
 def main() -> int:

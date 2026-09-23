@@ -285,8 +285,9 @@ def stage_identity(link: Link) -> dict:
 def stage_idle_reads(link: Link, n: int = 20, gap_s: float = 2.0) -> dict:
     """台子不动，连读两批各 n 次。
 
-    - 极差 = 读数噪声底（取两批较小的那个），这就是「停稳」门限的实测下限。
-      **口径**：极差是**读回单位**，×0.75 才是 µm（见 docs/xmt/设备认识账.xml E11）
+    - 极差 = 读数噪声底（取两批较小的那个）。**口径**：极差是**读回单位**，
+      ×0.75 才是 µm（见 docs/xmt/设备认识账.xml E11）。它现在只用来解释「读回确认」
+      的容差够不够宽 —— 生产端已经不判稳了（见 xmt_stage.wait_on_target）。
     - 是否逐次完全相同：闭环反馈是实时传感器，静止时也该有末位抖动；
       若两批都一字不差，要怀疑读回来的是目标寄存器而不是传感器。
       注意这个启发式**只是怀疑**：单位码粗（如 4=mm，1e-4 mm = 0.1 µm）时，
@@ -314,11 +315,11 @@ def stage_idle_reads(link: Link, n: int = 20, gap_s: float = 2.0) -> dict:
     identical = all(len(set(v)) == 1 for v in batches)
     print("  " + ("两批都逐次完全相同 —— 可疑：可能读的是目标值而不是传感器"
                   if identical else "有末位抖动 —— 是活的传感器读数，正常"))
-    print(f"  → ε 的实测下限 = {min(spreads):g} 读回单位"
+    print(f"  → 噪声底 = {min(spreads):g} 读回单位"
           f"（≈ {min(spreads) * 0.75:g} µm；两批里最乐观的那个，是**下限**）")
-    print("     必须长时间静止后测；刚跑过运动时这个数偏大，方向偏松、不安全。")
-    print("     设门限时必须乘系数（建议 ≥3×）：门限压到噪声底以下就永远判不出停稳，")
-    print("     而停稳超时不是「多等一会儿」—— scanner 会把整个扫描判 failed 并停在中途。")
+    print("     必须长时间静止后测；刚跑过运动时这个数偏大。")
+    print("     生产端不判稳：移动后等满界面上的稳定延时、再读一次回（容差 XMT_ARRIVAL_TOL_UM）。")
+    print("     这条噪声底用来判断容差够不够宽、等待时长会不会太短（走完 + 整定的时间）。")
     return {"spread": min(spreads), "identical": identical}
 
 
