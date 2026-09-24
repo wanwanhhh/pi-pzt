@@ -48,6 +48,8 @@ function mkEl(isFragment) {
     },
     addEventListener() {}, getAttribute() { return null; },
     classList: { contains() { return false; } }, closest() { return null; },
+    // 真浏览器里 chartHeight() 用它量 uPlot 图例的高度；这里从来没建过真图，如实返回 null
+    querySelector() { return null; },
   };
   Object.defineProperty(e, 'children', { get() { return e._children; } });
   Object.defineProperty(e, 'innerHTML', {
@@ -579,7 +581,7 @@ const count = (m) => calls.filter((c) => c === m).length;
 
   console.log('\n[N] 预览质心：后端算好坐标，前端只按比例摆（不量像素、不做阈值/背景扣除）');
   const cenBody = (centroid) => ({
-    available: true, open: true, model: 'CS165MU', serial: '1', frames: 7,
+    available: true, state: 'preview', open: true, model: 'CS165MU', serial: '1', frames: 7,
     exposure_us: 12000, gain: 0, gain_locked: true,
     exposure_min_us: 40, exposure_max_us: 26843432,
     preview_roi: [0, 0, 1440, 1080], full_roi: [0, 0, 1440, 1080], saturation_adu: 1022, centroid,
@@ -801,6 +803,47 @@ const count = (m) => calls.filter((c) => c === m).length;
      read('JSON.stringify(profCharts.preview.h.data)') === '[[],[]]' &&
      read("$('prof-where').textContent") === '在预览图上点一下');
 
+
+  console.log('\n[O] 重开相机（手动）：界面按 state 写字，意图在后端');
+  const failedBody = Object.assign(cenBody(cen()),
+    { state: 'failed', open: false, failure: 'TLCameraError: 设备已断开', centroid: null });
+  route = (m, u) => (u.indexOf('/api/ccd/') === 0 ? { body: failedBody } : { body: [] });
+  await run('ccdStatus()'); await tick();
+  ok('掉线时状态行写「掉线：原因 + 点重开相机」',
+     read("$('ccd-sub').textContent").indexOf('掉线：') >= 0 &&
+     read("$('ccd-sub').textContent").indexOf('重开相机') >= 0,
+     JSON.stringify(read("$('ccd-sub').textContent")));
+  ok('掉线时画面收掉（不留上一帧）', read("$('ccd-img').hidden") === true);
+  ok('掉线时取帧计时器停掉（ccdLive 由 state 派生）', read('ccdTimer') === null);
+
+  // 重开成功：后端把状态带回 preview（意图在后端，界面只管显示）
+  route = (m, u) => {
+    if (u.indexOf('/api/ccd/reopen') === 0) return { body: cenBody(cen()) };
+    return u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] };
+  };
+  calls.length = 0;
+  await run("$('btn-ccd-reopen').onclick()"); await tick(); await tick();   // 真的点按钮
+  ok('点「重开相机」确实发 POST /api/ccd/reopen', calls.indexOf('POST /api/ccd/reopen') >= 0,
+     JSON.stringify(calls.slice(-3)));
+  ok('重开成功后画面恢复取帧（state=preview → ccdLive → 计时器起来）',
+     read('ccdLive') === true && read('ccdTimer') !== null,
+     JSON.stringify([read('ccdLive'), String(read('ccdTimer'))]));
+  ok('预览按钮回到「停止预览」', read("$('btn-ccd-live').textContent") === '停止预览',
+     JSON.stringify(read("$('btn-ccd-live').textContent")));
+  ok('成功后有提示、状态行不再是掉线',
+     read("$('toast').textContent").indexOf('相机已重开') >= 0 &&
+     read("$('ccd-sub').textContent").indexOf('掉线：') < 0,
+     JSON.stringify(read("$('ccd-sub').textContent")));
+
+  // 重开失败：把后端的 503 原因照实弹出来，按钮回到可点
+  route = (m, u) => (u.indexOf('/api/ccd/reopen') === 0
+    ? { ok: false, status: 503, body: { detail: '没发现相机：检查 USB 连接与相机电源。' } }
+    : (u.indexOf('/api/ccd/') === 0 ? { body: failedBody } : { body: [] }));
+  await run('ccdReopen()'); await tick(); await tick();
+  ok('重开失败时弹出后端的中文原因', read("$('toast').textContent").indexOf('没发现相机') >= 0,
+     JSON.stringify(read("$('toast').textContent")));
+  ok('失败后按钮仍可点（可以再试）', read("$('btn-ccd-reopen').disabled") === false);
+  route = (m, u) => (u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] });
   console.log('\n[S] 点位表：列数对得上，「间距」= 相邻两点实际之差');
   reset(); calls.length = 0;
   route = (m, u) => (u.indexOf('/api/scans/') === 0

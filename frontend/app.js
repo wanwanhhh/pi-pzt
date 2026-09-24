@@ -79,8 +79,8 @@ function showView(v) {
     $('tab-' + VIEWS[i]).className = on ? 'tab active' : 'tab';
   }
   // 藏起来的容器宽度是 0：切回来得重新量一次，不然是一张压扁的图
-  if (view === 'scan' && chart) chart.setSize({ width: chartWidth($('chart')), height: 220 });
-  if (view === 'align' && traceChart) traceChart.setSize({ width: chartWidth($('trace')), height: 220 });
+  if (view === 'scan') fitChart(chart, 'chart', 220);
+  if (view === 'align') fitChart(traceChart, 'trace', 220);
   if (view === 'ccd') {
     ccdStatus();
     loadGrabs();
@@ -338,12 +338,17 @@ function renderScan(sc) {
     if (pinnedScanId === null || pinnedScanId === target) loadScan(target);
   }
 
-  // 相机归扫描用：预览必须停。**后端才是权威**（预览接口在扫描中一律 409），
-  // 这里只是不让界面停在一个"看着还在预览"的假象上。
-  if (scanActive && ccdLive) ccdLiveStop();
-  $('btn-ccd-live').disabled = !ccdAvailable || scanActive;
-  $('btn-ccd-grab').disabled = !ccdAvailable || scanActive;
-  $('btn-ccd-rot').disabled = !ccdAvailable || scanActive;
+  // 相机归扫描用由**后端**管（begin_scan → 状态变 held，预览取帧自动让位）。
+  // 界面**不许在这里发 on=false**：那会把「用户想要预览」的意图清掉，扫描结束后就接不回来。
+  // 按钮可用性：扫描中相机接口一律 409，所以直接禁用（真正的拒绝在后端）。
+  if (scanActive) {
+    $('btn-ccd-live').disabled = true;
+    $('btn-ccd-grab').disabled = true;
+    $('btn-ccd-rot').disabled = true;
+    $('btn-ccd-reopen').disabled = true;
+  } else if (ccdInfo) {
+    ccdPaint(ccdInfo);      // 扫描结束后按后端状态把按钮与画面恢复
+  }
 
   syncTraceFlag();
 }
@@ -411,8 +416,35 @@ function renderPoints(points) {
 
 /* ==================== 曲线：每点偏差（实际 − 目标） ==================== */
 
+/* 320 是"卡片最窄也要能放下坐标轴"的老下限，但预览页的剖面栏在 1280 下只有 279px 可用 ——
+   下限比容器还大就直接撑出横向滚动条。220 一样放得下两条轴，留出约 160px 画线。 */
 function chartWidth(el) {
-  return Math.max(320, el.clientWidth || 600);
+  return Math.max(220, el.clientWidth || 600);
+}
+
+/* 图跟着卡片长：卡片是 .grow、图区是 flex:1，clientHeight 就是"还剩多少高度"。
+   **uPlot 的 height 只算绘图区，图例另占一行**（实测 28px，字号 12px 下）：
+   不把它扣掉，整块就比卡片高一行，图例正好压在下面的统计条上
+   （实测：587 的框里塞了 615 的内容）。还没建图时按实测值先留一行。
+   量不到高度（还没布局 / 图区被 :empty 收成 0）就用回退值，别把图压成一条线。 */
+const CHART_LEGEND_PX = 28;
+
+function chartHeight(el, fallback) {
+  const lg = el.querySelector('.u-legend');
+  const avail = el.clientHeight || ((fallback || 220) + CHART_LEGEND_PX);
+  // 下限压到 90：矮屏下卡片只剩一百多像素时，硬撑到 140 会让图比卡片还高（实测差 5px）
+  return Math.max(90, avail - ((lg && lg.offsetHeight) || CHART_LEGEND_PX));
+}
+
+/* 按卡片当前尺寸重排一张图。尺寸没变就不调 setSize —— 这函数在遥测的每个节拍都会被叫到
+   （曲线每 200 ms 一次），没必要每次都让 uPlot 重排。 */
+function fitChart(u, id, fallback) {
+  if (!u) return;
+  const width = chartWidth($(id)), height = chartHeight($(id), fallback);
+  const last = u._fitSize;
+  if (last && last.width === width && last.height === height) return;
+  u._fitSize = { width: width, height: height };
+  u.setSize({ width: width, height: height });
 }
 
 /* uPlot 绘制时是把 points.show 当**函数**调用的（构造那一下会把布尔值包一层）。
@@ -436,7 +468,7 @@ function renderChart(points) {
     if (!points.length) return;
     chart = new uPlot({
       width: chartWidth($('chart')),
-      height: 220,
+      height: chartHeight($('chart'), 220),   // 建图时的高度；随后 fitChart 按卡片实际尺寸校正
       scales: { x: { time: false } },
       legend: { show: true },
       series: [
@@ -449,12 +481,12 @@ function renderChart(points) {
         { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } }
       ]
     }, data, $('chart'));
-    new ResizeObserver(function () {
-      chart.setSize({ width: chartWidth($('chart')), height: 220 });
-    }).observe($('chart'));
+    new ResizeObserver(function () { fitChart(chart, 'chart', 220); }).observe($('chart'));
   } else {
     chart.setData(data);
   }
+  // 点位表/提示条一多一少，图区的可用高度就变了，跟着重排一次
+  fitChart(chart, 'chart', 220);
 }
 
 /* ==================== 位置曲线（观察稳定性） ==================== */
@@ -483,7 +515,7 @@ function traceAxisSize(u, values) {
 function traceBuild() {
   traceChart = new uPlot({
     width: chartWidth($('trace')),
-    height: 220,
+    height: chartHeight($('trace'), 220),   // 建图时的高度；随后 fitChart 按卡片实际尺寸校正
     scales: { x: { time: false } },
     legend: { show: true },
     // 拖拽缩放和"四个输入框是唯一的准"直接冲突：拖完图变了、输入框没变，下次取数又被丢掉
@@ -499,9 +531,7 @@ function traceBuild() {
         values: traceAxisVals, size: traceAxisSize }
     ]
   }, [[], []], $('trace'));
-  new ResizeObserver(function () {
-    traceChart.setSize({ width: chartWidth($('trace')), height: 220 });
-  }).observe($('trace'));
+  new ResizeObserver(function () { fitChart(traceChart, 'trace', 220); }).observe($('trace'));
 }
 
 function renderTrace() {
@@ -512,6 +542,7 @@ function renderTrace() {
     ys.push(w.position[i]);
   }
   traceChart.setData([xs, ys]);
+  fitChart(traceChart, 'trace', 220);   // 提示条显隐会改图区高度，每帧跟一次
   applyTraceRange();
 }
 
@@ -691,13 +722,19 @@ async function traceStop(skipFetch) {
 /* 预览就是"最近一帧"：后端按 15 fps 连续取帧并缓存一张 JPEG，
    前端反复设 img.src 去取。取不到（204）就跳过，不排队、不重试。
    **界面不做任何处理**：后端给的就是原始灰度，不拉伸、不伪彩。 */
-const CCD_LIVE_MS = 100;      // 10 fps：比后端取帧还快，多出来的请求会拿到同一张
-const CCD_FAIL_MAX = 5;       // 连续失败这么多次就自动停，避免刷屏报错
+const CCD_LIVE_MS = 100;      // 取帧节拍 10 fps（比后端 15 fps 慢一点，多出来的请求拿同一张）
+const CCD_POLL_EVERY = 5;     // 每 5 拍才问一次状态（2 Hz）——状态是内存快照，没必要每帧都问
+// 「正在打开…」提示里写的等待上限：后端建会话时最多等这么久（config.TL_OPEN_WAIT_S）。
+// 这里只是文案用的数字，不参与任何判断 —— 真正的超时在后端。
+const CCD_OPEN_WAIT_S = 8;
 
 let ccdAvailable = false;
 let ccdInfo = null;
+// **界面不持有意图**：「要不要预览」是后端的状态（state === 'preview'），这里只是镜像它。
+// 旧代码在前端又存了一份 ccdWanted，于是「谁说了算」有两个答案 —— 掉线后就对不上。
 let ccdLive = false;
 let ccdTimer = null;
+let ccdTicks = 0;
 let ccdFails = 0;
 let ccdLoadedAt = 0;
 let ccdFrames = 0;
@@ -706,11 +743,8 @@ let grabsData = null;      // 最近一次 /api/grabs 的结果（改名时要�
 async function ccdStatus() {
   const d = await get('/api/ccd/status');
   if (!d) return null;
-  ccdInfo = d;
   ccdAvailable = !!d.available;
-  $('btn-ccd-live').disabled = !ccdAvailable || scanActive;
-  $('btn-ccd-grab').disabled = !ccdAvailable || scanActive;
-  $('btn-ccd-rot').disabled = !ccdAvailable || scanActive;
+  ccdPaint(d);          // 状态、按钮、画面收放都在这里按 state 走
   // **这段文字只能在这里写一次**：以前 index.html 里也写了一份，结果被这一行整段覆盖，
   // 界面上永远看不到新加的口径说明（评审抓到的）。数字一律取后端下发的值，别在 JS 里写死。
   $('ccd-note').innerHTML = ccdAvailable
@@ -795,27 +829,73 @@ async function ccdRotate() {
   toast('预览朝向 ' + (next ? next + '°' : '0°（传感器原始）') + '；保存的文件不受影响');
 }
 
+/* 重开相机（手动）：USB 接触不良 / 相机报错之后，后端不会自己试 —— 点这里丢掉旧句柄重开。
+   预览原本开着就接着开；失败原因照旧由 request() 弹出来（电源、ThorCam 占用、USB）。 */
+async function ccdReopen() {
+  const btn = $('btn-ccd-reopen');
+  btn.disabled = true;
+  setText('ccd-sub', '正在重开相机…（最多等 ' + CCD_OPEN_WAIT_S + ' s）');
+  const st = await post('/api/ccd/reopen');
+  if (!st) { await ccdStatus(); return; }        // 失败原因 request() 已经弹过
+  ccdFails = 0;
+  ccdPaint(st);
+  const who = (st.model || '相机') + (st.serial ? '（' + st.serial + '）' : '');
+  // 预览要不要继续，由**后端**的意图决定（state 就是答案）：它记着「用户想要预览」，
+  // 重开成功后自己会接着取帧；这里只如实转述。
+  toast(ccdLive ? ('相机已重开：' + who + '，预览继续') : ('相机已重开：' + who));
+}
+
+/* 界面按**后端的状态**写字，不自己推断：off / idle / opening / preview / held / failed。
+   旧代码靠 st.open + last_error 拼，掉线时拼出「已连接 + 出错」这种自相矛盾的样子。 */
+const CCD_STATE_TEXT = {
+  off: '未接入相机',
+  idle: '相机空闲（未打开）',
+  opening: '正在打开相机…',
+  held: '相机归扫描用（预览让位）',
+};
+
 function ccdPaint(st) {
   if (!st) return;
+  ccdInfo = st;
+  const state = st.state || (st.available ? 'idle' : 'off');
+  ccdLive = (state === 'preview');            // 镜像后端：界面不持有意图
   ccdPaintForm(st);
   setText('ccd-rot', st.rotation ? st.rotation + '°（仅预览）' : '0°（传感器原始）');
   ccdPaintCentroid(st);
-  $('ccd-sub').textContent = st.open
-    ? (st.model || '已连接') + (st.serial ? ' · ' + st.serial : '')
-    : (ccdAvailable ? '相机未打开' : '不可用');
+  $('ccd-sub').textContent = (state === 'preview')
+    ? ((st.model || '已连接') + (st.serial ? ' · ' + st.serial : ''))
+    : (state === 'failed')
+      ? ('掉线：' + (st.failure || '原因未知') + ' —— 点「重开相机」')
+      : (CCD_STATE_TEXT[state] || state);
   setText('ccd-res', st.preview_roi ? st.preview_roi[2] + '×' + st.preview_roi[3] : '—');
   // 这一格是**相机读回的实际值**（不是输入框里填的请求值）：固件会取整，以读回为准
   setText('ccd-exp', st.exposure_us ? (st.exposure_us / 1000).toFixed(2) : '—');
   setText('ccd-gain', (st.gain === undefined || st.gain === null) ? '—' : String(st.gain));
-  if (st.last_error) $('ccd-sub').textContent = '出错：' + st.last_error;
+
+  // 不是预览态就把画面收掉：浏览器的 <img> 在解码失败时会把**上一帧留在屏幕上** ——
+  // 那正是「旧帧冒充实时画面」的前端那一半。
+  if (!ccdLive) {
+    $('ccd-img').src = '';
+    $('ccd-img').hidden = true;
+    $('ccd-empty').hidden = false;
+    setText('ccd-fps', '—');
+  }
+  syncCcdTimer();
+  const busy = scanActive || !ccdAvailable || state === 'opening';
+  $('btn-ccd-live').disabled = busy;
+  $('btn-ccd-live').textContent = ccdLive ? '停止预览' : '开始预览';
+  $('btn-ccd-live').className = ccdLive ? '' : 'primary';
+  $('btn-ccd-grab').disabled = busy;
+  $('btn-ccd-rot').disabled = busy;
+  $('btn-ccd-reopen').disabled = busy;
 }
 
 /* 刷新用 img.src：浏览器直接解码显示，比 fetch+blob 省事，也不用管 URL 回收。
    设成空串会取消上一张还没下完的请求。 */
 function ccdTick() {
   if (!ccdLive) return;
-  // 顺带取一次状态：质心/ΣI/饱和这些读数就在状态里，跟着预览的节拍刷新（只读内存，不碰设备）
-  ccdStatus();
+  // 状态是内存快照：按 2 Hz 问就够，不必跟着 10 fps 的取帧节拍每帧都问一次
+  if (++ccdTicks % CCD_POLL_EVERY === 0) ccdStatus();
   if (profPoint.preview) profFetch('preview');   // 轮廓图：点在哪儿就一直跟着刷新
   const img = $('ccd-img');
   img.onload = function () {
@@ -828,34 +908,41 @@ function ccdTick() {
     $('ccd-empty').hidden = true;
   };
   img.onerror = function () {
+    // **界面不自己停**：拿不到帧就如实显示「取不到帧」，让状态（下一次 ccdStatus）说话。
+    // 旧代码在这里 POST on=false 自动停 —— 于是后端以为「用户不要预览了」，
+    // 重开之后自然也不接着取帧，界面看着就像「重开没用」。
     ccdFails++;
-    if (ccdFails >= CCD_FAIL_MAX) {
-      ccdLiveStop();
-      if (ccdFails > 0) toast('预览中断：连续 ' + ccdFails + ' 次取不到帧', true);
-    }
+    setText('ccd-fps', '取不到帧 ×' + ccdFails);
   };
   img.src = '/api/ccd/preview.jpg?t=' + Date.now();
+}
+
+function syncCcdTimer() {
+  // 取帧计时器只由 state 决定：是 preview 就取帧，别的状态一律停（不再有两份真相）
+  if (ccdLive && ccdTimer === null) {
+    ccdTicks = 0;
+    ccdTick();
+    ccdTimer = setInterval(ccdTick, CCD_LIVE_MS);
+  } else if (!ccdLive && ccdTimer !== null) {
+    clearInterval(ccdTimer);
+    ccdTimer = null;
+  }
 }
 
 async function ccdLiveStart(quiet) {
   const btn = $('btn-ccd-live');
   btn.disabled = true;
+  setText('ccd-sub', '正在打开相机…（最多等 ' + CCD_OPEN_WAIT_S + ' s）');
   const st = await post('/api/ccd/preview?on=true');
-  if (!st) { btn.disabled = false; await ccdStatus(); return; }   // 409/503 的提示 request() 已经弹过
-  ccdInfo = st;
-  ccdLive = true;
+  if (!st) { await ccdStatus(); return; }    // 409/503 的提示 request() 已经弹过
   ccdFails = 0;
   ccdFrames = 0;
   ccdLoadedAt = 0;
-  btn.textContent = '停止预览';
-  btn.className = '';
-  btn.disabled = !ccdAvailable || scanActive;
-  $('ccd-empty').hidden = false;
-  ccdPaint(st);
-  ccdTick();
-  ccdTimer = setInterval(ccdTick, CCD_LIVE_MS);
-  if (!quiet) toast('预览已开（' + st.preview_roi[2] + '×' + st.preview_roi[3] + '，曝光 ' +
-    (st.exposure_us / 1000).toFixed(1) + ' ms）');
+  ccdPaint(st);                               // state=preview → syncCcdTimer 开始取帧
+  if (!quiet && ccdLive) {
+    toast('预览已开（' + st.preview_roi[2] + '×' + st.preview_roi[3] + '，曝光 ' +
+      (st.exposure_us / 1000).toFixed(1) + ' ms）');
+  }
 }
 
 /* 停预览 = 停界面这一侧 **+ 告诉后端停**。
@@ -863,14 +950,12 @@ async function ccdLiveStart(quiet) {
    只有 preview?on=false 能停它（原来这里写着"浏览器一断自然就不再消耗设备"，是错的）。
    keepalive 让关页面时这个请求也发得出去。 */
 function ccdLiveStop() {
+  // 「停」= 告诉后端不要预览了（后端会顺手把会话收掉）。界面这边由下一次状态刷新收尾。
+  fetch('/api/ccd/preview?on=false', { method: 'POST', keepalive: true })
+    .then(function () { return ccdStatus(); })
+    .catch(function () {});
   if (ccdTimer) { clearInterval(ccdTimer); ccdTimer = null; }
-  if (!ccdLive) return;
   ccdLive = false;
-  fetch('/api/ccd/preview?on=false', { method: 'POST', keepalive: true }).catch(function () {});
-  const btn = $('btn-ccd-live');
-  btn.textContent = '开始预览';
-  btn.className = 'primary';
-  btn.disabled = !ccdAvailable || scanActive;
   $('ccd-img').src = '';
   $('ccd-img').hidden = true;
   $('ccd-empty').hidden = false;
@@ -908,7 +993,7 @@ function profBuild(host) {
   const mk = function (id, label, color) {
     return new uPlot({
       width: chartWidth($(id)),
-      height: 150,
+      height: chartHeight($(id), 150),
       scales: { x: { time: false } },
       legend: { show: true },
       cursor: { drag: { x: false, y: false } },
@@ -923,6 +1008,11 @@ function profBuild(host) {
     h: mk(cfg.h, '水平（整行）像素', '#2563eb'),
     v: mk(cfg.v, '垂直（整列）像素', '#0d9488'),
   };
+  // 剖面图也是吃满卡片高度的：卡片尺寸一变（切页、缩放窗口）就跟着重排
+  new ResizeObserver(function () {
+    fitChart(profCharts[host].h, cfg.h, 150);
+    fitChart(profCharts[host].v, cfg.v, 150);
+  }).observe($(cfg.h));
 }
 
 /* 把后端给的剖面上图：两张图各一条线，并在图上画出那两条切线 */
@@ -1167,9 +1257,100 @@ async function loadHistory() {
   tb.appendChild(frag);
 }
 
+/* ==================== 分栏拖动 ==================== */
+
+/* 分栏线拖的是**显示**，不是业务：只改 .view 上的一个 CSS 变量（grid 模板读它），
+   后端不知道也不关心你眼睛怎么分的栏。所以这里没有一条限位/业务判断。
+   值存在 localStorage（按视图 + 变量名），双击复位、方向键微调。
+   图不用管：每一张图都有 ResizeObserver，列宽一变自己按新尺寸重排。 */
+const LAYOUT_KEY = 'layout.';
+
+function layoutSave(viewId, name, px) {
+  try { localStorage.setItem(LAYOUT_KEY + viewId + name, String(px)); } catch (err) { /* 隐私模式禁写：不影响本次拖动 */ }
+}
+
+function layoutLoad(viewId, name) {
+  try { return parseFloat(localStorage.getItem(LAYOUT_KEY + viewId + name)) || 0; } catch (err) { return 0; }
+}
+
+/* 这条线管的那一格现在多大。**管哪一侧由 data-of 说了算**，不能靠猜：
+   对准/扫描的任务栏在线的左边（prev），预览页的剖面栏、图库栏和底部的历史带在线的右边/下边（next）。
+   猜错不会报错，只会"拖了没反应/一拖就顶到头"—— 所以写在 HTML 上。 */
+function gutterBox(g, axis, of) {
+  const box = of === 'next' ? g.nextElementSibling : g.previousElementSibling;
+  if (!box) return 0;
+  const r = box.getBoundingClientRect();
+  return Math.round(axis === 'x' ? r.width : r.height);
+}
+
+function gutterApply(g, view, name, px, save) {
+  const min = parseFloat(g.dataset.min) || 120;
+  const max = parseFloat(g.dataset.max) || 900;
+  const v = Math.max(min, Math.min(max, Math.round(px)));
+  view.style.setProperty(name, v + 'px');
+  if (save) layoutSave(view.id, name, v);
+}
+
+function wireGutters() {
+  const list = document.querySelectorAll('.gutter');
+  for (let i = 0; i < list.length; i++) {
+    const g = list[i];
+    const view = g.closest ? g.closest('.view') : null;
+    const name = g.dataset ? g.dataset.var : '';
+    if (!view || !name) continue;             // 结构不对就当没这条线（测试用的假 DOM 走到这里）
+    const axis = g.dataset.axis === 'y' ? 'y' : 'x';
+    const of = g.dataset.of === 'next' ? 'next' : 'prev';
+    // 位移进哪一格：管的是**线右边/下边**那一格时，鼠标往哪拖、那一格就变小（反号）。
+    // 判据只有一条 —— 线跟着手走：往左拖，线左移，右边的格子就更宽。
+    const sign = of === 'next' ? -1 : 1;
+    const saved = layoutLoad(view.id, name);
+    if (saved) gutterApply(g, view, name, saved, false);   // 恢复也走夹取：min/max 事后改小、或存储被手改，都不该把栏拖坏
+
+    g.addEventListener('pointerdown', function (ev) {
+      ev.preventDefault();                 // 挡掉拖动时选中文字
+      if (g.focus) g.focus();              // preventDefault 会把"点一下获得焦点"一起挡掉，这里补回来：
+                                           // 不补的话鼠标点完焦点还在 body 上，方向键就没反应
+      const from = gutterBox(g, axis, of);
+      const start = axis === 'x' ? ev.clientX : ev.clientY;
+      g.classList.add('on');
+      if (g.setPointerCapture) g.setPointerCapture(ev.pointerId);
+      const move = function (e) {
+        const d = (axis === 'x' ? e.clientX : e.clientY) - start;
+        gutterApply(g, view, name, from + sign * d, false);
+      };
+      const up = function () {
+        g.classList.remove('on');
+        g.removeEventListener('pointermove', move);
+        g.removeEventListener('pointerup', up);
+        gutterApply(g, view, name, gutterBox(g, axis, of), true);   // 落盘只在松手时写一次
+      };
+      g.addEventListener('pointermove', move);
+      g.addEventListener('pointerup', up);
+      g.addEventListener('pointercancel', up);   // 触屏被系统打断时同样收尾（不然 .on 高亮与监听留着）
+    });
+
+    g.addEventListener('dblclick', function () {
+      view.style.removeProperty(name);        // 复位 = 回到 CSS 里的默认值
+      layoutSave(view.id, name, 0);
+    });
+
+    g.addEventListener('keydown', function (ev) {
+      const d = ev.shiftKey ? 64 : 16;
+      const step = axis === 'x'
+        ? (ev.key === 'ArrowLeft' ? -d : ev.key === 'ArrowRight' ? d : 0)
+        : (ev.key === 'ArrowUp' ? -d : ev.key === 'ArrowDown' ? d : 0);
+      if (!step) return;
+      ev.preventDefault();
+      // 方向键同样是"线跟着按键走"：按左键 = 线左移（管左边那格就变小，管右边那格就变大）
+      gutterApply(g, view, name, gutterBox(g, axis, of) + sign * step, true);
+    });
+  }
+}
+
 /* ==================== 交互 ==================== */
 
 function wire() {
+  wireGutters();
   $('btn-move').onclick = async function () {
     const v = parseFloat($('move-target').value);
     if (Number.isNaN(v)) { toast('请填写目标位置', true); return; }
@@ -1231,13 +1412,9 @@ function wire() {
   };
 
   $('btn-scan-start').onclick = async function () {
-    // 预览占着相机时后端会 409 拒掉扫描，这里顺手先关掉，省得用户看到一句冲突报错。
-    // 这只是顺手：**后端自己也会在开始扫描前关预览**（POST /api/scans 里），
-    // 所以界面状态不准也不会让扫描和预览抢同一台相机。
-    if (ccdLive) {
-      ccdLiveStop();
-      toast('已关掉相机预览（扫描要用相机）');
-    }
+    // **不用先关预览**：扫描器一开始就跑 capture.begin() → begin_scan()，设备层会把取帧
+    // 停下、会话留给扫描（状态变 held）。界面这边什么都不用做，也不许发 on=false
+    // —— 那会清掉「用户想要预览」的意图，扫描结束后预览就回不来了。
     const body = {
       name: $('scan-name').value.trim(),
       start_um: parseFloat($('scan-start').value),
@@ -1274,6 +1451,7 @@ function wire() {
   $('btn-ccd-live').onclick = function () { if (ccdLive) ccdLiveStop(); else ccdLiveStart(); };
   $('btn-ccd-grab').onclick = ccdGrab;
   $('btn-ccd-rot').onclick = ccdRotate;
+  $('btn-ccd-reopen').onclick = ccdReopen;
   $('btn-grabs-refresh').onclick = loadGrabs;
   // 曝光改完立刻生效（数字框用 change，回车或失焦才发，别每敲一个字符就打设备）
   $('ccd-preview-ms').onchange = ccdSetExposure;

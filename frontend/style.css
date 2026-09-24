@@ -1,3 +1,28 @@
+/* =====================================================================
+   位移台控制台 —— 版式
+   ---------------------------------------------------------------------
+   三条硬规矩（每一层都要写 min-height:0，漏了就全塌）：
+
+   1) 页面永不滚动
+      html,body{height:100%} + body{overflow:hidden}；顶栏 flex:0 0 auto，
+      main 是唯一伸展区：flex:1 1 auto + min-height:0。
+      （flex/grid 子项的默认 min-height 是 auto：不写 0 它就不肯收缩，
+        内容一多整页立刻长出滚动条，下面的规矩全白搭。）
+
+   2) 每页 2~3 个「栏」，栏是卡片纵列，卡片分两种
+      .card.fit   按内容高度（读数、控件这种定内容的）
+      .card.grow  吃掉剩余高度（曲线、表、图、图库：不够时自己滚）
+      .card.fill  填满剩余高度但不许压到比内容还小（控制面板：大屏补平栏底）
+      栏顶一行 .coltitle 说明这一栏是干什么的 —— 分类靠它，不靠用户猜。
+
+   3) 溢出只发生在区域内部
+      .body（卡片内容区）与 .col（整栏兜底）各自 overflow:auto。
+      layout-demo.html 的压测（200 行点位 + 40 张缩略图）实测：页面 height 不变，
+      溢出的 6629px 内容全部落在 .body 自己的滚动条里；真页面上量到的是
+      点位表 548px、历史表 1659px 这两处，同样只在各自区域内滚。
+
+   三页的栏位与分类见 index.html 的注释。颜色与控件沿用原来的 token。
+   ===================================================================== */
 :root {
   --bg: #f1f5f9;
   --card: #fff;
@@ -8,26 +33,37 @@
   --warn: #d97706;
   --bad: #dc2626;
   --run: #2563eb;
+  --dark: #0b0f19;
+  --gap: 12px;
+  --pad: 14px;
+  --radius: 10px;
 }
 
 * { box-sizing: border-box; }
 
+html, body { height: 100%; }
+
 body {
   margin: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
   font: 14px/1.5 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
   background: var(--bg);
   color: var(--text);
 }
 
-/* ---------- 顶栏 ---------- */
+/* ---------- 顶栏（固定高，永不滚动） ---------- */
 .bar {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; flex-wrap: wrap;
-  padding: 12px 20px; background: var(--card);
-  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10;
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 14px;
+  padding: 9px 16px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
 }
-.bar h1 { font-size: 16px; margin: 0; font-weight: 600; }
-.pills { display: flex; gap: 8px; flex-wrap: wrap; }
+.bar h1 { margin: 0; font-size: 15px; font-weight: 600; white-space: nowrap; }
+.pills { display: flex; align-items: center; gap: 8px; }
 .pill {
   padding: 3px 10px; border-radius: 999px; font-size: 12px;
   background: #e2e8f0; color: var(--muted); white-space: nowrap;
@@ -37,12 +73,11 @@ body {
 .pill.bad  { background: #fee2e2; color: var(--bad); }
 .pill.run  { background: #dbeafe; color: var(--run); }
 
-/* 视图切换：两种工作模式互斥（扫描占着设备时手动会被后端拒），所以分成两页显示。
-   这是显示状态，不是权限 —— 真正的拒绝永远在后端（409 + 中文原因）。 */
-.tabs { display: flex; gap: 4px; padding: 3px; background: #e2e8f0; border-radius: 9px; }
+/* 分页是显示状态，不是权限：真正的拒绝永远在后端（409 + 中文原因）。 */
+.tabs { display: flex; gap: 4px; padding: 3px; background: #e2e8f0; border-radius: 9px; margin-left: auto; }
 .tab {
-  padding: 5px 18px; font-size: 13px; color: var(--muted);
-  background: transparent; border: 0; border-radius: 7px;
+  padding: 5px 20px; font: inherit; font-size: 13px; color: var(--muted);
+  background: transparent; border: 0; border-radius: 7px; cursor: pointer;
 }
 .tab:hover:not(.active) { background: #fff; color: var(--text); }
 .tab.active, .tab.active:hover {
@@ -50,109 +85,182 @@ body {
   box-shadow: 0 1px 2px rgba(15, 23, 42, .12);
 }
 
-/* ---------- 布局 ---------- */
-/* 每个视图自己两栏（对准：左＝读数+手动，右＝曲线；扫描：左＝参数+历史，右＝点位）。
-   420px 是下限不是审美：曲线卡的表单与统计条要排 3 列，卡宽得 ≥416px（3×120+2×12+内边距）。
-   栏内 track 必须写 minmax(0,1fr)：漏了它卡片会按 max-content 撑开，直接溢出栏宽。 */
-main { padding: 16px 20px 40px; }
-.view {
-  display: grid; gap: 16px; align-items: start;
-  grid-template-columns: 420px minmax(0, 1fr);
-}
+/* ---------- 页面骨架 ---------- */
+main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
+.view { height: 100%; min-height: 0; display: grid; gap: var(--gap); }
 .view[hidden] { display: none; }   /* 要显式写：.view 的 display 会盖掉 [hidden] 的默认值 */
-/* 扫描页左栏装的是历史列表（8 列），420 太挤 —— 那一列要宽一些；
-   对准页左栏是读数与控件，420 够用，而且曲线卡在 420 以上才排得下 3 列。 */
-#view-scan { grid-template-columns: 560px minmax(0, 1fr); }
-/* 预览页：左边预览、右边图库。图库卡整宽铺满，缩略图网格自己多行密排 ——
-   一排 3 个的话右边会空一大片（1440×1080 的图缩小后本来就看不清细节）。 */
-#view-ccd { grid-template-columns: 460px minmax(0, 1fr); }
-/* 窄屏（<=1180px）：图库掉到预览下面，仍然整宽 */
-@media (max-width: 1180px) {
-  #view-ccd { grid-template-columns: minmax(0, 1fr); }
+
+/* 三页的栏宽。左栏＝操作（定宽，表单不左右晃）；中栏＝结果（吃掉剩余）；
+   右栏＝历史 / 图库（定宽）。定宽用 px 不用 fr：表格列宽稳定，窗口拉伸时不抖。
+
+   **定宽那几栏都写成 var(..., 默认值)**：中间那根 0 宽的轨道是分栏线，
+   拖动时 JS 只改 .view 上的变量，grid 模板原样读它 —— 拖动不碰任何业务逻辑。
+   两个 0 宽轨道之间的 6px gap 相加 = 原来的 12px，所以视觉间距没变。
+   要调默认值就改这里的 fallback；用户拖过的值存在 localStorage 里，优先于它。 */
+.view-align {
+  grid-template-columns: var(--col-ctl, 380px) 0 minmax(0, 1fr);
+  column-gap: 6px;
 }
+.view-scan {
+  grid-template-columns: var(--col-task, 350px) 0 minmax(0, 1fr);
+  /* 第三行是「历史」横条：跨整宽，表在里面自己滚。
+     历史与点位不是一回事（一个是正在跑的、一个是翻旧账），所以给它单独一条带。 */
+  grid-template-rows: minmax(0, 1fr) 0 var(--hist, 240px);
+  column-gap: 6px; row-gap: 6px;
+}
+.view-ccd {
+  grid-template-columns: minmax(0, 1fr) 0 var(--col-prof, 320px) 0 var(--col-gal, 360px);
+  column-gap: 6px;
+}
+
+/* 栏：卡片纵列；整栏兜底滚动（矮屏 / 窄屏时用，正常情况不会出现滚动条） */
 .col {
-  display: grid; gap: 16px; align-content: start; min-width: 0;
-  grid-template-columns: minmax(0, 1fr);
+  display: flex; flex-direction: column; gap: var(--gap);
+  min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden;
 }
-/* 窄屏回落成单列，卡片按 DOM 顺序排 —— 顺序与分两栏之前完全一致。
-   display:contents 之后 .col 不产生盒子，所以这里不能给它 padding 之类的视觉样式。 */
-@media (max-width: 900px) {
-  .view { grid-template-columns: minmax(0, 1fr); }
-  .col { display: contents; }
-  /* 单列后按"参数 → 点位 → 历史"排：跑扫描时先看点位，历史垫底 */
-  #card-points { order: 1; }
-  #card-history { order: 2; }
+.col-history { grid-column: 1 / -1; grid-row: 3; }
+.gutter-h { grid-column: 1 / -1; grid-row: 2; }
+.coltitle {
+  flex: 0 0 auto; margin: 0; font-size: 11px; color: var(--muted);
+  display: flex; align-items: center; gap: 8px;
 }
+.coltitle::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 
+/* ---------- 分栏线（可拖动）----------
+   0 宽的 grid 轨道：占地为零，握把与命中区都从轨道里"溢"出来画。
+   命中区比握把宽（左右各 7px），不必非得点中那 4px 的小条。
+   光标 + hover 变色就是"这里能拖"的全部提示；双击复位，键盘方向键也能调。 */
+.gutter { position: relative; z-index: 2; }
+.gutter-v { cursor: col-resize; }
+.gutter-h { cursor: row-resize; }
+.gutter::after { content: ""; position: absolute; }
+.gutter-v::after { top: 0; bottom: 0; left: -7px; right: -7px; }
+.gutter-h::after { top: -7px; bottom: -7px; left: 0; right: 0; }
+.gutter::before {
+  content: ""; position: absolute; border-radius: 999px;
+  background: #cbd5e1; transition: background .15s;
+}
+.gutter-v::before { left: 50%; top: 50%; width: 4px; height: 36px; margin: -18px 0 0 -2px; }
+.gutter-h::before { left: 50%; top: 50%; width: 36px; height: 4px; margin: -2px 0 0 -18px; }
+.gutter:hover::before, .gutter.on::before, .gutter:focus-visible::before { background: var(--run); }
+.gutter:focus-visible { outline: none; }
+
+/* ---------- 卡片 ---------- */
 .card {
-  background: var(--card); border: 1px solid var(--line);
-  border-radius: 10px; padding: 16px;
+  display: flex; flex-direction: column;
+  min-height: 0; min-width: 0;
+  padding: var(--pad);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
 }
-.card h2 {
-  margin: 0 0 12px; font-size: 14px; font-weight: 600;
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+.card.fit  { flex: 0 0 auto; }                       /* 只占内容高度 */
+.card.grow { flex: 1 1 0; }                          /* 吃剩余高度（图表/表格/图：不够时自己滚） */
+/* 填满剩余高度，但**不许压到比内容还小**（flex-shrink:0 + basis:auto）：
+   控制类卡片用它 —— 大屏上把栏底补平，小屏上最多让整栏滚，不会把按钮挤没。 */
+.card.fill { flex: 1 0 auto; }
+/* 图表 / 表格在一栏里分高度：1 : 1.35（写在 HTML 里会看不见，收成类） */
+.card.grow-more { flex: 1.35 1 0; }
+/* 卡片内容区里再排一层纵列（两张剖面图那种） */
+.body.stack { display: flex; flex-direction: column; gap: 10px; }
+.head {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+  margin-bottom: 10px; min-width: 0;
 }
-.card h2 .sub { font-weight: 400; color: var(--muted); font-size: 12px; }
-
-/* ---------- 位置读数 ---------- */
-.readout { display: flex; align-items: baseline; gap: 6px; margin-bottom: 12px; }
-.readout span {
-  font-size: 34px; font-weight: 600; font-variant-numeric: tabular-nums;
-  letter-spacing: -0.5px;
+.head h2 {
+  margin: 0; font-size: 14px; font-weight: 600;
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; min-width: 0;
 }
-.readout small { color: var(--muted); }
+.head .sub { font-weight: 400; color: var(--muted); font-size: 12px; }
+.head .right { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+/* 卡片内容区：超出只在这里滚 */
+.body { flex: 1 1 auto; min-height: 0; min-width: 0; overflow: auto; scrollbar-gutter: stable; }
+.body.flush { overflow: hidden; scrollbar-gutter: auto; }   /* 图 / 曲线：自己缩放，不出滚动条（它的滚动条槽位也别白占 13px 宽） */
+/* 控件分组：把"标签 + 它的输入/按钮"捆成一个盒子 —— 不捆的话，
+   .spread 的 space-between 会把标签和它的输入框拆到两处去。 */
+.field { margin-bottom: 10px; }
+.field:last-child { margin-bottom: 0; }
+.field > label:first-child { margin-top: 0; }
+/* 卡片长高时控件摊开：多出来的高度**分到各组之间**，看起来是"留白"，
+   不是"底下空一块"。配合 .card.fill 用。 */
+.body.spread { display: flex; flex-direction: column; justify-content: space-between; }
+/* 长高的 .fill 卡片（控制面板）：内容排在顶部，末尾那句提示钉在卡片底部 ——
+   不留一块没有归属的空白。（margin-top:auto 只在 flex 容器里吃掉自由空间，
+   所以 body 得先是 flex 列；.spread 的卡片不要这条，那会把 space-between 吃光。） */
+.card.fill > .body { display: flex; flex-direction: column; }
+.card.fill > .body:not(.spread) > .hint:last-child { margin-top: auto; padding-top: 10px; }
 
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
-.kv dt { color: var(--muted); }
-.kv dd { margin: 0; font-variant-numeric: tabular-nums; }
-
-.hint { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
-.hint b { color: var(--text); }
+/* 卡片头部下面的一条工具行（曲线的时间与范围、相机的曝光） */
+.tools {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap; margin-bottom: 8px;
+}
+.tools label.mini { margin: 0; white-space: nowrap; }
+.tools input.mini { width: 86px; }
+.tsep { width: 1px; height: 20px; background: var(--line); }
 
 /* ---------- 控件 ---------- */
-label {
-  display: block; margin: 12px 0 4px;
-  color: var(--muted); font-size: 12px;
-}
-label:first-of-type { margin-top: 0; }
-
+label { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 12px; }
+.body > label:first-child { margin-top: 0; }
 input {
-  display: block; width: 100%; margin-top: 4px;
-  padding: 7px 10px; font: inherit; color: var(--text);
+  display: block; width: 100%; padding: 6px 9px; font: inherit; color: var(--text);
   background: #fff; border: 1px solid var(--line); border-radius: 6px;
 }
 input:focus { outline: 2px solid #bfdbfe; border-color: #93c5fd; }
 input:disabled { background: #f8fafc; color: var(--muted); }
-
 button {
-  padding: 7px 14px; font: inherit; color: var(--text); cursor: pointer;
+  padding: 6px 12px; font: inherit; color: var(--text); cursor: pointer;
+  white-space: nowrap;                       /* 按钮文字不折行：「移动到」不许断成两行 */
   background: #fff; border: 1px solid var(--line); border-radius: 6px;
 }
 button:hover:not(:disabled) { background: #f8fafc; }
-button:disabled { opacity: 0.45; cursor: not-allowed; }
+button:disabled { opacity: .45; cursor: not-allowed; }
 button.primary { background: var(--run); border-color: var(--run); color: #fff; }
 button.primary:hover:not(:disabled) { background: #1d4ed8; }
 button.warn { background: var(--warn); border-color: var(--warn); color: #fff; }
 button.warn:hover:not(:disabled) { background: #b45309; }
 button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
 button.danger:hover:not(:disabled) { background: #b91c1c; }
-button.ghost { padding: 3px 10px; font-size: 12px; color: var(--muted); }
+button.ghost { padding: 2px 9px; font-size: 12px; color: var(--muted); }
 
-.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
-.row.tight { gap: 6px; }
-.row.tight button { flex: 1 1 auto; padding: 7px 8px; }
+.row { display: flex; gap: 6px; align-items: center; }
+.row > * { min-width: 0; }
+.row > input { flex: 1 1 auto; }        /* 输入框吃掉剩余宽度，按钮不折行 */
+.row.tight button { flex: 1 1 auto; padding: 6px 4px; }
+.row.top { margin-top: 12px; }
+.row .grow1 { flex: 1 1 auto; }         /* 独占一行的主按钮 */
 
-.form {
-  display: grid; gap: 10px 12px; align-items: end;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+.form2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; margin-top: 4px; }
+.form2 label { margin-top: 0; }
+
+.hint { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+.hint b { color: var(--text); }
+.sep { height: 1px; margin: 12px 0; background: var(--line); }
+
+/* ---------- 读数 / 统计 ---------- */
+.readout { display: flex; align-items: baseline; gap: 6px; }
+.readout span {
+  font-size: 34px; font-weight: 600; font-variant-numeric: tabular-nums;
+  letter-spacing: -0.5px;
 }
-.form label { margin: 0; }
-.form button { height: 35px; }
+.readout small { color: var(--muted); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 10px 0 0; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.stats {
+  flex: 0 0 auto; display: grid; gap: 8px 16px; margin: 12px 0 0;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+}
+.stats > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.stats dt { color: var(--muted); font-size: 12px; }
+.stats dd { margin: 0; font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+/* 窄栏（预览卡）用这个：按 90px 起排，两列刚好放得下 */
+.stats-tight { grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px 12px; }
+.stats-tight dd { font-size: 15px; }
 
 /* ---------- 进度 ---------- */
-.progress { margin-top: 16px; }
-/* 进度条不能也叫 .bar：那个类名是顶栏的（padding 12px），两个规则会互相改 ——
-   顶栏被压成 25px 的灰药丸、内容被 overflow:hidden 裁掉，进度条则被撑成 25px 高。 */
+/* 进度条不能也叫 .bar：那个类名是顶栏的，两个规则会互相改。 */
 .pbar { height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
 .pbar > div { height: 100%; width: 0; background: var(--run); transition: width 0.2s; }
 .ptext {
@@ -161,61 +269,61 @@ button.ghost { padding: 3px 10px; font-size: 12px; color: var(--muted); }
 }
 .ptext span:first-child { color: var(--text); font-variant-numeric: tabular-nums; }
 
-/* ---------- 表格 ---------- */
-.tablewrap { max-height: 420px; overflow: auto; margin-top: 12px; }
+/* ---------- 表格（表头吸顶，滚动在 .body 里） ---------- */
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--line); }
+th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th {
   position: sticky; top: 0; background: var(--card); z-index: 1;
   font-weight: 600; color: var(--muted); font-size: 12px;
 }
+tbody tr:hover { background: #f8fafc; }
 td.bad { color: var(--bad); }
 
 .thumb {
   height: 34px; width: 34px; object-fit: cover; display: block;
   border: 1px solid var(--line); border-radius: 4px; cursor: zoom-in;
 }
-/* 缩略图一律**缩小**显示（几百 px 的图放进 34 px 或 92 px 的框），所以用平滑缩放。
+/* 缩略图一律**缩小**显示（几百 px 的图放进 34 px 或 78 px 的框），所以用平滑缩放。
    pixelated = 最近邻抽样，只适合"放大看像素"。实测同一真帧缩到格子大小、对理想面积平均的
    RMSE：最近邻 3.61（260 档）/ 5.99（520 档）/ 7.79（1440 档），平滑都是 1.4~1.5 ——
    **源图越大、最近邻抽得越糟**。这里绝不能开 pixelated。
-   另注：图库那边 .gallery img（0,1,1）会盖掉 .thumb 的 width/height/object-fit/border，
+   另注：.gallery img（0,1,1）会盖掉 .thumb 的 width/height/object-fit/border，
    要改图库样式请改 .gallery img，不要改这里。 */
 
-/* ---------- 曲线 ---------- */
-.chart { margin-top: 4px; min-height: 240px; }
-/* 还没建图（没有数据）时不要留一块 240px 的空白 */
-.chart:empty { min-height: 0; }
+/* ---------- 曲线 / 图像区域 ---------- */
+/* 图 = 吃满卡片剩余高度。空的时候（还没建图）不许留一块空白：
+   :empty 收回高度，uPlot 一挂上来就不再是 :empty，ResizeObserver 随即按真实高度重排。 */
+.chart { flex: 1 1 0; min-height: 0; position: relative; }
+.chart:empty { flex: 0 0 auto; height: 0; min-height: 0; }
+.chartbox { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+.chartbox > .cap { flex: 0 0 auto; font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+/* 大图弹窗里那两张剖面：固定高度，不跟着弹窗长 */
+.chart.prof { flex: 0 0 auto; height: 150px; }
 .u-legend { font-size: 12px; }
 
-#trace-flag { color: var(--warn); }
-
 /* ---------- 相机预览 ---------- */
+/* 画面区是**暗底信箱**：图片按比例缩到框里，框本身吃满卡片剩余高度。
+   .ccdstack 与图片严格同尺寸 —— 十字线与切线用百分比定位，缩放、letterbox、
+   转成竖画面都不会偏，前端不需要量像素。 */
 .ccdview {
-  position: relative; margin: 10px 0 0; min-height: 160px;
+  position: relative; flex: 1 1 0; min-height: 120px; margin-top: 8px;
   display: flex; align-items: center; justify-content: center;
-  background: #0b0f19; border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  background: var(--dark); border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
 }
-/* 预览是**缩小**显示的（1440 px 挤进约 600 px 宽的卡片），所以用平滑缩放：
-   pixelated 只适合放大看像素，用在缩小上会把邻域采样成噪点、细节全丢。 */
-/* 现在它独占一页，给个上限：4:3 的图撑满整栏会高到看不见下面的统计条 */
-/* 图片与质心十字线叠在一个**和图片同尺寸**的盒子里：十字线的 left/top 用百分比，
-   所以缩放、letterbox、窗口改大小都不会偏，前端不需要量像素。 */
-.ccdstack { position: relative; width: 100%; max-width: 900px; margin: 0 auto; }
-/* 转成竖的（90°/270°）时画面是 1080×1440：按 900px 宽会撑到 1200px 高，把统计条顶到屏幕外。
-   竖图按高度收：宽 = 高 × 1080/1440 = 高 × 0.75，取 62vh 高 ⇒ 46.5vh 宽。
-   收的是**容器宽**，图片仍然填满容器，所以十字线的百分比定位不受影响。 */
-.ccdstack.tall { max-width: min(900px, 46.5vh); }
-#ccd-img { display: block; width: 100%; height: auto; image-rendering: auto; }
+/* 画面按**高度**收：图跟框一样高，宽度按自己的长宽比算（img 是替换元素，width:auto
+   就是内在比例）—— 所以 90°/270° 转成竖画面也自动成立，不需要原来 .tall 那套宽度硬编码
+   （app.js 还在加那个类，留着当钩子，不再需要规则）。
+   .ccdstack 收缩包裹图片 = **图片的真实显示区域**：十字线与切线用的是百分比，必须对这块，
+   不是对整块暗底 —— 一旦按宽度收出上下信箱边，十字线就会偏。 */
+.ccdstack { position: relative; display: flex; height: 100%; min-height: 0; max-width: 100%; }
+#ccd-img {
+  display: block; height: 100%; width: auto; max-width: 100%; object-fit: contain;
+  image-rendering: auto;   /* 缩小显示：平滑缩放（理由见 .thumb 上面那段） */
+}
 #ccd-img[hidden] { display: none; }
 /* 质心十字线：坐标由后端算好（原生 16 位帧上的强度加权重心），这里只画 —— 显示，不是计算 */
-#ccd-cross {
-  position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px;
-  pointer-events: none;
-}
-#ccd-cross::before, #ccd-cross::after {
-  content: ""; position: absolute; background: #f43f5e; box-shadow: 0 0 2px rgba(0, 0, 0, .7);
-}
+#ccd-cross { position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px; pointer-events: none; }
+#ccd-cross::before, #ccd-cross::after { content: ""; position: absolute; background: #f43f5e; box-shadow: 0 0 2px rgba(0, 0, 0, .7); }
 #ccd-cross::before { left: 12px; top: 0; width: 2px; height: 26px; }
 #ccd-cross::after { top: 12px; left: 0; height: 2px; width: 26px; }
 #ccd-cross[hidden] { display: none; }
@@ -225,28 +333,23 @@ td.bad { color: var(--bad); }
 .cut[hidden] { display: none; }
 .cutv { position: absolute; top: 0; bottom: 0; width: 1px; background: #22d3ee; box-shadow: 0 0 2px rgba(0, 0, 0, .85); }
 .cuth { position: absolute; left: 0; right: 0; height: 1px; background: #22d3ee; box-shadow: 0 0 2px rgba(0, 0, 0, .85); }
-/* 轮廓图：两张矮一点的图，排在卡片里 */
-.chart.prof { min-height: 150px; }
-/* 图片没来时提示文字居中占位（"有图就藏提示"由 JS 管：切帧、停止、失败三条路都要管，
-   写在 CSS 里只能覆盖其中一条） */
+/* 图片没来时提示文字居中占位（"有图就藏提示"由 JS 管：切帧、停止、失败三条路都要管） */
 .ccdview .hint { margin: 0; padding: 16px; text-align: center; }
 #ccd-sat.on { color: var(--warn); }
 
 /* ---------- 已保存图像的列表 ---------- */
-/* 图库要多行排布、把横向空间用满：格子小一点、列多一点 */
-/* 一排能塞多少塞多少；格子只放"缩略图 + 两行字"，完整信息点开看弹窗。
-   早先把文件名/大小/备注全塞进格子，结果每行都被省略号截断 —— 信息等于没有。 */
+/* 图库多行密排：格子只放"缩略图 + 两行字"，完整信息点开看弹窗。 */
 .gallery {
-  display: grid; gap: 10px; margin-top: 12px;
-  grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
 }
-.gallery figure { margin: 0; position: relative; }
+.gallery figure { margin: 0; position: relative; min-width: 0; }
 .gallery img {
-  width: 100%; height: 92px; object-fit: contain; cursor: zoom-in;
-  background: #0b0f19; border: 1px solid var(--line); border-radius: 6px;
+  width: 100%; height: 78px; object-fit: contain; cursor: zoom-in;
+  background: var(--dark); border: 1px solid var(--line); border-radius: 6px;
 }
 .gallery figure:hover img { border-color: var(--run); }
-/* 名称一行（可编辑）+ 曝光一行，都不截断 */
+/* 名称一行（可编辑）+ 曝光/质心两行，都不截断布局 */
 .gallery .gname {
   display: block; margin-top: 4px; padding: 1px 4px; border-radius: 4px;
   color: var(--text); font-size: 12px; line-height: 1.4; cursor: text;
@@ -263,22 +366,7 @@ td.bad { color: var(--bad); }
 }
 .gallery figure:hover .gdel { opacity: 1; }
 
-/* ---------- 统计条（位置曲线） ---------- */
-.stats {
-  display: grid; gap: 8px 16px; margin: 14px 0 0;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-}
-.stats > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-/* 窄栏（预览卡只有 460px 宽）用这个：5 项按 90px 起排，两列刚好放得下 */
-.stats-tight { grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px 12px; }
-.stats-tight dd { font-size: 15px; }
-.stats dt { color: var(--muted); font-size: 12px; }
-.stats dd {
-  margin: 0; font-size: 16px; font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-
-/* ---------- 提示 ---------- */
+/* ---------- 提示条 ---------- */
 #toast {
   position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
   max-width: 70vw; padding: 10px 18px; border-radius: 8px;
@@ -298,7 +386,6 @@ td.bad { color: var(--bad); }
 }
 #lightbox[hidden] { display: none; }
 .lb-imgwrap { position: relative; min-width: 0; cursor: crosshair; }
-/* 大图多是**缩小**显示（1440 px 挤进 56vw），所以平滑缩放；pixelated 只适合放大看像素 */
 #lightbox img {
   display: block; max-width: 56vw; max-height: 84vh; background: #fff;
   border-radius: 8px; image-rendering: auto;
@@ -311,3 +398,45 @@ td.bad { color: var(--bad); }
 #lightbox-cap { margin: 0; cursor: auto; color: var(--text); font-size: 13px; line-height: 1.5; }
 #lightbox-cap[hidden] { display: none; }
 #lightbox-cap a { color: #2563eb; }
+
+/* ==================== 窄屏回落：仍然一屏，各区域自己滚 ==================== */
+@media (max-width: 1240px) {
+  /* 窄一点：两栏的默认宽度收一档，分栏线照旧可用 */
+  .view-ccd { grid-template-columns: minmax(0, 1fr) 0 var(--col-prof, 290px) 0 var(--col-gal, 320px); }
+}
+@media (max-width: 1080px) {
+  /* 并排不下了：分栏线关掉（布局固定），改用下面这套两列的模板 */
+  .gutter { display: none; }
+  /* 图库挪到预览下面；剖面那一栏跨两行。结构不变，只是不再并排 */
+  .view-ccd {
+    grid-template-columns: minmax(0, 1fr) 280px;
+    grid-template-rows: minmax(0, 1fr) minmax(0, .7fr);
+    column-gap: var(--gap); row-gap: var(--gap);
+  }
+  .view-ccd .col-live { grid-column: 1; grid-row: 1; }
+  .view-ccd .col-prof { grid-column: 2; grid-row: 1 / 3; }
+  .view-ccd .col-gallery { grid-column: 1; grid-row: 2; }
+  .view-align { grid-template-columns: 330px minmax(0, 1fr); column-gap: var(--gap); }
+  .view-scan {
+    grid-template-columns: 310px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) 0 var(--hist, 240px);
+    column-gap: var(--gap); row-gap: 6px;   /* 6px + 那根 0 高轨道 + 6px = 与桌面版同样的 12px */
+  }
+}
+
+/* ==================== 矮屏（笔记本 800px 上下）====================
+   高度不够时先收节奏，而不是让「对准」左栏这种定内容的栏去滚：
+   栏一滚，底部按钮就被切掉一半，比整体小一号难看。
+
+   **这一段必须排在所有宽度查询后面**：1000×800 这种"又窄又矮"的窗口两条都命中，
+   两条又都是 .view-scan、同优先级 —— 后写的赢。排在前面的话，矮屏想省的那 70px
+   会被宽度查询里的 240px 盖掉（实测：历史带按 240 而不是 170，左下卡片被切掉 50px）。 */
+@media (max-height: 840px) {
+  :root { --gap: 10px; --pad: 12px; }
+  .readout span { font-size: 30px; }
+  .stats dd { font-size: 14px; }
+  th, td { padding: 4px 8px; }
+  .hint { margin-top: 6px; }
+  .sep { margin: 8px 0; }
+  .view-scan { grid-template-rows: minmax(0, 1fr) 0 var(--hist, 170px); }
+}
