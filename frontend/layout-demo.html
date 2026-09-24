@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>布局 demo — 位移台控制台</title>
+<!--
+  布局 demo（静态、假数据、不连后端）。要讨论的只有一件事：**版式**。
+  三条硬规矩，CSS 里逐条落地：
+
+  1) 页面永远一屏：html,body{height:100%} + body{overflow:hidden}。
+     顶栏 flex:0 0 auto，main flex:1 1 auto + min-height:0 —— 漏掉 min-height，
+     flex 子项不肯收缩，整页立刻被内容撑出滚动条。
+  2) 每页 = 2~3 个「栏」，栏是 flex 纵列；卡片自上而下堆。
+     卡片两种：.fit 只占内容高度，.grow 吃掉剩余高度（曲线、表、图、图库）。
+  3) 滚动只发生在**区域内部**：
+     - .body（卡片内容区）overflow:auto —— 表格、图库、长表单在这里滚；
+     - .col（整栏）overflow-y:auto —— 窄屏兜底，卡片挤不下时整栏滚，仍然不动页面。
+     每一层都要写 min-height:0，否则 overflow 不生效（flex/grid 子项的默认 min-height:auto）。
+
+  颜色与控件样式照抄 frontend/style.css 的 token，方便直接搬。
+  id 尽量沿用 index.html 的叫法（pos / scan-start / ccd-img …），将来换皮不用改 app.js 的选择器。
+-->
+<style>
+:root{
+  --bg:#f1f5f9; --card:#fff; --line:#e2e8f0; --text:#0f172a; --muted:#64748b;
+  --ok:#16a34a; --warn:#d97706; --bad:#dc2626; --run:#2563eb; --dark:#0b0f19;
+  --gap:12px; --pad:14px; --radius:10px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; display:flex; flex-direction:column; height:100%; overflow:hidden;
+  font:14px/1.5 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;
+  background:var(--bg); color:var(--text);
+}
+
+/* ==================== 顶栏（固定高，永不滚动） ==================== */
+.bar{
+  flex:0 0 auto; display:flex; align-items:center; gap:14px; flex-wrap:nowrap;
+  padding:9px 16px; background:var(--card); border-bottom:1px solid var(--line);
+}
+.bar h1{margin:0; font-size:15px; font-weight:600; white-space:nowrap}
+.bar h1 .ver{font-weight:400; font-size:12px; color:var(--muted); margin-left:6px}
+.tabs{display:flex; gap:4px; padding:3px; background:#e2e8f0; border-radius:9px; margin-left:auto}
+.tab{padding:5px 20px; font:inherit; font-size:13px; color:var(--muted);
+     background:transparent; border:0; border-radius:7px; cursor:pointer}
+.tab:hover:not(.active){background:#fff; color:var(--text)}
+.tab.active{background:var(--card); color:var(--text); font-weight:600; box-shadow:0 1px 2px rgba(15,23,42,.12)}
+.pills{display:flex; align-items:center; gap:8px; flex-wrap:nowrap}
+.pill{padding:3px 10px; border-radius:999px; font-size:12px; background:#e2e8f0; color:var(--muted); white-space:nowrap}
+.pill.ok{background:#dcfce7; color:var(--ok)}
+.pill.warn{background:#fef3c7; color:var(--warn)}
+.pill.bad{background:#fee2e2; color:var(--bad)}
+.pill.run{background:#dbeafe; color:var(--run)}
+
+/* ==================== 页面骨架：唯一伸展区 ==================== */
+main{flex:1 1 auto; min-height:0; padding:var(--gap)}
+.view{height:100%; min-height:0; display:grid; gap:var(--gap)}
+.view[hidden]{display:none}
+
+/* 三页的栏宽。左栏＝操作（定宽，表单才不会左右晃）；中栏＝结果（吃掉剩余）；
+   右栏＝历史 / 图库（定宽）。定宽都用 px 而不是 fr：表格列宽稳定，窗口拉伸时不会抖。 */
+.view-align{grid-template-columns:360px minmax(0,1fr)}
+.view-scan{grid-template-columns:320px minmax(0,1fr) 340px}
+.view-ccd{grid-template-columns:minmax(0,1.35fr) 320px minmax(0,.85fr)}
+
+/* 栏：卡片纵列；整栏兜底滚动（窄屏/矮屏时用） */
+.col{display:flex; flex-direction:column; gap:var(--gap);
+     min-height:0; min-width:0; overflow-y:auto; overflow-x:hidden}
+/* 栏标题：一句话说清这一栏是干什么的 —— 分类靠它，不靠用户猜 */
+.coltitle{flex:0 0 auto; margin:0; font-size:11px; color:var(--muted);
+          display:flex; align-items:center; gap:8px}
+.coltitle::after{content:""; flex:1; height:1px; background:var(--line)}
+
+/* ==================== 卡片 ==================== */
+.card{display:flex; flex-direction:column; min-height:0; min-width:0;
+      padding:var(--pad); background:var(--card);
+      border:1px solid var(--line); border-radius:var(--radius)}
+.card.fit{flex:0 0 auto}      /* 按内容高度 */
+.card.grow{flex:1 1 0}        /* 吃剩余高度（曲线/表/图/图库） */
+.head{flex:0 0 auto; display:flex; align-items:center; gap:10px; margin-bottom:10px; min-width:0}
+.head h2{margin:0; font-size:14px; font-weight:600; display:flex; align-items:baseline; gap:8px; min-width:0}
+.head .sub{font-weight:400; font-size:12px; color:var(--muted)}
+.head .right{margin-left:auto; display:flex; align-items:center; gap:6px; flex:0 0 auto}
+/* 卡片内容区：超出只在这里滚 */
+.body{flex:1 1 auto; min-height:0; min-width:0; overflow:auto; scrollbar-gutter:stable}
+.body.flush{overflow:hidden}   /* 图/曲线：自己缩放，不出滚动条 */
+.body.pad0{padding-right:2px}
+
+/* ==================== 控件（照抄 style.css） ==================== */
+label{display:block; margin:0 0 4px; font-size:12px; color:var(--muted)}
+input{display:block; width:100%; padding:6px 9px; font:inherit; color:var(--text);
+      background:#fff; border:1px solid var(--line); border-radius:6px}
+input:focus{outline:2px solid #bfdbfe; border-color:#93c5fd}
+input:disabled{background:#f8fafc; color:var(--muted)}
+button{padding:6px 12px; font:inherit; color:var(--text); cursor:pointer; white-space:nowrap;
+       background:#fff; border:1px solid var(--line); border-radius:6px}
+button:hover:not(:disabled){background:#f8fafc}
+button:disabled{opacity:.45; cursor:not-allowed}
+button.primary{background:var(--run); border-color:var(--run); color:#fff}
+button.primary:hover:not(:disabled){background:#1d4ed8}
+button.warn{background:var(--warn); border-color:var(--warn); color:#fff}
+button.danger{background:var(--bad); border-color:var(--bad); color:#fff}
+button.ghost{padding:2px 9px; font-size:12px; color:var(--muted)}
+.row{display:flex; gap:6px; align-items:center}
+.row>*{min-width:0}
+.row>input{flex:1 1 auto}          /* 输入框吃掉剩余，按钮不折行 */
+.row.tight button{flex:1 1 auto; padding:6px 4px}
+.field{margin-bottom:10px}
+.field:last-child{margin-bottom:0}
+.form2{display:grid; grid-template-columns:1fr 1fr; gap:10px 12px; align-items:end}
+.hint{margin:6px 0 0; font-size:12px; color:var(--muted)}
+.hint b{color:var(--text)}
+.sep{height:1px; margin:12px 0; background:var(--line)}
+
+/* ==================== 读数 / 统计 ==================== */
+.readout{display:flex; align-items:baseline; gap:6px}
+.readout span{font-size:34px; font-weight:600; letter-spacing:-.5px; font-variant-numeric:tabular-nums}
+.readout small{color:var(--muted)}
+.kv{display:grid; grid-template-columns:auto 1fr; gap:4px 12px; margin:10px 0 0}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0; font-variant-numeric:tabular-nums}
+.stats{flex:0 0 auto; display:grid; gap:6px 14px; margin:12px 0 0;
+       grid-template-columns:repeat(auto-fit, minmax(92px,1fr))}
+.stats>div{display:flex; flex-direction:column; gap:2px; min-width:0}
+.stats dt{font-size:11px; color:var(--muted)}
+.stats dd{margin:0; font-size:15px; font-weight:600; font-variant-numeric:tabular-nums}
+.stats dd.ok{color:var(--ok)} .stats dd.warn{color:var(--warn)}
+
+/* ==================== 表格（表头吸顶，滚动在 .body 里） ==================== */
+table{width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums}
+th,td{padding:5px 8px; text-align:left; border-bottom:1px solid var(--line); white-space:nowrap}
+th{position:sticky; top:0; z-index:1; background:var(--card); font-size:12px; font-weight:600; color:var(--muted)}
+tbody tr:hover{background:#f8fafc}
+td.num{text-align:right}
+.thumb{display:block; width:30px; height:22px; border:1px solid var(--line); border-radius:4px;
+       background:radial-gradient(circle at 45% 50%, #fff 0 8%, #94a3b8 16%, #111827 46%)}
+
+/* ==================== 进度 ==================== */
+.pbar{height:8px; background:#e2e8f0; border-radius:999px; overflow:hidden; margin-top:2px}
+.pbar>div{height:100%; width:62%; background:var(--run); border-radius:999px}
+.ptext{display:flex; justify-content:space-between; gap:12px; margin-top:6px; font-size:12px; color:var(--muted)}
+.ptext b{color:var(--text); font-variant-numeric:tabular-nums}
+
+/* ==================== 曲线 / 图像区域 ==================== */
+/* 图 = 「一行说明 + 一张铺满剩余高度的图」。说明是正常流里的元素，不叠在曲线上 */
+.chartbox{flex:1 1 0; min-height:0; display:flex; flex-direction:column}
+.chartbox>.cap{flex:0 0 auto; font-size:11px; color:var(--muted); margin-bottom:2px}
+.chart{position:relative; flex:1 1 0; min-height:0}
+.chart svg{display:block; width:100%; height:100%}
+.stage{flex:1 1 0; min-height:0; position:relative; overflow:hidden;
+       background:var(--dark); border:1px solid var(--line); border-radius:8px}
+.stage svg{display:block; width:100%; height:100%}
+
+/* ==================== 历史（紧凑行，不摊成 8 列表格） ==================== */
+.hist{display:flex; flex-direction:column; gap:8px}
+.hist .item{display:grid; grid-template-columns:minmax(0,1fr) auto; gap:2px 8px;
+            padding:8px 10px; border:1px solid var(--line); border-radius:8px; cursor:pointer}
+.hist .item:hover{border-color:var(--run); background:#f8fafc}
+.hist .item.on{border-color:var(--run); background:#eff6ff}
+.hist .name{font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.hist .meta{font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.hist .side{grid-row:1/3; grid-column:2/3; display:flex; flex-direction:column;
+            align-items:flex-end; justify-content:space-between; gap:4px}
+.state{padding:1px 7px; border-radius:999px; font-size:11px; background:#e2e8f0; color:var(--muted)}
+.state.done{background:#dcfce7; color:var(--ok)}
+.state.aborted{background:#fef3c7; color:var(--warn)}
+.state.failed{background:#fee2e2; color:var(--bad)}
+.state.running{background:#dbeafe; color:var(--run)}
+
+/* ==================== 图库 ==================== */
+.gallery{display:grid; gap:10px; grid-template-columns:repeat(auto-fill, minmax(104px,1fr))}
+.gallery figure{margin:0; min-width:0; display:flex; flex-direction:column; gap:3px}
+.gallery .ph{height:74px; border:1px solid var(--line); border-radius:6px; background:#0b0f19; cursor:zoom-in}
+.gallery figure:hover .ph{border-color:var(--run)}
+.gallery .gname{font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.gallery .gmeta{font-size:11px; color:var(--muted)}
+
+/* ==================== 矮屏（笔记本 800px 上下）====================
+   高度不够时先收节奏，而不是让「对准」左栏这种定内容的栏去滚：
+   栏一滚，底部按钮就被切掉一半，比整体小一号难看。 */
+@media (max-height:840px){
+  :root{--gap:10px; --pad:12px}
+  .readout span{font-size:30px}
+  .stats dd{font-size:14px}
+  th,td{padding:4px 8px}
+  .field{margin-bottom:8px}
+  .head{margin-bottom:8px}
+  .hint{margin-top:4px}
+  .sep{margin:8px 0}
+}
+
+/* ==================== 窄屏回落：仍然一屏，各区域自己滚 ==================== */
+@media (max-width:1240px){
+  .view-scan{grid-template-columns:300px minmax(0,1fr) 290px}
+  .view-ccd{grid-template-columns:minmax(0,1fr) 290px minmax(0,.8fr)}
+}
+@media (max-width:1080px){
+  /* 历史 / 图库挪到结果栏下面，中间栏跨两行 —— 结构不变，只是不再并排 */
+  .view-scan{grid-template-columns:290px minmax(0,1fr); grid-template-rows:minmax(0,1fr) minmax(0,.72fr)}
+  .view-scan .col-task{grid-column:1; grid-row:1/3}
+  .view-scan .col-result{grid-column:2; grid-row:1}
+  .view-scan .col-history{grid-column:2; grid-row:2}
+  .view-ccd{grid-template-columns:minmax(0,1fr) 280px; grid-template-rows:minmax(0,1fr) minmax(0,.7fr)}
+  .view-ccd .col-live{grid-column:1; grid-row:1}
+  .view-ccd .col-prof{grid-column:2; grid-row:1/3}
+  .view-ccd .col-gallery{grid-column:1; grid-row:2}
+}
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <h1>位移台控制台<span class="ver">布局 demo</span></h1>
+  <nav class="tabs">
+    <button class="tab active" data-view="align">对准</button>
+    <button class="tab" data-view="scan">扫描</button>
+    <button class="tab" data-view="ccd">预览</button>
+  </nav>
+  <div class="pills">
+    <span class="pill ok">界面已连接</span>
+    <span class="pill ok">设备 COM7</span>
+    <span class="pill ok">伺服已开</span>
+    <span class="pill run" id="pill-scan">扫描中</span>
+    <button class="ghost" id="btn-stress" title="塞满数据，看各处滚动条是不是只出现在自己的区域里">压测数据</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- ==================== 对准：左＝操作与状态，右＝观测稳定性 ==================== -->
+  <section class="view view-align" id="v-align">
+
+    <div class="col col-ctl">
+      <p class="coltitle">操作 · 现在在哪</p>
+
+      <section class="card fit">
+        <div class="head">
+          <h2>位置<span class="sub">E53.D1S-H · 闭环</span></h2>
+        </div>
+        <div class="body">
+          <div class="readout"><span id="pos">108.7123</span><small>µm</small></div>
+          <dl class="kv">
+            <dt>目标</dt><dd id="target">108.6992 µm</dd>
+            <dt>到位</dt><dd id="ontarget" style="color:var(--ok)">是（±0.20 µm）</dd>
+            <dt>行程</dt><dd id="limits">5.000 – 150.000 µm</dd>
+            <dt>状态</dt><dd id="errcode">正常 · 无错误码</dd>
+          </dl>
+          <p class="hint">行程是按<b>实测可用区间</b>夹取的；设备自报的 0–201.18 µm 不采信。
+            <button class="ghost" id="btn-connect">重连</button></p>
+        </div>
+      </section>
+
+      <section class="card fit">
+        <div class="head"><h2>手动控制<span class="sub">点击即生效</span></h2></div>
+        <div class="body">
+          <div class="field">
+            <label>目标位置 (µm)</label>
+            <div class="row"><input id="move-target" type="number" step="0.001" value="108.700"><button class="primary">移动到</button></div>
+          </div>
+          <div class="field">
+            <label>点动 (µm)</label>
+            <div class="row tight">
+              <button>−10</button><button>−1</button><button>−0.1</button>
+              <button>+0.1</button><button>+1</button><button>+10</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>速度 (µm/s)</label>
+            <div class="row"><input id="vel" type="number" value="—" disabled><button disabled>设定速度</button></div>
+            <p class="hint">这台设备没有速度指令，按钮按 caps 禁用。</p>
+          </div>
+          <div class="field">
+            <label>伺服</label>
+            <div class="row tight"><button class="primary">开启伺服</button><button class="danger">释放</button></div>
+          </div>
+          <div class="field">
+            <label>安全</label>
+            <div class="row tight"><button class="warn">停止</button><button class="danger">急停</button></div>
+            <p class="hint">XMT 没有停止命令：界面按实际能力写实话。</p>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="col col-obs">
+      <p class="coltitle">观测 · 稳不稳</p>
+      <section class="card grow">
+        <div class="head">
+          <h2>位置曲线<span class="sub" id="trace-title">2026-09-24 15:16:17 起 10 s</span></h2>
+          <div class="right">
+            <input type="number" value="10" style="width:64px" title="记录时长 (s)">
+            <button class="ghost">记录 10 秒</button>
+            <button class="ghost">自动范围</button>
+          </div>
+        </div>
+        <div class="chartbox">
+          <span class="cap">Y 108.66 – 108.76 µm　·　X 0 – 10 s</span>
+          <div class="chart" id="chart-trace"></div>
+        </div>
+        <dl class="stats">
+          <div><dt>采样点</dt><dd>412</dd></div>
+          <div><dt>跨度 (s)</dt><dd>10.02</dd></div>
+          <div><dt>平均间隔 (ms)</dt><dd>24.3</dd></div>
+          <div><dt>均值 (µm)</dt><dd>108.702</dd></div>
+          <div><dt>标准差 σ (nm)</dt><dd class="ok">38</dd></div>
+          <div><dt>峰峰值 (nm)</dt><dd>214</dd></div>
+          <div><dt>目标 (µm)</dt><dd>108.699</dd></div>
+        </dl>
+      </section>
+    </div>
+
+  </section>
+
+  <!-- ==================== 扫描：左＝本次任务，中＝结果，右＝历史 ==================== -->
+  <section class="view view-scan" id="v-scan" hidden>
+
+    <div class="col col-task">
+      <p class="coltitle">本次任务</p>
+
+      <section class="card fit">
+        <div class="head"><h2>扫描参数</h2></div>
+        <div class="body">
+          <div class="field"><label>名称</label><input id="scan-name" placeholder="可留空" value="联调 108.7→109.7"></div>
+          <div class="form2">
+            <div><label>起点 (µm)</label><input id="scan-start" type="number" value="108.700"></div>
+            <div><label>终点 (µm)</label><input id="scan-stop" type="number" value="109.700"></div>
+            <div><label>点数</label><input id="scan-count" type="number" value="11"></div>
+            <div><label>稳定延时 (ms)</label><input id="scan-settle" type="number" value="300"></div>
+          </div>
+          <div class="row" style="margin-top:10px"><button class="primary" style="flex:1 1 auto">开始扫描</button></div>
+          <p class="hint">单向逼近；PI 每点下发后按步距复核（超半个步距判该点无效），XMT 只等稳定延时。</p>
+        </div>
+      </section>
+
+      <section class="card fit">
+        <div class="head"><h2>进度<span class="sub">第 7 / 11 点</span></h2></div>
+        <div class="body">
+          <div class="pbar"><div></div></div>
+          <div class="ptext"><b>62%</b><span>109.300 µm · 已采 7</span></div>
+          <div class="sep"></div>
+          <div class="row tight">
+            <button>暂停</button><button>继续</button><button class="warn">中止</button>
+          </div>
+          <p class="hint">任务由后端执行器跑，关页面也继续。</p>
+        </div>
+      </section>
+
+      <section class="card fit">
+        <div class="head"><h2>每点采图<span class="sub">CCD 联动</span></h2></div>
+        <div class="body">
+          <div class="row tight"><button class="primary">采图：开</button><button>采图：关</button></div>
+          <dl class="kv">
+            <dt>曝光</dt><dd>12.00 ms（与预览共用）</dd>
+            <dt>存放</dt><dd>data/grabs/scan-43/</dd>
+          </dl>
+          <p class="hint">开跑前后端自动关预览；相机出错＝整条扫描 failed。</p>
+        </div>
+      </section>
+    </div>
+
+    <div class="col col-result">
+      <p class="coltitle">结果 · 当前扫描</p>
+
+      <section class="card grow" style="flex:1 1 0">
+        <div class="head"><h2>点位图<span class="sub">实际 vs 目标</span></h2></div>
+        <div class="chartbox">
+          <span class="cap">Y 108.6 – 109.8 µm　·　虚线＝目标，实线＝实际</span>
+          <div class="chart" id="chart-points"></div>
+        </div>
+      </section>
+
+      <section class="card grow" style="flex:1.5 1 0">
+        <div class="head">
+          <h2>点位表<span class="sub" id="points-sub">11 点</span></h2>
+          <div class="right"><button class="ghost">导出</button></div>
+        </div>
+        <div class="body">
+          <table id="points">
+            <thead><tr>
+              <th>#</th><th>目标 (µm)</th><th>实际 (µm)</th><th>间距 (µm)</th>
+              <th>偏差 (nm)</th><th>到位</th><th>耗时 (ms)</th><th>图像</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div class="col col-history">
+      <p class="coltitle">历史</p>
+      <section class="card grow">
+        <div class="head">
+          <h2>历史扫描<span class="sub" id="hist-sub">最近 6 次</span></h2>
+          <div class="right"><button class="ghost">刷新</button></div>
+        </div>
+        <div class="body"><div class="hist" id="history"></div></div>
+      </section>
+    </div>
+
+  </section>
+
+  <!-- ==================== 预览：左＝实时画面，中＝剖面，右＝图库 ==================== -->
+  <section class="view view-ccd" id="v-ccd" hidden>
+
+    <div class="col col-live">
+      <p class="coltitle">实时画面</p>
+      <section class="card grow">
+        <div class="head">
+          <h2>相机预览<span class="sub" id="ccd-sub">CS165MU · 预览中 15 fps</span></h2>
+          <div class="right">
+            <button class="primary">开始预览</button>
+            <button>保存原生帧</button>
+            <button>重开相机</button>
+            <button>旋转 90°</button>
+          </div>
+        </div>
+        <div class="row" style="flex:0 0 auto; margin-bottom:10px">
+          <label style="margin:0; white-space:nowrap">曝光 (ms)</label>
+          <input id="ccd-preview-ms" type="number" step="0.1" value="12.0" style="width:96px">
+          <span class="hint" style="margin:0">预览与采图共用；增益恒为 0</span>
+        </div>
+        <div class="stage" id="ccd-stage"></div>
+        <dl class="stats">
+          <div><dt>分辨率</dt><dd>1440×1080</dd></div>
+          <div><dt>当前曝光 (ms)</dt><dd>12.00</dd></div>
+          <div><dt>帧率 (fps)</dt><dd>15.2</dd></div>
+          <div><dt>质心 (传感器 px)</dt><dd>715.95, 540.63</dd></div>
+          <div><dt>ΣI（整幅）</dt><dd>6.30e7</dd></div>
+          <div><dt>峰值 / 饱和</dt><dd class="warn">1022（716 px）</dd></div>
+        </dl>
+      </section>
+    </div>
+
+    <div class="col col-prof">
+      <p class="coltitle">剖面 · 过点整行 / 整列</p>
+      <section class="card grow">
+        <div class="head"><h2>轮廓图<span class="sub" id="prof-where">(716, 541) 显示坐标</span></h2></div>
+        <div class="body flush" style="display:flex; flex-direction:column; gap:10px">
+          <div class="chartbox">
+            <span class="cap">整行 · 1440 px · 原生 16 位原值</span>
+            <div class="chart" id="prof-h"></div>
+          </div>
+          <div class="chartbox">
+            <span class="cap">整列 · 1080 px · 原生 16 位原值</span>
+            <div class="chart" id="prof-v"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="col col-gallery">
+      <p class="coltitle">图库 · 手动保存的原生帧</p>
+      <section class="card grow">
+        <div class="head">
+          <h2>已保存<span class="sub" id="grabs-sub">6 张</span></h2>
+          <div class="right"><button class="ghost">刷新</button></div>
+        </div>
+        <div class="body"><div class="gallery" id="gallery"></div></div>
+      </section>
+    </div>
+
+  </section>
+
+</main>
+
+<script>
+'use strict';
+/* 只做两件事：切页（视图名进 hash）+ 造假数据把各区域填满。
+   真接后端时，这一整块换成 app.js 的 SSE 渲染，DOM 结构与 class 不用动。 */
+
+var VIEWS = ['align', 'scan', 'ccd'];
+
+function show(v) {
+  if (VIEWS.indexOf(v) < 0) v = 'align';
+  var tabs = document.querySelectorAll('.tab');
+  for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle('active', tabs[i].dataset.view === v);
+  for (var j = 0; j < VIEWS.length; j++) {
+    document.getElementById('v-' + VIEWS[j]).hidden = VIEWS[j] !== v;
+  }
+  if (location.hash !== '#' + v) location.hash = v;
+}
+
+document.querySelector('.tabs').addEventListener('click', function (e) {
+  var b = e.target.closest('.tab');
+  if (b) show(b.dataset.view);
+});
+window.addEventListener('hashchange', function () { show(location.hash.slice(1)); });
+show(location.hash.slice(1));
+
+/* ---------- 画 SVG 的小工具（demo 用；真项目里换成 uPlot） ---------- */
+function svgBox(w, h) {
+  return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">';
+}
+function grid(w, h, n) {
+  var s = '', i;
+  for (i = 1; i < n; i++) {
+    s += '<line x1="' + (w * i / n) + '" y1="0" x2="' + (w * i / n) + '" y2="' + h + '" stroke="#eef2f7" stroke-width="1" vector-effect="non-scaling-stroke"/>';
+    s += '<line x1="0" y1="' + (h * i / n) + '" x2="' + w + '" y2="' + (h * i / n) + '" stroke="#eef2f7" stroke-width="1" vector-effect="non-scaling-stroke"/>';
+  }
+  return s;
+}
+function poly(pts, color, dash, width) {
+  var d = '', i;
+  for (i = 0; i < pts.length; i++) d += (i ? 'L' : 'M') + pts[i][0].toFixed(1) + ' ' + pts[i][1].toFixed(1);
+  return '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="' + (width || 1.6) + '"' +
+         (dash ? ' stroke-dasharray="' + dash + '"' : '') + ' vector-effect="non-scaling-stroke"/>';
+}
+
+/* ---------- 对准页：位置曲线（随机游走，看起来像真的一段遥测） ---------- */
+function drawTrace() {
+  var W = 1000, H = 300, n = 420, i, v = 108.7123, pts = [], lo = 108.66, hi = 108.76;
+  for (i = 0; i < n; i++) {
+    v += (Math.random() - 0.5) * 0.0016 + (108.702 - v) * 0.15;
+    pts.push([W * i / (n - 1), H - (v - lo) / (hi - lo) * H]);
+  }
+  var ty = H - (108.6992 - lo) / (hi - lo) * H;
+  document.getElementById('chart-trace').innerHTML =
+    svgBox(W, H) + grid(W, H, 10) +
+    '<line x1="0" y1="' + ty + '" x2="' + W + '" y2="' + ty + '" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 4" vector-effect="non-scaling-stroke"/>' +
+    poly(pts, '#2563eb') + '</svg>';
+}
+
+/* ---------- 扫描页：点位图（目标虚线 + 实际折线） ---------- */
+function drawPointsChart(n) {
+  var W = 1000, H = 260, i, lo = 108.6, hi = 109.8;
+  var tgt = [], act = [];
+  for (i = 0; i < n; i++) {
+    var x = W * (n === 1 ? 0 : i / (n - 1));
+    var t = 108.7 + (1.0 * i / Math.max(1, n - 1));
+    tgt.push([x, H - (t - lo) / (hi - lo) * H]);
+    act.push([x, H - (t + 0.012 * Math.sin(i) + (Math.random() - 0.5) * 0.03 - lo) / (hi - lo) * H]);
+  }
+  document.getElementById('chart-points').innerHTML =
+    svgBox(W, H) + grid(W, H, 8) + poly(tgt, '#94a3b8', '5 4', 1.4) + poly(act, '#2563eb', '', 1.8) + '</svg>';
+}
+
+/* ---------- 扫描页：点位表 ---------- */
+function drawPointsTable(n) {
+  var tb = document.querySelector('#points tbody'), html = '', i;
+  for (i = 0; i < n; i++) {
+    var t = 108.7 + 1.0 * i / Math.max(1, n - 1);
+    var dev = Math.round((Math.random() - 0.5) * 90);
+    var ok = Math.abs(dev) < 120;
+    html += '<tr>' +
+      '<td class="num">' + (i + 1) + '</td>' +
+      '<td class="num">' + t.toFixed(4) + '</td>' +
+      '<td class="num">' + (t + dev / 1000).toFixed(4) + '</td>' +
+      '<td class="num">' + (i ? (1.0 + (Math.random() - 0.5) * 0.001).toFixed(4) : '—') + '</td>' +
+      '<td class="num" style="color:' + (ok ? 'inherit' : 'var(--bad)') + '">' + dev + '</td>' +
+      '<td><span class="state ' + (ok ? 'done' : 'aborted') + '">' + (ok ? '到位' : '超差') + '</span></td>' +
+      '<td class="num">' + Math.round(305 + Math.random() * 40) + '</td>' +
+      '<td><span class="thumb"></span></td>' +
+    '</tr>';
+  }
+  tb.innerHTML = html;
+  document.getElementById('points-sub').textContent = n + ' 点';
+}
+
+/* ---------- 扫描页：历史（紧凑行） ---------- */
+var HIST = [
+  ['联调 108.7→109.7', '108.700 – 109.700 µm · 11 点', 'done', '已完成', '今天 15:16'],
+  ['逼近首点', '108.600 – 108.800 µm · 3 点', 'done', '已完成', '今天 14:02'],
+  ['冒烟 0→2', '0.000 – 2.000 µm · 5 点', 'done', '已完成', '昨天 18:41'],
+  ['急停', '5.000 – 150.000 µm · 60 点', 'aborted', '已中止 3/60', '昨天 18:33'],
+  ['停止', '5.000 – 150.000 µm · 60 点', 'aborted', '已中止 3/60', '昨天 18:31'],
+  ['相机中断', '20.000 – 21.000 µm · 3 点', 'failed', '相机出错', '昨天 17:55']
+];
+function drawHistory(rows) {
+  var host = document.getElementById('history'), html = '', i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    html += '<div class="item' + (i === 0 ? ' on' : '') + '">' +
+      '<div class="name">' + r[0] + '</div>' +
+      '<div class="meta">' + r[1] + '</div>' +
+      '<div class="side"><span class="state ' + r[2] + '">' + r[3] + '</span>' +
+      '<span class="meta">' + r[4] + '</span></div>' +
+    '</div>';
+  }
+  host.innerHTML = html;
+  document.getElementById('hist-sub').textContent = '最近 ' + rows.length + ' 次';
+}
+
+/* ---------- 预览页：假的一帧（SVG：黑底 + 亮斑 + 质心十字 + 切线） ---------- */
+function drawFrame() {
+  var W = 1440, H = 1080, cx = 716, cy = 541, i, spot = '';
+  for (i = 9; i >= 1; i--) {
+    spot += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (i * 26) + '" fill="#ffffff" opacity="' + (0.05 + 0.02 * (9 - i)) + '"/>';
+  }
+  document.getElementById('ccd-stage').innerHTML =
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">' +
+    '<rect width="' + W + '" height="' + H + '" fill="#05070d"/>' +
+    spot +
+    '<circle cx="' + cx + '" cy="' + cy + '" r="12" fill="#f8fafc"/>' +
+    '<line x1="' + cx + '" y1="0" x2="' + cx + '" y2="' + H + '" stroke="#22d3ee" stroke-width="2"/>' +
+    '<line x1="0" y1="' + cy + '" x2="' + W + '" y2="' + cy + '" stroke="#22d3ee" stroke-width="2"/>' +
+    '<line x1="' + (cx - 13) + '" y1="' + cy + '" x2="' + (cx + 13) + '" y2="' + cy + '" stroke="#f43f5e" stroke-width="3"/>' +
+    '<line x1="' + cx + '" y1="' + (cy - 13) + '" x2="' + cx + '" y2="' + (cy + 13) + '" stroke="#f43f5e" stroke-width="3"/>' +
+    '</svg>';
+}
+
+/* ---------- 预览页：两张剖面（高斯 + 噪声） ---------- */
+function drawProfile(id, n, peakAt, caption) {
+  var W = 1000, H = 150, i, pts = [], sigma = n / 26;
+  for (i = 0; i < 200; i++) {
+    var x = n * i / 199;
+    var y = 1022 * Math.exp(-Math.pow((x - peakAt) / sigma, 2) / 2) + Math.random() * 26;
+    pts.push([W * i / 199, H - Math.min(1, y / 1100) * H]);
+  }
+  document.getElementById(id).innerHTML = svgBox(W, H) + grid(W, H, 8) + poly(pts, '#0ea5e9', '', 1.4) + '</svg>';
+}
+
+/* ---------- 预览页：图库 ---------- */
+function drawGallery(n) {
+  var host = document.getElementById('gallery'), html = '', i;
+  for (i = 0; i < n; i++) {
+    var x = 30 + Math.round(Math.random() * 40), y = 30 + Math.round(Math.random() * 40);
+    var bg = 'radial-gradient(circle at ' + x + '% ' + y + '%, #fff 0 5%, #94a3b8 11%, #111827 44%)';
+    var name = '2026-09-24_15-' + String(10 + (i % 50)).padStart(2, '0') + '-0' + (i % 10) + '.png';
+    html += '<figure><div class="ph" style="background:' + bg + '"></div>' +
+      '<span class="gname">' + (i === 0 ? '亮心 12ms' : name) + '</span>' +
+      '<span class="gmeta">12.00 ms · (715.9, 540.6)</span></figure>';
+  }
+  host.innerHTML = html;
+  document.getElementById('grabs-sub').textContent = n + ' 张';
+}
+
+/* ---------- 首屏 & 压测 ---------- */
+function render(stress) {
+  drawTrace();
+  drawPointsChart(stress ? 200 : 11);
+  drawPointsTable(stress ? 200 : 11);
+  drawHistory(stress ? HIST.concat(HIST).concat(HIST).concat(HIST).concat(HIST) : HIST);
+  drawFrame();
+  drawProfile('prof-h', 1440, 716, '整行 · 1440 px · 原生 16 位原值');
+  drawProfile('prof-v', 1080, 541, '整列 · 1080 px · 原生 16 位原值');
+  drawGallery(stress ? 40 : 6);
+}
+render(false);
+
+var stress = false;
+document.getElementById('btn-stress').addEventListener('click', function () {
+  stress = !stress;
+  this.textContent = stress ? '压测中（点我还原）' : '压测数据';
+  this.classList.toggle('primary', stress);
+  render(stress);
+});
+window.addEventListener('resize', function () { /* SVG 用 viewBox 自适应，不用重量宽 */ });
+</script>
+</body>
+</html>

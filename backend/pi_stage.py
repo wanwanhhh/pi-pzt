@@ -120,6 +120,9 @@ class Stage:
     """线程安全的 E-709 封装。所有公开方法都可以从任意线程调用。"""
 
     caps: Caps = CAPS
+    # 采图前按步距再复核一次偏差（scanner 那道相对校验）：PI 的到达容差是绝对的，
+    # 步距比它小时判据失去分辨力，这道补盲区。
+    step_check = True
 
     def __init__(
         self,

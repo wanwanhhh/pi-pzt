@@ -30,7 +30,7 @@ from backend.stage_api import (
 
 
 EXPECTED_MEMBERS = frozenset({
-    "caps", "start", "shutdown", "estop", "status", "poll", "clamp", "move", "jog",
+    "caps", "step_check", "start", "shutdown", "estop", "status", "poll", "clamp", "move", "jog",
     "set_servo", "hold_here", "set_velocity", "stop_motion", "release",
     "poll_on_target", "wait_on_target",
 })
@@ -70,6 +70,18 @@ def test_pi_caps():
     assert CAPS.release_mode == RELEASE_SERVO_OFF
     assert CAPS.default_settle_ms == DEFAULT_SETTLE_MS
     assert Stage.caps is CAPS
+
+
+def test_step_check_is_declared_per_device():
+    """采图前那道「半个步距」的相对校验做不做，由设备自己声明：
+
+    PI 要（补「步距小于绝对容差时判据失效」的盲区）；**XMT 不要** —— 用户定的，
+    等满稳定延时就直接采图，偏差一概不拦。代价见 docs/xmt/设备认识账.xml E12。
+    """
+    from backend.xmt_stage import XmtStage
+
+    assert Stage.step_check is True, "PI 的到达容差是绝对的，这道相对校验必须留着"
+    assert XmtStage.step_check is False, "XMT 不做任何到位判据（用户 2026-09 定）"
 
 
 def test_pi_declares_device_settle():

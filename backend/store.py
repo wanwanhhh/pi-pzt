@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS point (
     on_target   INTEGER,
     settle_source TEXT,
     image_path  TEXT,
+    -- 这一点**采图那一刻**用的曝光（µs，相机读回值）。NULL = 未记录：
+    -- 占位相机没有曝光概念、没采到图的点、以及加这一列之前的老数据。
+    exposure_us INTEGER,
     taken_at    REAL,
     PRIMARY KEY (scan_id, idx)
 );
@@ -62,6 +65,9 @@ CREATE TABLE IF NOT EXISTS grab (
 MIGRATIONS = (
     # (表, 列, 类型, 老行补什么值)
     ("point", "settle_source", "TEXT", SETTLE_UNKNOWN),
+    # 曝光对老行**没有**能补的值（当时没记），如实留 NULL —— 界面显示「—」，
+    # 不许拿"现在的曝光"去倒填：那是编数，不是记录。
+    ("point", "exposure_us", "INTEGER", None),
 )
 
 # 终止态：进程启动时把这两个状态之外的残留扫描判为 aborted
@@ -141,15 +147,16 @@ def add_point(
     on_target: bool,
     settle_source: str,
     image_path: Optional[str],
+    exposure_us: Optional[int] = None,
 ) -> None:
     with _db() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO point"
             " (scan_id, idx, target_um, actual_um, settled_ms, on_target, settle_source,"
-            "  image_path, taken_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  image_path, exposure_us, taken_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (scan_id, idx, target_um, actual_um, settled_ms, int(on_target), settle_source,
-             image_path, time.time()),
+             image_path, exposure_us, time.time()),
         )
 
 

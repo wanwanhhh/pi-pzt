@@ -132,6 +132,9 @@ class Scanner:
         step = (req.stop_um - req.start_um) / (req.count - 1)
         settle_s = self._settle_ms(req) / 1000.0
         try:
+            # 相机归扫描用（预览让位、会话保持到扫描结束）：什么时候算结束只有这里知道，
+            # 所以持有/交还由扫描器显式说 —— 不靠「空闲多久」之类的计时器去猜。
+            self._capture.begin()
             self._approach_start(req, step, settle_s)
             for i in range(req.count):
                 self._resume.wait()
@@ -141,8 +144,8 @@ class Scanner:
                 target = req.start_um + step * i
                 t0 = time.monotonic()
                 self._stage.move(target)
-                # 等待与判到位都归设备层：PI 等 ONT 信号 + 稳定延时，XMT 等满稳定延时
-                # 再读一次回（不判稳）。上层只要「到位 / 超时 / 中止」这一个结论。
+                # 等待与判到位都归设备层：PI 等 ONT 信号 + 稳定延时；XMT 只等满稳定延时
+                # （不读回、不判任何东西）。上层只要「到位 / 超时 / 中止」这一个结论。
                 if not self._stage.wait_on_target(
                     ON_TARGET_TIMEOUT_S,
                     cancel=self._abort.is_set,
@@ -160,16 +163,24 @@ class Scanner:
                                    f"（目标 {target:.4f} µm，读数 {pos:.4f} µm）")
                         log.error("扫描 %s %s", scan_id, message)
                     break
+                # **先让相机开始曝光，再读位置**：一个走 USB、一个走串口，本来就互不相干，
+                # 串行做就是白等一次曝光（实测 200 ms/点）。并行之后那次读数还落进了这一帧
+                # 的积分窗，位置与图对得更齐（从前读数比帧早 ~250 ms）。
+                self._capture.trigger()
                 # 这一读就是**采集时的位置**，连同命令值一起入库（点位表能看到实际间距）。
+                # XMT 上它还是唯一能事后看出丢帧的东西（我们不做判据了，见下面那条）。
                 st = self._stage.poll()
                 if not st.on_target:
-                    # 确认到位之后又漂了/溢出了：图像仍采，但如实记录
+                    # 采图那一刻读数已经不在目标上：图像照采，如实记录
                     log.warning("第 %d 点采图时已不在位：目标 %.4f µm，实际 %.4f µm",
                                 i, target, st.position)
-                # 设备层的到达容差是**绝对**的，这里补一道**相对**校验（取半个步距的理由见
+                # 设备层的到达容差是**绝对**的，这里再补一道**相对**校验（取半个步距的理由见
                 # config.SCAN_ARRIVAL_FRACTION）：超了就不采图、不入库、中止扫描。
-                # 步距为 0（起终点相同）时不做这条：没有"上一点"可比。
-                if step and abs(st.position - target) > abs(step) * SCAN_ARRIVAL_FRACTION:
+                # 做不做由设备自己声明（stage.step_check）：PI 做；**XMT 不做** —— 用户定的，
+                # 等满稳定延时就直接采图，偏差一概不拦。代价写在 docs/xmt/设备认识账.xml E12。
+                # 步距为 0（起终点相同）时也没有"上一点"可比，不做。
+                if (self._stage.step_check and step
+                        and abs(st.position - target) > abs(step) * SCAN_ARRIVAL_FRACTION):
                     status = "failed"
                     message = (f"第 {i}/{req.count} 点偏差 {abs(st.position - target):.4f} µm"
                                f"超过步距的 {SCAN_ARRIVAL_FRACTION:.0%}"
@@ -177,10 +188,13 @@ class Scanner:
                                f"设点可能丢了，或台子没走到")
                     log.error("扫描 %s %s", scan_id, message)
                     break
-                image = self._capture.capture(scan_id, i, st.position)
+                # 图片路径与**这一帧的曝光**一起入库：曝光是相机读回值，扫描参数里没有它，
+                # 事后要问"这张图当时用的多少曝光"只能从元数据或 PNG 自己身上查。
+                shot = self._capture.capture(scan_id, i, st.position)
                 store.add_point(
                     scan_id, i, target, st.position,
-                    (time.monotonic() - t0) * 1000.0, st.on_target, st.settle_source, image,
+                    (time.monotonic() - t0) * 1000.0, st.on_target, st.settle_source,
+                    shot.path, shot.exposure_us,
                 )
                 with self._lock:
                     self._state.update(index=i + 1, target_um=target, actual_um=st.position)
@@ -197,7 +211,8 @@ class Scanner:
         finally:
             # 先把设备放开再转终态：这样"状态转终态"之后扫描不会再碰设备，
             # busy() 以状态为准才成立（否则收尾期间的 409 是误导）。
-            # 两步都不抛，所以终态一定写得到。
+            # 三步都不抛，所以终态一定写得到。
+            self._capture.end()        # 交还相机（内部自己吞异常）
             if status != "done":
                 self._stop_quiet(scan_id)
             with self._lock:

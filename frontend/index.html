@@ -18,10 +18,11 @@
 
 <header class="bar">
   <h1>PI P-621.1CD 位移台控制台</h1>
-  <nav class="tabs" title="三个页签（对准 / 扫描 / 预览）：后端本来就规定它们互斥 —— 扫描占着设备时手动会被拒绝、相机也归扫描用。分页只是显示，不是权限。">
+  <nav class="tabs" title="四个页签：对准 / 扫描 / 预览对的是**设备**（后端本来就规定它们互斥 —— 扫描占着设备时手动会被拒绝、相机也归扫描用）；数据对的是**盘上的数据**，只读，扫描跑着也能翻旧数据。分页只是显示，不是权限。">
     <button id="tab-align" class="tab active">对准</button>
     <button id="tab-scan" class="tab">扫描</button>
     <button id="tab-ccd" class="tab">预览</button>
+    <button id="tab-data" class="tab">数据</button>
   </nav>
   <div class="pills">
     <span class="pill" id="pill-link">界面连接中…</span>
@@ -45,7 +46,7 @@
           <div class="readout"><span id="pos">—</span><small>µm</small></div>
           <dl class="kv">
             <dt>目标</dt><dd id="target">—</dd>
-            <dt title="PI：控制器给的到位信号。XMT：最近一次读数是否落在目标 ±到达容差内（读数与命令值的比较，不是「台子停没停」）。">到位</dt><dd id="ontarget">—</dd>
+            <dt title="PI：控制器给的到位信号。XMT：最近一次读数是否落在目标 ±到达容差内（读数与命令值的比较，不是「台子停没停」）—— **只用于显示，不拦任何动作**：XMT 的扫描不做到位判据。">到位</dt><dd id="ontarget">—</dd>
             <dt title="XMT 没有速度指令，这一格会显示「无此指令」">速度</dt><dd id="velocity">—</dd>
             <dt>状态</dt><dd id="errcode">—</dd>
           </dl>
@@ -169,12 +170,13 @@
             <div><label for="scan-start">起点 (µm)</label><input id="scan-start" type="number" step="0.1"></div>
             <div><label for="scan-stop">终点 (µm)</label><input id="scan-stop" type="number" step="0.1"></div>
             <div><label for="scan-count">点数</label><input id="scan-count" type="number" min="2" step="1"></div>
-            <div><label for="scan-settle" title="PI：到位信号置位后再等这么久才采图。XMT：移动后固定等这么久，再读一次回确认。等待时长要覆盖「走完一步 + 整定」的时间；改了设备上的整定旋钮就得重设。填 0 等于不等：读数还没走到目标就会判该点无效。">稳定延时 (ms)</label><input id="scan-settle" type="number" min="0" step="10"></div>
+            <div><label for="scan-settle" title="PI：到位信号置位后再等这么久才采图。XMT：移动后固定等这么久**就直接采图**——不做任何到位判据，等多久全靠这个数（填 0 等于不等，会采到还在走的点）。等待时长要覆盖「走完一步 + 整定」的时间；改了设备上的整定旋钮就得重设。">稳定延时 (ms)</label><input id="scan-settle" type="number" min="0" step="10"></div>
           </div>
           <div class="row top">
             <button id="btn-scan-start" class="primary grow1">开始扫描</button>
           </div>
           <p class="hint" id="scan-hint">单向逼近：从起点到终点单调推进，每点从同一侧逼近；起点前会先退让一段再逼近首点。</p>
+          <p class="hint" id="scan-check-hint">XMT 的每点只等满「稳定延时」就采图：不读回确认、不按步距复核，偏差不拦也不中止 —— 没走到/设点丢了会静默采到错位的图，事后看点位表的「间距」列。</p>
         </div>
       </section>
 
@@ -216,8 +218,10 @@
               <th>#</th><th>目标 (µm)</th><th>实际 (µm)</th>
               <th title="相邻两点「实际」位置之差 —— 采图那一刻记下来的读数，看实际间距用。与命令间距的差见「目标」列。">间距 (µm)</th>
               <th>偏差 (nm)</th>
-              <th title="PI：控制器给的到位信号。XMT：读回是否落在目标 ±到达容差内。">到位</th>
-              <th>耗时 (ms)</th><th>图像</th>
+              <th title="PI：控制器给的到位信号。XMT：**采图那一刻**读数是否落在目标 ±到达容差内 —— 只记录，不拦扫描（XMT 不做到位判据，没走到也照采）。">到位</th>
+              <th>耗时 (ms)</th>
+              <th title="这一点采图时相机上的曝光（读回值，与预览共用同一个）。扫描参数里没有曝光这一项；老数据与没采到图的点写「—」，不倒填">曝光 (ms)</th>
+              <th>图像</th>
             </tr></thead>
             <tbody></tbody>
           </table>
@@ -308,7 +312,21 @@
       <!-- 轮廓图：点预览图取"过该点的整行 / 整列"剖面。数据是后端原生 16 位帧上的原值，
            不平滑、不扣背景；切线方向跟着预览朝向走。 -->
       <section class="card grow" id="card-profile">
-        <div class="head"><h2>轮廓图<span class="sub" id="prof-where">在预览图上点一下</span></h2></div>
+        <div class="head">
+          <h2>轮廓图
+            <span class="sub" id="prof-where">在预览图上点一下</span>
+            <span class="sub" id="prof-pin" hidden>范围已钉住</span>
+          </h2>
+        </div>
+        <!-- 纵轴范围：与位置曲线同一套规矩 —— 输入框是唯一的准，没手填过就按数据铺满。
+             整行与整列**共用一条纵轴**：各画各的自动范围，两张图就没法互相比较了。 -->
+        <div class="form2 gap-bottom">
+          <div><label for="prof-ymin">Y 最小 (ADU)</label><input id="prof-ymin" type="number" min="0" step="10"></div>
+          <div><label for="prof-ymax">Y 最大 (ADU)</label><input id="prof-ymax" type="number" min="0" step="10"></div>
+        </div>
+        <div class="row gap-bottom">
+          <button id="btn-prof-fit" class="ghost grow1" title="按这一段数据把纵轴铺满；恢复自动也用它">自动范围</button>
+        </div>
         <div class="body flush stack">
           <div class="chartbox">
             <span class="cap">过该点整行（水平）· 原生 16 位原值</span>
@@ -322,6 +340,8 @@
         <p class="hint" id="prof-note">在预览图上点一下：取过该点的<b>整行</b>（上）与<b>整列</b>（下）两条剖面，
           数据是<b>原生 16 位</b>原值（0~1022 ADU）—— 不平滑、不扣背景、不归一化，画出来是什么就是什么。
           横轴是<b>显示坐标</b>下的像素位置，切线方向跟着预览朝向走；实时跟着预览刷新。
+          <b>纵轴范围可设</b>：默认按数据铺满；填了数字就钉住（整行与整列共用一条纵轴，
+          大图弹窗里那两张也认同一个刻度，两组剖面才可比），点「自动范围」恢复。
           图库里点开大图也能切（那读的是保存的 PNG 本身）。</p>
       </section>
     </div>
@@ -345,6 +365,69 @@
             点缩略图看大图（就是原始帧本身，16 位 PNG）；<b>点名字改名 = 磁盘上真的改文件名</b>（后缀缺了会自动补 .png，
             重名或含非法字符会被后端拒绝）。</p>
         </div>
+      </section>
+    </div>
+
+  </section>
+
+  <!-- ==================== 数据：左＝取自哪条扫描、哪个像素，右＝曲线 ====================
+       这一页跟上面三页不是一类：那三页对的是**设备**（谁在用、归谁，所以互斥），
+       这一页对的是**盘上的数据**（库里的扫描 + data/images 的帧），只读。
+       所以它既不参与互斥（扫描跑着也能翻旧数据），也不许碰设备（只是读文件）。 -->
+  <section class="view view-data" id="view-data" hidden>
+
+    <div class="col col-data-ctl">
+      <p class="coltitle">取数 · 哪条扫描、哪个像素</p>
+
+      <section class="card fill">
+        <div class="head">
+          <h2>扫描</h2>
+          <div class="right"><button id="btn-data-refresh" class="ghost">刷新</button></div>
+        </div>
+        <div class="body">
+          <label for="data-scan">选一条</label>
+          <select id="data-scan"></select>
+          <p class="hint" id="data-scan-info">—</p>
+        </div>
+      </section>
+
+      <section class="card fill">
+        <div class="head"><h2>像素</h2></div>
+        <div class="body">
+          <div class="form2">
+            <div><label for="data-x">X（列）</label><input id="data-x" type="number" min="0" step="1" value="720"></div>
+            <div><label for="data-y">Y（行）</label><input id="data-y" type="number" min="0" step="1" value="540"></div>
+          </div>
+          <div class="row top"><button id="btn-data-draw" class="primary grow1">画曲线</button></div>
+          <p class="hint">坐标是<b>保存的 PNG 自己的</b>坐标（原生幅面、传感器朝向）——
+            与质心、图库大图上的剖面同一套，不受预览朝向影响。</p>
+        </div>
+      </section>
+    </div>
+
+    <!-- 分栏线：拖动改栏宽（双击复位，方向键微调）；拖出来的值记在 localStorage，刷新还在 -->
+    <div class="gutter gutter-v" data-var="--col-data" data-axis="x" data-min="260" data-max="620"
+         role="separator" aria-orientation="vertical" aria-label="拖动调整取数栏宽度（双击复位，方向键微调）" tabindex="0"></div>
+
+    <div class="col col-data-curve">
+      <p class="coltitle">曲线 · 这个像素随扫描位置怎么变</p>
+
+      <section class="card grow">
+        <div class="head"><h2>像素曲线<span class="sub" id="data-title">未取数</span></h2></div>
+        <div class="chart" id="data-chart"></div>
+        <dl class="stats">
+          <div><dt>扫描点</dt><dd id="data-n">—</dd></div>
+          <div><dt>有值</dt><dd id="data-ok">—</dd></div>
+          <div><dt>没图的点</dt><dd id="data-missing">—</dd></div>
+          <div><dt>位置跨度 (µm)</dt><dd id="data-span">—</dd></div>
+          <div><dt>峰值 (ADU)</dt><dd id="data-peak">—</dd></div>
+          <div><dt>幅面 · 位深 · 满量程</dt><dd id="data-size">—</dd></div>
+        </dl>
+        <p class="hint" id="data-empty">还没有取数。左边选一条扫描、填上像素坐标，点「画曲线」。</p>
+        <p class="hint">横轴是<b>采图那一刻记下来的读出位置</b>（µm —— 不是命令值、也不是点序号）；
+          纵轴是这一点上<b>那一个像素的原值</b>（ADU）：不平滑、不扣背景、不归一化。
+          数据全部取自各点<b>已经落盘的帧</b>：不重采、不占设备，扫描跑着也能看已经采完的那一段；
+          没图的点给不上值，曲线在那儿断开。</p>
       </section>
     </div>
 

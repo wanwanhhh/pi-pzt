@@ -115,7 +115,7 @@ def test_caps_declares_xmt_differences():
     assert CAPS.platform == "仅 Windows"
     assert CAPS.has_on_target is False, "设备没有到位信号"
     assert CAPS.has_stop_command is False, "设备没有停止指令"
-    assert CAPS.has_setpoint_ack is False, "设点无应答，必须读回校验"
+    assert CAPS.has_setpoint_ack is False, "设点无应答 —— 丢了是静默的（扫描不再校验，见 E12）"
     assert CAPS.release_mode == RELEASE_OPEN_LOOP_ZERO
     assert CAPS.has_velocity is False, "本设备没有速度指令，能力声明里要说清楚"
     assert CAPS.unit == "µm"
@@ -217,7 +217,7 @@ def test_clamp_uses_the_usable_range():
 
 
 def confirm(stage) -> bool:
-    """走一次采集前的到位确认（读一次回 + 顺手跑比值诊断）。"""
+    """读一次回，问「落在目标附近吗」。**它只是一个查询**：扫描那条路不再调用它。"""
     return stage.poll_on_target()
 
 
@@ -226,36 +226,20 @@ def reply_raw(link: FakeLink, raw: float) -> None:
     link._replies[xp.CMD_READ_POSITION] = _data(raw)
 
 
-def test_far_from_target_is_diagnosed_not_blocked():
-    """读回离目标很远：要报出来（确认返回 False），但**绝不拦运动**。
+def test_far_from_target_is_only_reported():
+    """读回离目标很远：poll_on_target 如实说 False，但**没有任何东西会因此拦下来**。
 
-    真机上「比值不对就拒绝运动」闩死过两次（设点丢帧会被算成"标定被改"），
-    所以这一层只做诊断 —— 真正兜底的是到达容差：系数一变，读数再也落不到目标附近。
+    这个结论只有两个去处：界面「到位」列，以及每点元数据里的 on_target（采图那一刻的读数比较）。
+    扫描那条路（wait_on_target）现在根本不看读数 —— 那是用户定的口径，见 E12。
     """
     stage, link = connected()
     reply_raw(link, 20.0 / 0.75)
     stage.move(20.0)
     assert confirm(stage) is True
-    assert stage._scale_suspect is False
     reply_raw(link, 60.0)                 # 读数停在"原值 = 设点"：离目标差 15 µm
     stage.move(60.0)
     assert confirm(stage) is False, "离目标 15 µm 不能算到位"
-    assert stage._scale_suspect is True, "离目标很远时应当被诊断为可疑"
-    assert stage.move(50.0) == 50.0, "诊断归诊断，不能拦运动"
-    stage.shutdown()
-
-
-def test_scale_check_accepts_a_clean_ratio():
-    """干净设备（差分比值 = 4/3）不能被误报 —— 真机有 ~90 nm 偏置与 30~50 nm 抖动。"""
-    stage, link = connected()
-    reply_raw(link, 20.0 / 0.75)
-    stage.move(20.0)
-    confirm(stage)
-    reply_raw(link, 60.0 / 0.75)
-    stage.move(60.0)
-    confirm(stage)
-    assert stage._scale_suspect is False
-    assert stage.move(50.0) == 50.0
+    assert stage.move(50.0) == 50.0, "读数归读数，绝不拦运动"
     stage.shutdown()
 
 
@@ -282,20 +266,34 @@ def test_usable_range_with_no_intersection_is_rejected():
         raise AssertionError("自报 160~200 与可用 5~150 无交集，必须拒绝连接")
 
 
-def test_wait_on_target_waits_then_confirms():
-    """等待时长是调用方给的：等满 settle_s 再读一次回，落在容差内才算到位。"""
-    stage, _ = connected()
+def test_wait_on_target_waits_then_says_arrived():
+    """等待时长是调用方给的：等满 settle_s 就算到位 —— 就这一条，别的什么都不判。"""
+    stage, link = connected()
     t0 = time.monotonic()
     assert stage.wait_on_target(10.0, settle_s=0.12) is True
-    assert time.monotonic() - t0 >= 0.12, "没等满就确认了"
+    assert time.monotonic() - t0 >= 0.12, "没等满就算到位了"
     stage.shutdown()
 
 
-def test_wait_on_target_rejects_a_lost_setpoint():
-    """台子停在别处（设点丢了）→ 不算到位，扫描据此判该点无效、不采图。"""
+def test_wait_on_target_ignores_a_lost_setpoint():
+    """**用户定的口径**：台子停在别处（设点丢了）也照返回 True，到点就采图。
+
+    这就是"不做任何判据"的代价：丢帧是静默的，会采到一张错位的图。回头看只有每点
+    记下的读数能暴露它（点位表的「间距」列、数据页曲线的横轴）。依据见 E12。
+    """
     stage, _ = connected()
-    stage.move(POSITION_UM + 5.0)     # 假串口固定回包：读回不动
-    assert stage.wait_on_target(10.0, settle_s=0.0) is False
+    stage.move(POSITION_UM + 5.0)     # 假串口固定回包：台子没动，离目标 5 µm
+    assert stage.wait_on_target(10.0, settle_s=0.0) is True
+    assert stage.poll_on_target() is False, "读数本身照实说：它确实没在目标上"
+    stage.shutdown()
+
+
+def test_wait_on_target_does_not_touch_the_device():
+    """这条路上**一次设备访问都没有**：等的是时间，不是台子。"""
+    stage, link = connected()
+    before = len(link.sent)
+    assert stage.wait_on_target(10.0, settle_s=0.05) is True
+    assert len(link.sent) == before, "等到位不该读设备"
     stage.shutdown()
 
 

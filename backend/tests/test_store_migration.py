@@ -79,6 +79,7 @@ def test_old_db_gets_the_new_column():
 
         cols = {r[1] for r in _query(t.db, "PRAGMA table_info(point)")}
         assert "settle_source" in cols, f"迁移没补列，现有列 {sorted(cols)}"
+        assert "exposure_us" in cols, f"曝光列没补上，现有列 {sorted(cols)}"
 
 
 def test_add_point_round_trips_settle_source():
@@ -88,6 +89,17 @@ def test_add_point_round_trips_settle_source():
         store.add_point(scan_id, 0, 1.0, 1.0, 5.0, True, SETTLE_SOFTWARE, None)
         got = _query(t.db, "SELECT settle_source FROM point")
         assert got and got[0][0] == SETTLE_SOFTWARE, got
+
+
+def test_add_point_round_trips_exposure():
+    """曝光随点入库；**没有**时留 NULL（不许倒填当前值）。"""
+    with _TempStore() as t:
+        store.init()
+        scan_id = store.create_scan("曝光", 0.0, 10.0, 2, 100)
+        store.add_point(scan_id, 0, 1.0, 1.0, 5.0, True, SETTLE_SOFTWARE, "images/a.png", 12_000)
+        store.add_point(scan_id, 1, 2.0, 2.0, 5.0, True, SETTLE_SOFTWARE, None)
+        got = _query(t.db, "SELECT exposure_us FROM point ORDER BY idx")
+        assert [r[0] for r in got] == [12_000, None], got
 
 
 # 模拟「上一版迁移已经补过列、但还没有回填逻辑」的库：

@@ -59,12 +59,13 @@ function toast(text, isErr) {
 
 /* ==================== 视图 ==================== */
 
-/* 三页：对准（读数 / 手动 / 曲线）、扫描（参数 / 进度 / 点位 / 历史）、
-   预览（相机预览 / 已保存的原始帧）。
-   后端本来就规定它们互斥（扫描占着设备时手动会被 409 拒、相机也归扫描用），
-   所以分页藏起来的不是"还有用的东西"，是"此刻用不了的东西"。
+/* 四页：对准（读数 / 手动 / 曲线）、扫描（参数 / 进度 / 点位 / 历史）、
+   预览（相机预览 / 已保存的原始帧）、数据（指定像素在各扫描点上的值）。
+   前三页对的是**设备**：后端本来就规定它们互斥（扫描占着设备时手动会被 409 拒、
+   相机也归扫描用），所以分页藏起来的不是"还有用的东西"，是"此刻用不了的东西"。
+   后一页对的是**盘上的数据**（库 + 图像文件），只读 —— 扫描跑着也能翻旧数据。
    **这是显示状态，不是权限** —— 真正的拒绝永远在后端。 */
-const VIEWS = ['align', 'scan', 'ccd'];
+const VIEWS = ['align', 'scan', 'ccd', 'data'];
 let view = VIEWS[0];
 
 function showView(v) {
@@ -84,6 +85,11 @@ function showView(v) {
   if (view === 'ccd') {
     ccdStatus();
     loadGrabs();
+  }
+  // 数据页只读：进页时刷一次扫描列表（新跑完的扫描要能选到），再把曲线按卡片尺寸重排
+  if (view === 'data') {
+    loadDataScans();
+    fitChart(dataChart, 'data-chart', 240);
   }
   location.hash = v;   // 刷新、或者开两个标签各停一页，都靠它
 }
@@ -397,6 +403,10 @@ function renderPoints(points) {
         (dev === null ? '—' : dev.toFixed(0)) + '</td>' +
       '<td>' + (p.on_target ? '是' : '否') + '</td>' +
       '<td>' + (p.settled_ms === null || p.settled_ms === undefined ? '—' : Math.round(p.settled_ms)) + '</td>' +
+      // 曝光：**这一点采图当时**相机上的值（后端从相机读回，随点位元数据入库）。
+      // 老数据 / 没采到图的点没有这个数 —— 如实写「—」，不拿当前曝光倒填。
+      '<td>' + (p.exposure_us === null || p.exposure_us === undefined
+        ? '—' : (p.exposure_us / 1000).toFixed(2)) + '</td>' +
       // 点位表的图也走 8 位映射：真机扫描帧同样是 16 位 PNG，直连 /data 会是一片黑
       // （假相机的占位图是 8 位，所以以前看不出问题）。data-full 让点击能进同一套大图。
       '<td>' + (p.image_path
@@ -407,7 +417,7 @@ function renderPoints(points) {
   }
   if (points.length > n) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="8" class="hint">只显示前 ' + n + ' 点，共 ' + points.length + ' 点</td>';
+    tr.innerHTML = '<td colspan="9" class="hint">只显示前 ' + n + ' 点，共 ' + points.length + ' 点</td>';
     frag.appendChild(tr);
   }
   tb.innerHTML = '';
@@ -975,6 +985,8 @@ const PROF_HOSTS = {
 const profPoint = { preview: null, lightbox: null };   // {x, y}；大图那条另带 path
 const profCharts = {};                                 // host -> {h, v}
 const profSeq = { preview: 0, lightbox: 0 };           // 迟到的响应不许覆盖新的
+const profLast = { preview: null, lightbox: null };    // 最近一次剖面数据（"按数据铺满"要按它算）
+let profPinned = false;                                // 手填过纵轴范围就不再自动铺满
 
 /* 点击位置 → 图像像素坐标（纯算术，便于测）：box 是图片在屏幕上的矩形，nw/nh 是它的像素尺寸 */
 function profPixel(clientX, clientY, box, nw, nh) {
@@ -1025,6 +1037,8 @@ function profApply(host, p) {
   for (let i = 0; i < p.vertical.length; i++) { xsV.push(i); ysV.push(p.vertical[i]); }
   profCharts[host].h.setData([xsH, ysH]);
   profCharts[host].v.setData([xsV, ysV]);
+  profLast[host] = p;
+  applyProfRange();                       // 每来一段新数据跟一次（钉住时不动、自动时铺满）
   $(cfg.cut).hidden = false;
   $(cfg.cv).style.left = (p.x + 0.5) / p.width * 100 + '%';    // 画在像素中心
   $(cfg.ch).style.top = (p.y + 0.5) / p.height * 100 + '%';
@@ -1046,9 +1060,52 @@ async function profFetch(host) {
   if (p) profApply(host, p);
 }
 
+/* 纵轴范围。与位置曲线同一套规矩：**输入框是唯一的准**，没手填过就按数据铺满；
+   钉住是个可见状态（头部「范围已钉住」），也是"范围为什么不动了"的说明。
+   整行与整列共用一条纵轴 —— 各画各的自动范围，两张图就没法互相比较。
+   大图弹窗那两张也认这个范围（同一个刻度才可比）；没钉住时各按各的数据铺满。 */
+function profExtent(p) {
+  if (!p || !p.horizontal || !p.vertical) return null;
+  let lo = null, hi = null;
+  [p.horizontal, p.vertical].forEach(function (arr) {
+    for (let i = 0; i < arr.length; i++) {
+      if (lo === null || arr[i] < lo) lo = arr[i];
+      if (hi === null || arr[i] > hi) hi = arr[i];
+    }
+  });
+  if (lo === null) return null;
+  const pad = Math.max(2, (hi - lo) * 0.05);   // 平的一段也给几 ADU 的窗，别退化成一条线
+  return [Math.max(0, lo - pad), hi + pad];
+}
+
+function profRange(host) {
+  const y0 = parseFloat($('prof-ymin').value), y1 = parseFloat($('prof-ymax').value);
+  if (profPinned) return (y0 < y1) ? { min: y0, max: y1 } : null;   // 填反/只填一半不套用，框留着等人改完
+  const r = profExtent(profLast[host]);
+  return r ? { min: r[0], max: r[1] } : null;
+}
+
+function applyProfRange() {
+  $('prof-pin').hidden = !profPinned;
+  if (!profPinned) {
+    // 框里跟的是"当前有数据的那一张"：优先预览（框就在它下面），
+    // 只有大图那条有数据时（比如没开预览、直接点图库）就跟大图 —— 不然点了"自动范围"、
+    // 图上明明变了，框里还留着旧值，看着像没生效。
+    const r = profExtent(profLast.preview) || profExtent(profLast.lightbox);
+    if (r) { $('prof-ymin').value = Math.round(r[0]); $('prof-ymax').value = Math.round(r[1]); }
+  }
+  ['preview', 'lightbox'].forEach(function (host) {
+    const c = profCharts[host], r = profRange(host);
+    if (!c || !r) return;
+    c.h.setScale('y', { min: r.min, max: r.max });
+    c.v.setScale('y', { min: r.min, max: r.max });
+  });
+}
+
 function profClear(host) {
   const cfg = PROF_HOSTS[host];
   profPoint[host] = null;
+  profLast[host] = null;
   $(cfg.cut).hidden = true;
   if (profCharts[host]) {
     profCharts[host].h.setData([[], []]);
@@ -1257,6 +1314,151 @@ async function loadHistory() {
   tb.appendChild(frag);
 }
 
+/* ==================== 数据处理页：指定像素在各扫描点上的值 ====================
+
+   这一页对的是**盘上的数据**（库里的扫描 + data/images 里各点的帧），不是设备：
+   一次请求把整条序列取回来，界面只负责把它画出来、把口径写在脸上。
+   **前端不做数据加工**：取哪个像素、算哪一段，全部照后端给的画。 */
+
+let dataScans = [];        // 后端列的扫描（左栏下拉框的选项）
+let dataChart = null;      // 像素曲线
+let dataSeq = 0;           // 取数请求序号：慢响应回来时可能已经换了扫描或像素
+
+async function loadDataScans() {
+  const list = await get('/api/scans');
+  if (!list) return;
+  dataScans = list;
+  const sel = $('data-scan');
+  const keep = sel.value;                  // 正在看的那条：刷新列表不该把人挑好的换掉
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    const o = document.createElement('option');
+    o.value = String(s.id);
+    o.textContent = '#' + s.id + (s.name ? ' · ' + s.name : '') + ' · ' +
+      s.start_um + '→' + s.stop_um + ' µm · ' + s.count + ' 点 · ' +
+      (STATUS_CN[s.status] || s.status) + ' · ' + fmtTime(s.created_at);
+    frag.appendChild(o);
+  }
+  sel.innerHTML = '';
+  sel.appendChild(frag);
+  // 没选过就默认最新那次（列表是倒序的）
+  const ids = list.map(function (s) { return String(s.id); });
+  sel.value = ids.indexOf(keep) >= 0 ? keep : (ids.length ? ids[0] : '');
+  dataScanInfo();
+}
+
+function dataScanPick() {
+  const id = parseInt($('data-scan').value, 10);
+  for (let i = 0; i < dataScans.length; i++) if (dataScans[i].id === id) return dataScans[i];
+  return null;
+}
+
+function dataScanInfo() {
+  const s = dataScanPick();
+  setText('data-scan-info', !s ? '没有可选的扫描。'
+    : '共 ' + s.count + ' 点，已记录 ' + s.done + ' 点 · ' + s.start_um + ' → ' +
+      s.stop_um + ' µm · ' + (STATUS_CN[s.status] || s.status));
+}
+
+/* 后端给的序列 → 图上的两条数组。
+   **缺图的点：值原样是 null，线在那里断开**（uPlot 遇 null 断线）—— 不许拿邻点顶上。
+   没记下读出位置的点连横坐标都没有，上不了图：丢几个由统计里的「没图的点」一并如实说明。 */
+function pixelSeries(d) {
+  const xs = [], ys = [];
+  for (let i = 0; i < d.value.length; i++) {
+    const px = d.position_um[i];
+    if (px === null || px === undefined) continue;
+    xs.push(px);
+    ys.push(d.value[i] === undefined ? null : d.value[i]);
+  }
+  return [xs, ys];
+}
+
+async function drawPixelCurve() {
+  const s = dataScanPick();
+  if (!s) { toast('先选一条扫描', true); return; }
+  // 空框不能当成 0：Number('') 是 0，那样"没填"会静默变成左上角那个像素
+  const rx = String($('data-x').value || '').trim();
+  const ry = String($('data-y').value || '').trim();
+  if (!/^\d+$/.test(rx) || !/^\d+$/.test(ry)) {
+    toast('像素坐标要填非负整数（列、行）', true);
+    return;
+  }
+  const seq = ++dataSeq;
+  const prev = $('data-title').textContent;
+  setText('data-title', '读图中…');
+  const d = await get('/api/scans/' + s.id + '/pixel?x=' + rx + '&y=' + ry);
+  if (!d) {
+    // 失败原因 request() 已经弹过；标题得还原 —— 停在"读图中…"就是骗人
+    if (seq === dataSeq) setText('data-title', prev);
+    return;
+  }
+  if (seq !== dataSeq) return;            // 慢响应回来时可能已经换了扫描或像素
+  renderPixelCurve(d);
+}
+
+function renderPixelCurve(d) {
+  const data = pixelSeries(d);
+  const xs = data[0], ys = data[1];
+  let ok = 0, peak = null, lo = null, hi = null;
+  for (let i = 0; i < ys.length; i++) {
+    if (ys[i] === null) continue;                // 没图的点不参与统计（它连值都没有）
+    ok++;
+    if (peak === null || ys[i] > peak) peak = ys[i];
+  }
+  // 跨度是**位置**的跨度（µm），不是值的跨度 —— 值那一条已经在图上，峰值另算
+  for (let i = 0; i < xs.length; i++) {
+    if (lo === null || xs[i] < lo) lo = xs[i];
+    if (hi === null || xs[i] > hi) hi = xs[i];
+  }
+
+  if (!dataChart) {
+    dataChart = new uPlot({
+      width: chartWidth($('data-chart')),
+      height: chartHeight($('data-chart'), 240),   // 建图时的高度；随后 fitChart 按卡片实际尺寸校正
+      scales: { x: { time: false } },
+      legend: { show: true },
+      // 拖拽缩放会跟"输入框是唯一的准"打架（与位置曲线、剖面同一套理由），这里也关掉
+      cursor: { drag: { x: false, y: false } },
+      series: [
+        { label: '实际位置 (µm)' },
+        { label: '像素值 (ADU)', stroke: '#2563eb', width: 1.5,
+          points: { show: showPointsBelow(400), size: 4 } }
+      ],
+      axes: [
+        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
+        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } }
+      ]
+    }, data, $('data-chart'));
+    new ResizeObserver(function () { fitChart(dataChart, 'data-chart', 240); }).observe($('data-chart'));
+  } else {
+    dataChart.setData(data);
+  }
+  fitChart(dataChart, 'data-chart', 240);
+
+  setText('data-title', '#' + d.scan_id + (d.name ? ' · ' + d.name : '') +
+    '　像素 (' + d.x + ', ' + d.y + ')');
+  setText('data-n', String(d.count));
+  setText('data-ok', String(ok));
+  setText('data-missing', String(d.missing));
+  setText('data-span', lo === null ? '—' : (hi - lo).toFixed(3));
+  setText('data-peak', peak === null ? '—' : String(peak));
+  setText('data-size', d.width === null || d.width === undefined ? '—'
+    : d.width + '×' + d.height + ' · ' + d.bits + ' 位 · ' + d.full_scale);
+
+  const empty = $('data-empty');
+  if (ok > 0) {
+    empty.hidden = true;
+  } else {
+    empty.hidden = false;
+    empty.textContent = !d.count ? '这条扫描里还没有点。'
+      : (d.missing >= d.count && d.width === null
+        ? '这条扫描没有可读的帧（没采图，或者图被删了）—— 没有值可画。'
+        : '这个像素一个值都没取到。');
+  }
+}
+
 /* ==================== 分栏拖动 ==================== */
 
 /* 分栏线拖的是**显示**，不是业务：只改 .view 上的一个 CSS 变量（grid 模板读它），
@@ -1447,6 +1649,16 @@ function wire() {
   $('tab-align').onclick = function () { showView('align'); };
   $('tab-scan').onclick = function () { showView('scan'); };
   $('tab-ccd').onclick = function () { showView('ccd'); };
+  $('tab-data').onclick = function () { showView('data'); };
+
+  // 数据页：选扫描、填像素、画曲线。换扫描时**已经画过就跟着重画** ——
+  // 不然左边写着 #52、图上还是 #51 的那条，看着像没生效。
+  $('btn-data-refresh').onclick = loadDataScans;
+  $('btn-data-draw').onclick = drawPixelCurve;
+  $('data-scan').onchange = function () {
+    dataScanInfo();
+    if (dataChart) drawPixelCurve();
+  };
 
   $('btn-ccd-live').onclick = function () { if (ccdLive) ccdLiveStop(); else ccdLiveStart(); };
   $('btn-ccd-grab').onclick = ccdGrab;
@@ -1455,6 +1667,12 @@ function wire() {
   $('btn-grabs-refresh').onclick = loadGrabs;
   // 曝光改完立刻生效（数字框用 change，回车或失焦才发，别每敲一个字符就打设备）
   $('ccd-preview-ms').onchange = ccdSetExposure;
+
+  $('btn-prof-fit').onclick = function () { profPinned = false; applyProfRange(); };
+  ['prof-ymin', 'prof-ymax'].forEach(function (id) {
+    // 手填过就不再自动铺满：想用同一个刻度对比两张图、或看真实动态范围，范围得留得住
+    $(id).oninput = function () { profPinned = true; applyProfRange(); };
+  });
 
   $('btn-trace').onclick = function () { if (traceActive) traceStop(); else traceStart(); };
   $('btn-trace-fit').onclick = function () { tracePinned = false; applyTraceRange(); };
@@ -1534,6 +1752,8 @@ function wire() {
   ['scan-name', 'scan-start', 'scan-stop', 'scan-count', 'scan-settle'].forEach(function (id) {
     enterTo(id, 'btn-scan-start');
   });
+  enterTo('data-x', 'btn-data-draw');
+  enterTo('data-y', 'btn-data-draw');
 }
 
 /* ==================== 启动 ==================== */

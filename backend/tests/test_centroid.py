@@ -217,6 +217,14 @@ def test_thumb_cache_key_covers_size_and_mtime():
         assert _thumb_cache_name(p, 260) != before, "mtime 变了键要跟着变"
 
 
+def _sess_with(cam, frame):
+    """造一个只带「最近一帧」的假会话 —— 帧挂在会话上（见 thorlabs_ccd._Session）。"""
+    import types
+
+    cam._sess = types.SimpleNamespace(live=frame)
+    return cam._sess
+
+
 def test_profile_cuts_the_whole_row_and_column():
     """轮廓图 = 过点的**整行**与**整列**，原值返回（16 位、不处理）。
     朝向为 0 时就是传感器的行/列 —— 转置了的话这条会红。"""
@@ -227,7 +235,7 @@ def test_profile_cuts_the_whole_row_and_column():
     f = np.zeros((4, 6), dtype=np.uint16)
     f[:, 3] = [1, 2, 3, 4]                    # 第 3 列
     f[2, :] = [10, 20, 30, 40, 50, 60]        # 第 2 行；交叉点 (3,2) 最后写，所以两边都该是 40
-    cam._live = f
+    cam._sess = _sess_with(cam, f)
     p = cam.profile(3, 2)
     assert p["horizontal"] == [10, 20, 30, 40, 50, 60], p["horizontal"]
     assert p["vertical"] == [1, 2, 40, 4], p["vertical"]      # 交叉点两条剖面里必须是同一个数
@@ -242,7 +250,7 @@ def test_profile_follows_rotation():
 
     cam = ThorlabsCamera()
     f = np.arange(4 * 6, dtype=np.uint16).reshape(4, 6)      # frame[y, x] = y*6 + x
-    cam._live = f
+    cam._sess = _sess_with(cam, f)
     cam._rotation = 90
     p = cam.profile(0, 0)                                    # 显示坐标系左上角
     assert (p["width"], p["height"]) == (4, 6), (p["width"], p["height"])   # 宽高互换
@@ -261,7 +269,7 @@ def test_profile_refuses_bad_points_and_no_frame():
         assert "先开预览" in str(exc), exc
     else:
         raise AssertionError("没有帧时应该明确报错，而不是返回空剖面")
-    cam._live = np.zeros((4, 6), dtype=np.uint16)
+    cam._sess = _sess_with(cam, np.zeros((4, 6), dtype=np.uint16))
     for bad in ((6, 0), (0, 4), (99, 99)):
         try:
             cam.profile(*bad)

@@ -797,6 +797,30 @@ const count = (m) => calls.filter((c) => c === m).length;
   ok('大图那一套也能画（读保存的 PNG，同一套画法）',
      read("$('lb-cut').hidden") === false &&
      read('JSON.stringify(profCharts.lightbox.h.data)') === '[[0,1,2],[1,2,3]]');
+  // 纵轴范围：与位置曲线同一套规矩（输入框是唯一的准）。整行与整列共用一条纵轴。
+  ok('自动范围：按数据铺满并写回输入框（1~5 留余量 → 0~7）',
+     Number(read("$('prof-ymin').value")) === 0 && Number(read("$('prof-ymax').value")) === 7,
+     read("$('prof-ymin').value") + ' ~ ' + read("$('prof-ymax').value"));
+  run("$('prof-ymin').value = '0'; $('prof-ymax').value = '1022'; profPinned = true; applyProfRange();");
+  ok('钉住后：整行与整列用同一条纵轴（两张图才可比）',
+     read('JSON.stringify(profCharts.preview.h.scales.y)') === '{"min":0,"max":1022}' &&
+     read('JSON.stringify(profCharts.preview.v.scales.y)') === '{"min":0,"max":1022}',
+     read('JSON.stringify(profCharts.preview.h.scales.y)'));
+  ok('大图弹窗那两张也认同一个刻度',
+     read('JSON.stringify(profCharts.lightbox.h.scales.y)') === '{"min":0,"max":1022}',
+     read('JSON.stringify(profCharts.lightbox.h.scales.y)'));
+  run('profApply("preview", ' + JSON.stringify(profPayload) + ')');
+  ok('再取一段也不会被自动铺满顶掉', 
+     read('JSON.stringify(profCharts.preview.h.scales.y)') === '{"min":0,"max":1022}');
+  run("$('prof-ymin').value = '900'; $('prof-ymax').value = '100'; applyProfRange();");
+  ok('范围填反了就不套用（留着上一次的范围）',
+     read('JSON.stringify(profCharts.preview.h.scales.y)') === '{"min":0,"max":1022}',
+     read('JSON.stringify(profCharts.preview.h.scales.y)'));
+  run("$('btn-prof-fit').onclick()");
+  ok('点「自动范围」恢复按数据铺满',
+     read('JSON.stringify(profCharts.preview.h.scales.y)') === '{"min":0,"max":7}',
+     read('JSON.stringify(profCharts.preview.h.scales.y)'));
+
   run('profClear("preview")');
   ok('清掉之后切线收起、数据清空、提示复位',
      read("$('ccd-cut').hidden") === true &&
@@ -857,7 +881,7 @@ const count = (m) => calls.filter((c) => c === m).length;
   driveScan(42, 'done'); await tick(); await tick();
   const rows42 = read("$('points').tBodies[0].children.map(function(r){return r.innerHTML;})");
   const firstRow = rows42[0] || '';
-  ok('每行 8 个格子', (rows42.join('').match(/<td/g) || []).length === 24,
+  ok('每行 9 个格子（含曝光）', (rows42.join('').match(/<td/g) || []).length === 27,
      (rows42.join('').match(/<td/g) || []).length + ' 个');
   ok('第一行没有「上一点」，间距写「—」',
      firstRow.split('</td>')[3].indexOf('—') >= 0, JSON.stringify(firstRow.split('</td>')[3]));
@@ -868,7 +892,139 @@ const count = (m) => calls.filter((c) => c === m).length;
   for (let i = 0; i < 2001; i++) many.push({ idx: i, target_um: i, actual_um: i, on_target: 1, settled_ms: 1, image_path: null });
   run('renderPoints(' + JSON.stringify(many) + ')');
   const cut = read("$('points').tBodies[0].children[2000].innerHTML");
-  ok('截断行的 colspan = 8（与列数一致）', cut.indexOf('colspan="8"') >= 0, JSON.stringify(cut.slice(0, 60)));
+  ok('截断行的 colspan = 9（与列数一致）', cut.indexOf('colspan="9"') >= 0, JSON.stringify(cut.slice(0, 60)));
+  console.log('\n[T] 数据处理页：指定像素在各扫描点上的值（只读盘上的数据）');
+  run('dataChart = null; dataScans = []; dataSeq = 0;');
+  const dataScanRow = (id) => ({
+    id, name: '', start_um: 0, stop_um: 10, count: 5, done: 5, status: 'done',
+    created_at: 1790240166, message: '',
+  });
+  // 一条 5 点、其中第 3 点没图的序列：位置是**读出位置**（不是序号）
+  const pixelBody = (id) => ({
+    scan_id: id, name: '', status: 'done', count: 5,
+    x: 700, y: 540, width: 1440, height: 1080, bits: 16, full_scale: 1022, missing: 1,
+    idx: [0, 1, 2, 3, 4],
+    position_um: [5.0413, 5.4481, 5.9526, 6.3236, 6.8],
+    value: [122, 107, null, 105, 113],
+  });
+  const dataRoute = (m, u) => {
+    if (u === '/api/scans') return { body: [dataScanRow(52), dataScanRow(51)] };
+    const px = u.match(/^\/api\/scans\/(\d+)\/pixel/);
+    if (px) return { body: pixelBody(Number(px[1])) };
+    return { body: [] };
+  };
+
+  calls.length = 0; route = dataRoute;
+  run("showView('data')");
+  await tick(); await tick();
+  ok('切到数据页：只有数据页可见',
+     read("$('view-data').hidden") === false && read("$('view-align').hidden") === true &&
+     read("$('view-scan').hidden") === true && read("$('view-ccd').hidden") === true);
+  ok('数据页标签高亮、hash 记下来（刷新还在这一页）',
+     read("$('tab-data').className") === 'tab active' && read('location.hash') === 'data',
+     read("$('tab-data').className") + ' / ' + read('location.hash'));
+  ok('进页就问扫描列表', count('GET /api/scans') === 1, JSON.stringify(calls));
+  const opts = read("Array.prototype.map.call($('data-scan').children, function(o){return o.value + ':' + o.textContent;})");
+  ok('下拉框按后端给的顺序列出（最新在前）',
+     opts.length === 2 && opts[0].indexOf('52:') === 0 && opts[1].indexOf('51:') === 0,
+     JSON.stringify(opts));
+  ok('没选过就默认最新那条（#52）', read("$('data-scan').value") === '52',
+     read("$('data-scan').value"));
+  ok('这一页只读：发出去的全是 GET，没有一条控制/设备请求',
+     calls.length > 0 && calls.every((c) => c.indexOf('GET ') === 0), JSON.stringify(calls));
+
+  run("$('data-x').value = '700'; $('data-y').value = '540';");
+  calls.length = 0;
+  await run("$('btn-data-draw').onclick()"); await tick(); await tick();
+  ok('画曲线：把扫描 id 与像素坐标原样发给后端',
+     calls.indexOf('GET /api/scans/52/pixel?x=700&y=540') >= 0, JSON.stringify(calls));
+  ok('横轴是后端给的**读出位置**（不是序号）',
+     read('JSON.stringify(dataChart.data[0])') === JSON.stringify([5.0413, 5.4481, 5.9526, 6.3236, 6.8]),
+     read('JSON.stringify(dataChart.data[0])'));
+  ok('缺图的点是 null：线在那儿断开（不许拿邻点顶上）',
+     read('JSON.stringify(dataChart.data[1])') === JSON.stringify([122, 107, null, 105, 113]),
+     read('JSON.stringify(dataChart.data[1])'));
+  ok('统计：扫描点 / 有值 / 没图的点',
+     read("$('data-n').textContent") === '5' && read("$('data-ok').textContent") === '4' &&
+     read("$('data-missing').textContent") === '1',
+     [read("$('data-n').textContent"), read("$('data-ok').textContent"),
+      read("$('data-missing').textContent")].join(' / '));
+  ok('统计：位置跨度按读出位置算（6.8 − 5.0413 = 1.759）',
+     read("$('data-span').textContent") === '1.759', read("$('data-span').textContent"));
+  ok('统计：峰值 = 有值那些点里的最大值（122；缺图那点不参与）',
+     read("$('data-peak').textContent") === '122', read("$('data-peak').textContent"));
+  ok('幅面 / 位深 / 满量程照文件说（1440×1080 · 16 位 · 1022）',
+     read("$('data-size').textContent") === '1440×1080 · 16 位 · 1022',
+     read("$('data-size').textContent"));
+  ok('标题写明哪条扫描、哪个像素',
+     read("$('data-title').textContent").indexOf('#52') >= 0 &&
+     read("$('data-title').textContent").indexOf('(700, 540)') >= 0,
+     JSON.stringify(read("$('data-title').textContent")));
+  ok('有值就不显示空态提示', read("$('data-empty').hidden") === true);
+
+  // 换扫描：已经画过就得跟着重画（不然左边写 #51、图上还是 #52 那条）
+  calls.length = 0;
+  run("$('data-scan').value = '51'; $('data-scan').onchange()");
+  await tick(); await tick();
+  ok('换扫描自动重画，且问的是新那条',
+     calls.indexOf('GET /api/scans/51/pixel?x=700&y=540') >= 0 &&
+     read("$('data-title').textContent").indexOf('#51') >= 0,
+     JSON.stringify(calls) + ' / ' + read("$('data-title').textContent"));
+
+  // 输入校验：空框不能当成 0（Number('') === 0 会静默变成左上角那个像素）
+  calls.length = 0;
+  run("$('data-x').value = ''; $('data-y').value = '540';");
+  await run("$('btn-data-draw').onclick()"); await tick();
+  ok('空坐标不发请求、弹提示',
+     calls.length === 0 && read("$('toast').textContent").indexOf('非负整数') >= 0,
+     JSON.stringify(calls) + ' / ' + JSON.stringify(read("$('toast').textContent")));
+  run("$('data-x').value = '700.5';");
+  await run("$('btn-data-draw').onclick()"); await tick();
+  ok('小数不是像素坐标：不发请求', calls.length === 0, JSON.stringify(calls));
+  run("$('data-x').value = '-3';");
+  await run("$('btn-data-draw').onclick()"); await tick();
+  ok('负数不发请求', calls.length === 0, JSON.stringify(calls));
+
+  // 后端拒绝（点在图外）：照实弹后端的中文原因，标题不许停在"读图中…"
+  run("$('data-x').value = '9999';");
+  route = (m, u) => (u.indexOf('/pixel') > 0
+    ? { ok: false, status: 400, body: { detail: '点 (9999, 540) 超出画面 1440×1080' } }
+    : dataRoute(m, u));
+  await run("$('btn-data-draw').onclick()"); await tick(); await tick();
+  ok('越界时弹出后端的原因',
+     read("$('toast').textContent").indexOf('超出画面') >= 0,
+     JSON.stringify(read("$('toast').textContent")));
+  ok('失败后标题还原（不留"读图中…"）',
+     read("$('data-title').textContent").indexOf('#51') >= 0,
+     JSON.stringify(read("$('data-title').textContent")));
+  ok('失败不清掉上一次画出来的曲线',
+     read('JSON.stringify(dataChart.data[1])') === JSON.stringify([122, 107, null, 105, 113]),
+     read('JSON.stringify(dataChart.data[1])'));
+
+  // 整条扫描都没有帧（CCD 后端是 null，或图被删光）：如实说，不画一条空坐标系
+  run("$('data-x').value = '700';");
+  route = (m, u) => (u.indexOf('/pixel') > 0
+    ? { body: { scan_id: 7, name: '', status: 'done', count: 3, x: 700, y: 540,
+                width: null, height: null, bits: null, full_scale: null, missing: 3,
+                idx: [0, 1, 2], position_um: [1, 2, 3], value: [null, null, null] } }
+    : dataRoute(m, u));
+  await run("$('btn-data-draw').onclick()"); await tick(); await tick();
+  ok('没有帧时说清楚，而不是画成"像素全黑"',
+     read("$('data-empty').hidden") === false &&
+     read("$('data-empty').textContent").indexOf('没有可读的帧') >= 0,
+     JSON.stringify(read("$('data-empty').textContent")));
+  ok('幅面/位深没有就说没有（不猜一个 1440×1080 出来）',
+     read("$('data-size').textContent") === '—', read("$('data-size').textContent"));
+  ok('没有值就没有峰值（不是 0）', read("$('data-peak').textContent") === '—',
+     read("$('data-peak').textContent"));
+
+  // 刷新列表不许把用户挑好的那条换掉
+  route = dataRoute;
+  run("$('data-scan').value = '51'; loadDataScans()");
+  await tick(); await tick();
+  ok('刷新列表保留已选的那条', read("$('data-scan').value") === '51',
+     read("$('data-scan').value"));
+
   route = () => ({ body: [] });
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');
   process.exit(failed ? 1 : 0);

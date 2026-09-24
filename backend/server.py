@@ -14,6 +14,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -23,7 +24,13 @@ from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from . import store
@@ -247,12 +254,18 @@ def ccd_status() -> dict:
 
     if CCD_BACKEND != "thorlabs":
         return {"backend": CCD_BACKEND, "preview": False, "available": False,
+                "state": "off", "failure": "",
                 "message": f"CCD 后端是 {CCD_BACKEND}，没有真相机"}
     from .ccd import thorlabs_camera
 
-    st = thorlabs_camera().status()
+    cam = thorlabs_camera()
+    try:
+        st = cam.status()
+    except Exception as exc:                # noqa: BLE001
+        # **永远答得出来**：界面每个节拍都要它。给 500 只会让界面瞎猜 + 弹一串 toast。
+        st = {"state": "failed", "failure": f"{type(exc).__name__}: {exc}"}
     st["backend"] = CCD_BACKEND
-    st["available"] = True
+    st["available"] = True        # 后端在：能不能用看 state
     return st
 
 
@@ -516,6 +529,26 @@ async def ccd_exposure(
         raise HTTPException(503, str(exc)) from exc
 
 
+@app.post("/api/ccd/reopen")
+async def ccd_reopen() -> dict:
+    """重开相机：USB 接触不良 / 相机掉线之后，只有把旧句柄丢掉再开才能接回来。
+
+    **手动功能，不做自动重连**（用户定的）：什么时候重开由人决定。
+    扫描进行中一律 409（相机归扫描用），与其它相机接口同规矩。
+    """
+    _ccd_idle()
+    from .config import CCD_BACKEND
+
+    if CCD_BACKEND != "thorlabs":
+        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
+    from .ccd import thorlabs_camera
+
+    try:
+        return await asyncio.to_thread(thorlabs_camera().reopen)
+    except Exception as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
 @app.post("/api/ccd/rotation")
 async def ccd_rotation(
     deg: int = Query(..., description="预览显示朝向，顺时针 0/90/180/270；**只转预览，不动保存的文件**"),
@@ -571,12 +604,22 @@ async def ccd_capture() -> dict:
 
 @app.get("/api/ccd/preview.jpg")
 def ccd_preview_jpg() -> Response:
-    """最近一帧预览。不排队等设备：没帧就 204，前端继续按自己的节奏拉。"""
+    """最近一帧预览。不排队等设备；还没出帧就给 204，前端继续按自己的节奏拉。
+
+    **相机掉线时必须报错**，不能把上一帧接着发出去：那样界面会一直显示最后那张图、
+    看着像活着，人就以为「重开没用」（实测就是这么被骗的）。掉线给 503，
+    前端的取帧失败计数接住它，提示与「重开相机」按钮就在旁边。
+    """
     from .ccd import thorlabs_camera
 
-    jpeg = thorlabs_camera().latest_jpeg()
+    cam = thorlabs_camera()
+    st = cam.status()
+    jpeg = cam.latest_jpeg()
     if jpeg is None:
-        return Response(status_code=204)
+        if st.get("state") == "failed":
+            # 会话没了（掉线/出错）：**必须报错**，不能拿上一帧冒充实时画面
+            raise HTTPException(503, f"相机不可用：{st.get('failure')}；点「重开相机」重新连接")
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
     return Response(
         content=jpeg, media_type="image/jpeg",
         headers={"Cache-Control": "no-store"},
@@ -690,21 +733,10 @@ def api_estop() -> dict:
 # ------------------------------------------------------------------ 扫描
 @app.post("/api/scans")
 async def api_scan_start(req: ScanRequest) -> dict:
-    """开始扫描前**由后端自己**把相机预览关掉。
+    """开始扫描。相机互斥由设备层保证（见下面那行注释），不靠界面先点一下。"""
 
-    互斥是后端的规定，不能靠界面先点一下"停预览"：界面可能根本不知道后端还在取帧
-    （刷新过、或另一个标签页开过预览），那样扫描就会和预览抢同一台相机。
-    关预览和之后的采图都排进相机自己的 owner 线程，顺序天然有保证。
-    """
-    from .config import CCD_BACKEND
-
-    if CCD_BACKEND == "thorlabs":
-        from .ccd import thorlabs_camera
-
-        try:
-            await asyncio.to_thread(thorlabs_camera().preview, False)
-        except Exception as exc:
-            log.warning("开始扫描前关预览失败（不影响扫描）：%s", exc)
+    # 相机与位移台互斥：**不用在这里手动关预览** —— 扫描器一开始就跑
+    # capture.begin() → begin_scan()，设备层会把取帧停下、会话留给扫描（状态变 held）。
     return scanner.start(req)
 
 
@@ -727,6 +759,43 @@ def api_scan_detail(scan_id: int) -> dict:
     return scan
 
 
+@app.get("/api/scans/{scan_id}/pixel")
+def api_scan_pixel(
+    scan_id: int,
+    x: int = Query(..., ge=0, description="像素列（保存的 PNG 自己的坐标，传感器朝向）"),
+    y: int = Query(..., ge=0, description="像素行"),
+) -> dict:
+    """一条扫描里、**每个扫描点上同一个像素**的值 —— 数据处理页那条曲线的取数口子。
+
+    数据全部来自各点**已经落盘的 PNG**：不是重采、不碰设备、不占设备带宽（只是读文件）。
+    position_um 是**采图那一刻记下来的读出位置**（point.actual_um），曲线的横轴就是它 ——
+    命令值只说明"想让台子去哪"，这里的每一个点都是"当时读数是多少"。
+    没图的点给 null，**不补值、不插值**：曲线在那里断开。
+    """
+    from .thorlabs_ccd import png_pixel_series
+
+    scan = store.get_scan(scan_id)
+    if scan is None:
+        raise HTTPException(404, "扫描不存在")
+    points = store.get_points(scan_id)
+    items = [
+        (p["idx"], p["actual_um"],
+         (DATA_DIR / p["image_path"]) if p["image_path"] else None)
+        for p in points
+    ]
+    try:
+        series = png_pixel_series(items, x, y)
+    except ValueError as exc:                 # 点落在画面外：这是坐标填错了，说清楚
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "scan_id": scan_id,
+        "name": scan["name"],
+        "status": scan["status"],
+        "count": len(points),
+        **series,
+    }
+
+
 @app.delete("/api/scans/{scan_id}")
 def api_scan_delete(scan_id: int) -> dict:
     if scanner.state()["scan_id"] == scan_id and scanner.state()["status"] in (
@@ -739,13 +808,47 @@ def api_scan_delete(scan_id: int) -> dict:
 
 
 # ------------------------------------------------------------------ 静态页面
+# 前端是**零构建**的：改了 app.js，浏览器必须立刻拿到新的。Starlette 的文件响应只给
+# ETag/Last-Modified、不带 Cache-Control —— 浏览器于是按「启发式新鲜度」（约 Last-Modified
+# 到现在的 10%）直接吃缓存：等于改了前端却在浏览器里看不到（实测：新按钮点下去连请求都
+# 没发出去，因为手里还是旧的 app.js）。这几个是自家文件，一律要求回源校验 —— ETag 在，
+# 回源就是一次 304；vendor 里的大件（uPlot）保持默认可缓存。
+def _own_asset(path: str) -> bool:
+    """是不是「我们自己会改的文件」。用规则不用白名单：漏一个文件就再踩一次
+    （而且白名单里写 /index.html 是死配置 —— 那条路由根本不存在）。vendor 里的大件
+    （uPlot）不算自家文件，保持默认可缓存。"""
+    return path == "/" or (path.startswith("/static/") and "/vendor/" not in path)
+
+
+@app.middleware("http")
+async def no_cache_for_own_assets(request: Request, call_next):
+    response = await call_next(request)
+    if _own_asset(request.url.path):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+def index() -> HTMLResponse:
+    """首页。给自家 JS/CSS 的 URL 带上文件 mtime（index.html 里写的是 ?v=dev）。
+
+    零构建的前端改了文件就必须让浏览器拿到新的，光靠 Cache-Control 不够：已经缓存过旧文件
+    的浏览器会按启发式新鲜度继续用旧的、连问都不问（实测反复踩：页面刷新了、HTML 也回源了，
+    app.js 却还是旧的，于是新按钮点下去连请求都没有）。HTML 每次都回源，所以在这里换成带
+    版本号的 URL 最稳 —— 文件一动，URL 就变。
+    """
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    for name in ("app.js", "style.css"):
+        stamp = int((STATIC_DIR / name).stat().st_mtime)
+        html, n = re.subn(re.escape(f"/static/{name}?v=dev"), f"/static/{name}?v={stamp}", html)
+        if not n:
+            # 占位符被改掉/删掉就会静默失效（浏览器又吃旧 JS）——所以这里必须吵一句
+            log.error("index.html 里没有 /static/%s?v=dev 占位符：版本化 URL 没生效", name)
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":

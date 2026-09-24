@@ -21,7 +21,7 @@
       溢出的 6629px 内容全部落在 .body 自己的滚动条里；真页面上量到的是
       点位表 548px、历史表 1659px 这两处，同样只在各自区域内滚。
 
-   三页的栏位与分类见 index.html 的注释。颜色与控件沿用原来的 token。
+   各页的栏位与分类见 index.html 的注释。颜色与控件沿用原来的 token。
    ===================================================================== */
 :root {
   --bg: #f1f5f9;
@@ -110,6 +110,12 @@ main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
 }
 .view-ccd {
   grid-template-columns: minmax(0, 1fr) 0 var(--col-prof, 320px) 0 var(--col-gal, 360px);
+  column-gap: 6px;
+}
+/* 数据页：左＝取数（选扫描、填像素），右＝曲线。跟设备那三页同一套栏规矩 ——
+   左栏定宽（表单不左右晃），右栏吃掉剩余。 */
+.view-data {
+  grid-template-columns: var(--col-data, 320px) 0 minmax(0, 1fr);
   column-gap: 6px;
 }
 
@@ -202,12 +208,12 @@ main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
 /* ---------- 控件 ---------- */
 label { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 12px; }
 .body > label:first-child { margin-top: 0; }
-input {
+input, select {
   display: block; width: 100%; padding: 6px 9px; font: inherit; color: var(--text);
   background: #fff; border: 1px solid var(--line); border-radius: 6px;
 }
-input:focus { outline: 2px solid #bfdbfe; border-color: #93c5fd; }
-input:disabled { background: #f8fafc; color: var(--muted); }
+input:focus, select:focus { outline: 2px solid #bfdbfe; border-color: #93c5fd; }
+input:disabled, select:disabled { background: #f8fafc; color: var(--muted); }
 button {
   padding: 6px 12px; font: inherit; color: var(--text); cursor: pointer;
   white-space: nowrap;                       /* 按钮文字不折行：「移动到」不许断成两行 */
@@ -228,6 +234,8 @@ button.ghost { padding: 2px 9px; font-size: 12px; color: var(--muted); }
 .row > input { flex: 1 1 auto; }        /* 输入框吃掉剩余宽度，按钮不折行 */
 .row.tight button { flex: 1 1 auto; padding: 6px 4px; }
 .row.top { margin-top: 12px; }
+.row.gap-bottom { margin-bottom: 8px; }
+.form2.gap-bottom { margin-bottom: 8px; }
 .row .grow1 { flex: 1 1 auto; }         /* 独占一行的主按钮 */
 
 .form2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; margin-top: 4px; }
@@ -417,6 +425,7 @@ td.bad { color: var(--bad); }
   .view-ccd .col-prof { grid-column: 2; grid-row: 1 / 3; }
   .view-ccd .col-gallery { grid-column: 1; grid-row: 2; }
   .view-align { grid-template-columns: 330px minmax(0, 1fr); column-gap: var(--gap); }
+  .view-data { grid-template-columns: 280px minmax(0, 1fr); column-gap: var(--gap); }
   .view-scan {
     grid-template-columns: 310px minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) 0 var(--hist, 240px);
