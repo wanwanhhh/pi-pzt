@@ -60,6 +60,11 @@ class Caps:
     has_velocity: bool        # 是否有速度设定指令（没有就必须明确拒绝，不能假装接受）
     unit: str                 # 设备原生单位；对外统一折算成 µm
     default_settle_ms: int    # 界面「稳定延时」的默认值（PI：到位后的延时；XMT：唯一的等待）
+    # **位置读回的口径**：µm = 读回值 × 这个系数。PI 报的就是 µm（1.0）；
+    # XMT 的读回是 4/3 µm（0.75，实测出来的，见 docs/xmt/设备认识账.xml A2/E1）。
+    # 记进每条扫描（scan.readback_to_um）：数据页要能把这串位置**按原值**再看一遍，
+    # 而"原值"只能从当时那台设备的系数反推 —— 设备换了以后也得算得对。
+    readback_to_um: float
 
 
 class StopResult(Enum):

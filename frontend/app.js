@@ -89,7 +89,9 @@ function showView(v) {
   // 数据页只读：进页时刷一次扫描列表（新跑完的扫描要能选到），再把曲线按卡片尺寸重排
   if (view === 'data') {
     loadDataScans();
+    loadDataSources();     // 「这条是哪台设备采的」的选项（系数只在后端，前端只拿键与文案）
     fitChart(dataChart, 'data-chart', 240);
+    fitChart(specChart, 'spec-chart', 180);
   }
   location.hash = v;   // 刷新、或者开两个标签各停一页，都靠它
 }
@@ -134,6 +136,31 @@ function detailText(data, status) {
 function get(p) { return request('GET', p); }
 function post(p, b) { return request('POST', p, b); }
 
+/* ==================== 轮询 ====================
+   一个定时器 + 一条规矩：**不许重复启动**。重复启动会丢掉旧句柄 —— 之后 stop 只停得掉一个，
+   另一个还在后台跑；五处循环从前各写一遍这三句（判空、setInterval、clearInterval），
+   写法还各不相同（有的先跑一次再定时、有的只定时、有的靠外面的状态变量兜）。
+
+   顺序是**先定时、再立刻跑一次**：立刻那一次是异步的，里面可能顺着状态机把轮询停掉
+   （比如取数被拒就收工）—— 先定时才停得掉；反过来会留下一个没人管的定时器。
+   */
+function poller(fn, ms) {
+  let timer = null;
+  return {
+    running: function () { return timer !== null; },
+    start: function () {
+      if (timer !== null) return;          // 已经在跑：什么都不做（状态刷新会反复调进来）
+      timer = setInterval(fn, ms);
+      fn();
+    },
+    stop: function () {
+      if (timer === null) return;
+      clearInterval(timer);
+      timer = null;
+    },
+  };
+}
+
 /* ==================== 状态 ==================== */
 
 const SCAN_HINT = '单向逼近：从起点到终点单调推进，每点从同一侧逼近；起点前会先退让一段再逼近首点。';
@@ -163,9 +190,7 @@ let traceFrom = 0;         // 本次记录锚定的服务器时刻（X 轴零点
 let traceSecs = 10;        // 本次记录时长
 let traceStartedAt = 0;    // 本地墙钟（只用于界面上的进度与收工）
 let traceUntil = 0;
-let traceTimer = null;     // 记录中的取数定时器
 let traceActive = false;
-let tracePinned = false;   // 手填过范围就不再自动铺满
 let lastServerTs = null;   // 最近一帧遥测的服务器时刻（记录锚点）
 
 function deviceReady() {
@@ -173,6 +198,11 @@ function deviceReady() {
 }
 
 /* ==================== SSE ==================== */
+
+const linkPoll = poller(pollLink, 1000);   // 链路指示灯（只报"界面这头还收得到 SSE 吗"）
+const beat = poller(function () {
+  fetch('/api/heartbeat', { method: 'POST' }).catch(function () {});
+}, 2000);
 
 function pollLink() {
   const ok = Date.now() - lastMsgAt < 3000;
@@ -411,7 +441,7 @@ function renderPoints(points) {
       // （假相机的占位图是 8 位，所以以前看不出问题）。data-full 让点击能进同一套大图。
       '<td>' + (p.image_path
         ? '<img class="thumb" loading="lazy" alt="" data-full="' + esc(p.image_path) +
-          '" src="/api/grabs/thumb?path=' + encodeURIComponent(p.image_path) + '">'
+          '" src="' + thumbUrl(p.image_path) + '">'
         : '—') + '</td>';
     frag.appendChild(tr);
   }
@@ -464,6 +494,153 @@ function showPointsBelow(max) {
   return function (u) { return u.data[0].length <= max; };
 }
 
+/* ==================== 范围框（三张图共用一套） ====================
+   一张图的「坐标范围」= 两个输入框 + 一个钉住标记 + 一个「自动范围」按钮。
+   位置曲线、剖面、像素曲线用的是同一套规矩，所以只有这一份实现：
+   **输入框是唯一的准** —— 没被手填过（也没被手势改过）就按当前数据铺满，改过一次就不再自动铺满，
+   点「自动范围」松钉恢复。铺满的边距、写回的小数位都由这里一处说了算。
+
+   钉住是**每个轴各自的**：位置曲线的 X 与 Y 是两个框，填了 Y 不会把 X 一起钉住
+   （从前两个轴共用一个标记，填一个数两个轴就都不再铺满了）。
+
+   opt:
+     min / max  两个输入框的 id
+     decimals   写回框里的小数位（手势缩放能到多细就是它）
+     pin        「范围已钉住」那个角标（两个轴共用一个角标时留空，由 onApply 自己写）
+     fit        「自动范围」按钮的 id（可选；给 `unpin` 用）
+     fitValues  () => [lo, hi] | null   按当前数据铺满；null = 还没数据，别动框
+     onApply    (win, pinned) => void   把窗口套到图上（win = [lo, hi] 或 null）
+   */
+function rangeBox(opt) {
+  const b = {
+    pinned: false,
+    decimals: opt.decimals === undefined ? 3 : opt.decimals,
+
+    /* 现在框里那个窗口。填反或只填一半 = 没有窗口：不套用（那样画出来是空图），框留着等人改完 */
+    window: function () {
+      const lo = parseFloat($(opt.min).value), hi = parseFloat($(opt.max).value);
+      return lo < hi ? [lo, hi] : null;
+    },
+
+    /* 写进框里并钉住：手填、滚轮、拖动、换读法换算，最后都走到这里 */
+    set: function (lo, hi) {
+      $(opt.min).value = lo.toFixed(b.decimals);
+      $(opt.max).value = hi.toFixed(b.decimals);
+      b.pinned = true;
+      b.apply();
+    },
+
+    /* 套到图上：没钉住就先按当前数据铺满（没有数据就只套框里现有的数） */
+    apply: function () {
+      if (opt.pin) $(opt.pin).hidden = !b.pinned;
+      if (!b.pinned && opt.fitValues) {
+        const r = opt.fitValues();
+        if (r) {
+          $(opt.min).value = r[0].toFixed(b.decimals);
+          $(opt.max).value = r[1].toFixed(b.decimals);
+        }
+      }
+      opt.onApply(b.window(), b.pinned);
+    },
+
+    /* 「自动范围」：松钉 + 重新按数据铺满 */
+    unpin: function () { b.pinned = false; b.apply(); },
+
+    /* 接线：手填 = 钉住（框是唯一的准）；「自动范围」= 松钉 */
+    wire: function () {
+      if (opt.fit) $(opt.fit).onclick = b.unpin;
+      [opt.min, opt.max].forEach(function (id) {
+        $(id).oninput = function () { b.pinned = true; b.apply(); };
+      });
+      return b;
+    },
+
+    /* 滚轮缩放 + 按住拖动平移。两条手势**只改范围框里的数**（框仍然是唯一的准），
+       改完照旧走 apply() —— 直接改图的话，下一次重画（换扫描、换读法）就被顶回去了。
+       挂的是 uPlot 的 .u-over，**每建一次图都要重挂**：重建会把旧元素整个丢掉。 */
+    attach: function (chart, axis) {
+      const over = chart.over;
+      /* 向上滚（deltaY < 0）= 放大。因子按 deltaY 的**大小**算，不是"一格一个固定倍数"：
+         鼠标滚轮一格约 100（≈1.16 倍），触控板一次只有几 —— 一格一档在触控板上快得没法用。
+         Firefox 的行模式（deltaMode=1）折成像素。 */
+      over.addEventListener('wheel', function (ev) {
+        const win = b.window();
+        if (!win) return;                    // 没有窗口：不拦页面滚动
+        ev.preventDefault();                 // 监听是 passive:false 挂的，这里才拦得住页面跟着滚
+        const box = over.getBoundingClientRect();
+        const anchor = chart.posToVal(ev.clientX - box.left, axis);
+        const k = Math.pow(1.0015, ev.deltaY * (ev.deltaMode === 1 ? 16 : 1));
+        const next = zoomRange(win[0], win[1], k, anchor);
+        b.set(next[0], next[1]);
+      }, { passive: false });
+
+      /* 按住拖动平移视窗。位移按**一个像素多少值**换算（拖动开始时量一次），
+         不拿 posToVal 边拖边问 —— 比例随窗口变，那样拖久了窗口会自己变宽变窄。 */
+      over.addEventListener('pointerdown', function (ev) {
+        if (ev.button !== 0) return;         // 只认左键，右键留给浏览器菜单
+        const win = b.window();
+        if (!win) return;
+        ev.preventDefault();                 // 挡掉拖动时选中文字
+        const box = over.getBoundingClientRect();
+        const vpp = (win[1] - win[0]) / Math.max(1, box.width);
+        const from = win, startX = ev.clientX;
+        over.classList.add('pan');
+        if (over.setPointerCapture) over.setPointerCapture(ev.pointerId);
+        const move = function (e) {
+          // 手往右拖 = 把曲线往右拉 = 看更小的值（跟拖地图一个方向），所以位移取负
+          const next = shiftRange(from[0], from[1], -(e.clientX - startX) * vpp);
+          b.set(next[0], next[1]);
+        };
+        const up = function () {
+          over.classList.remove('pan');
+          over.removeEventListener('pointermove', move);
+          over.removeEventListener('pointerup', up);
+          over.removeEventListener('pointercancel', up);
+        };
+        over.addEventListener('pointermove', move);
+        over.addEventListener('pointerup', up);
+        over.addEventListener('pointercancel', up);   // 触屏被系统打断时同样收尾
+      });
+    },
+  };
+  return b;
+}
+
+/* ==================== 建图（四张图共用一套壳子） ====================
+   点位图、位置曲线、剖面（两张）、像素曲线：**壳子是同一套** —— 宽高按卡片量、图例留着、
+   坐标轴配色一致、卡片尺寸变了跟着重排，各图只有 series 与回退高度不同。
+   **拖拽缩放默认关掉**（boxed）：uPlot 自带的拖拽直接改 scales，而范围框才是唯一的准
+   （见 rangeBox：手势改的是框里的数，改完再套回图上）。点位图没有范围框，那里单独放行。
+
+   尺寸观察者按 id **只挂一个**：换横轴读法会把图 destroy 重建，但元素还是同一个 ——
+   每重建一次就挂一个的话，旧观察者会一直对着已经不存在的图重排（图就再也不会自己长回来）。
+   opt: { xlabel, series（series[1..] 原样给）, yaxis?, height?, data?, drag? }
+   */
+const chartSlots = {};        // id → {u, h, obs}；u 每次都换，obs 只挂一次
+function makeChart(id, opt) {
+  const h = opt.height || 220;
+  const slot = chartSlots[id] || (chartSlots[id] = { u: null, h: h, obs: null });
+  slot.h = h;
+  const cfg = {
+    width: chartWidth($(id)),
+    height: chartHeight($(id), h),   // 建图时的高度；随后 fitChart 按卡片实际尺寸校正
+    scales: { x: { time: false } },
+    legend: { show: true },
+    series: [{ label: opt.xlabel }].concat(opt.series),
+    axes: [
+      { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
+      Object.assign({ stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
+                    opt.yaxis)
+    ]
+  };
+  if (!opt.drag) cfg.cursor = { drag: { x: false, y: false } };
+  slot.u = new uPlot(cfg, opt.data || [[], []], $(id));
+  if (!slot.obs) {
+    slot.obs = new ResizeObserver(function () { fitChart(slot.u, id, slot.h); });
+    slot.obs.observe($(id));
+  }
+  return slot.u;
+}
 function renderChart(points) {
   const xs = [], ys = [];
   for (let i = 0; i < points.length; i++) {
@@ -476,22 +653,13 @@ function renderChart(points) {
 
   if (!chart) {
     if (!points.length) return;
-    chart = new uPlot({
-      width: chartWidth($('chart')),
-      height: chartHeight($('chart'), 220),   // 建图时的高度；随后 fitChart 按卡片实际尺寸校正
-      scales: { x: { time: false } },
-      legend: { show: true },
-      series: [
-        { label: '序号' },
-        { label: '偏差 (nm)', stroke: '#2563eb', width: 1.5,
-          points: { show: showPointsBelow(200), size: 5 } }
-      ],
-      axes: [
-        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
-        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } }
-      ]
-    }, data, $('chart'));
-    new ResizeObserver(function () { fitChart(chart, 'chart', 220); }).observe($('chart'));
+    chart = makeChart('chart', {
+      xlabel: '序号',
+      series: [{ label: '偏差 (nm)', stroke: '#2563eb', width: 1.5,
+                 points: { show: showPointsBelow(200), size: 5 } }],
+      data: data,
+      drag: true,        // 点位图没有范围框：uPlot 自带的拖拽缩放留着（别处一律关掉）
+    });
   } else {
     chart.setData(data);
   }
@@ -504,6 +672,7 @@ function renderChart(points) {
 const TRACE_POLL_MS = 200;     // 记录中的取数间隔：后端按 10 Hz 攒样本，取再快也没有新点
 const TRACE_POINT_MAX = 300;   // 点比这多就只画线不画点
 const TRACE_PROBE_SECS = 10;   // 还没收到遥测帧时，探测服务器时间用的窗口
+const tracePoll = poller(traceTick, TRACE_POLL_MS);   // 记录中的取数节拍（traceTick 是函数声明，提升到位）
 
 /* 位置在 20 µm 上下抖几十 nm：小数位不够就看不出变化，按刻度间隔定小数位 */
 function traceAxisVals(u, splits) {
@@ -523,25 +692,12 @@ function traceAxisSize(u, values) {
 }
 
 function traceBuild() {
-  traceChart = new uPlot({
-    width: chartWidth($('trace')),
-    height: chartHeight($('trace'), 220),   // 建图时的高度；随后 fitChart 按卡片实际尺寸校正
-    scales: { x: { time: false } },
-    legend: { show: true },
-    // 拖拽缩放和"四个输入框是唯一的准"直接冲突：拖完图变了、输入框没变，下次取数又被丢掉
-    cursor: { drag: { x: false, y: false } },
-    series: [
-      { label: '时间 (s)' },
-      { label: '位置 (µm)', stroke: '#2563eb', width: 1.5,
-        points: { show: showPointsBelow(TRACE_POINT_MAX), size: 4 } }
-    ],
-    axes: [
-      { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
-      { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' },
-        values: traceAxisVals, size: traceAxisSize }
-    ]
-  }, [[], []], $('trace'));
-  new ResizeObserver(function () { fitChart(traceChart, 'trace', 220); }).observe($('trace'));
+  traceChart = makeChart('trace', {
+    xlabel: '时间 (s)',
+    series: [{ label: '位置 (µm)', stroke: '#2563eb', width: 1.5,
+               points: { show: showPointsBelow(TRACE_POINT_MAX), size: 4 } }],
+    yaxis: { values: traceAxisVals, size: traceAxisSize },
+  });
 }
 
 function renderTrace() {
@@ -556,35 +712,44 @@ function renderTrace() {
   applyTraceRange();
 }
 
-/* 坐标范围：四个输入框是唯一的准；没被手填过就先按数据铺满 */
-function applyTraceRange() {
-  // 钉住是个状态，得看得见 —— 顺手也是"范围为什么不动了"的说明
-  $('trace-pin').hidden = !tracePinned;
+/* 位置曲线的范围：X（秒）与 Y（µm）**各是一个范围框**，规矩同一套（见 rangeBox）。
+   共用一个「范围已钉住」角标 —— 有两个轴，钉住哪个它都该亮。 */
+function traceScales() {
+  $('trace-pin').hidden = !(traceX.pinned || traceY.pinned);
   if (!traceChart) return;
-  if (!tracePinned) fitTraceRange();
-  const x0 = parseFloat($('trace-xmin').value), x1 = parseFloat($('trace-xmax').value);
-  const y0 = parseFloat($('trace-ymin').value), y1 = parseFloat($('trace-ymax').value);
-  // 反向或只填了一半就先不套用（画出来是空图），输入框原样留着等人改完
-  if (x0 < x1) traceChart.setScale('x', { min: x0, max: x1 });
-  if (y0 < y1) traceChart.setScale('y', { min: y0, max: y1 });
+  const wx = traceX.window();
+  if (wx) traceChart.setScale('x', { min: wx[0], max: wx[1] });
+  const wy = traceY.window();
+  if (wy) traceChart.setScale('y', { min: wy[0], max: wy[1] });
 }
 
-function fitTraceRange() {
-  const w = traceLast;
-  if (!w || !w.ts.length) return;      // 还没有数据就别去动输入框
-  const n = w.ts.length;
-  let lo = w.position[0], hi = w.position[0];
-  for (let i = 1; i < n; i++) {
-    if (w.position[i] < lo) lo = w.position[i];
-    if (w.position[i] > hi) hi = w.position[i];
-  }
-  const pad = (hi - lo) * 0.05 || 0.0005;   // 一点起伏都没有时给 1 nm 的窗，别退化成一条线
-  $('trace-ymin').value = (lo - pad).toFixed(4);
-  $('trace-ymax').value = (hi + pad).toFixed(4);
-  const span = w.ts[n - 1] - traceFrom;
-  $('trace-xmin').value = '0';
-  $('trace-xmax').value = (span > 0 ? span : traceSecs).toFixed(3);
-}
+const traceX = rangeBox({
+  min: 'trace-xmin', max: 'trace-xmax', decimals: 3, onApply: traceScales,
+  fitValues: function () {
+    const w = traceLast;
+    if (!w || !w.ts.length) return null;        // 还没有数据就别去动输入框
+    const span = w.ts[w.ts.length - 1] - traceFrom;
+    return [0, span > 0 ? span : traceSecs];
+  },
+}).wire();
+
+const traceY = rangeBox({
+  min: 'trace-ymin', max: 'trace-ymax', decimals: 4, onApply: traceScales,
+  fitValues: function () {
+    const w = traceLast;
+    if (!w || !w.position.length) return null;
+    let lo = w.position[0], hi = w.position[0];
+    for (let i = 1; i < w.position.length; i++) {
+      if (w.position[i] < lo) lo = w.position[i];
+      if (w.position[i] > hi) hi = w.position[i];
+    }
+    const pad = (hi - lo) * 0.05 || 0.0005;     // 一点起伏都没有时给 1 nm 的窗，别退化成一条线
+    return [lo - pad, hi + pad];
+  },
+}).wire();
+
+/* 数据换了就重套一次：没钉住的那个轴跟着铺满，钉住的保持不动 */
+function applyTraceRange() { traceX.apply(); traceY.apply(); }
 
 function renderTraceStats() {
   const w = traceLast, pos = w ? w.position : [], n = pos.length;
@@ -699,8 +864,7 @@ async function traceStart() {
   renderTrace();
   renderTraceStats();
   syncTraceUI();
-  traceTimer = setInterval(traceTick, TRACE_POLL_MS);
-  traceTick();                                     // 立刻出一帧，别等第一个间隔
+  tracePoll.start();        // 先定时再立刻出一帧（见 poller：顺序反了会留下没人管的定时器）
 }
 
 async function traceTick() {
@@ -722,7 +886,7 @@ async function traceStop(skipFetch) {
   if (!traceActive) return;
   const r = skipFetch ? null : await get(traceUrl());
   traceActive = false;
-  if (traceTimer !== null) { clearInterval(traceTimer); traceTimer = null; }
+  tracePoll.stop();
   if (r) { traceLast = r; renderTrace(); renderTraceStats(); }
   syncTraceUI();
 }
@@ -734,6 +898,7 @@ async function traceStop(skipFetch) {
    **界面不做任何处理**：后端给的就是原始灰度，不拉伸、不伪彩。 */
 const CCD_LIVE_MS = 100;      // 取帧节拍 10 fps（比后端 15 fps 慢一点，多出来的请求拿同一张）
 const CCD_POLL_EVERY = 5;     // 每 5 拍才问一次状态（2 Hz）——状态是内存快照，没必要每帧都问
+const ccdPoll = poller(ccdTick, CCD_LIVE_MS);   // 取帧节拍（只由 state 决定，见 syncCcdTimer）
 // 「正在打开…」提示里写的等待上限：后端建会话时最多等这么久（config.TL_OPEN_WAIT_S）。
 // 这里只是文案用的数字，不参与任何判断 —— 真正的超时在后端。
 const CCD_OPEN_WAIT_S = 8;
@@ -743,7 +908,6 @@ let ccdInfo = null;
 // **界面不持有意图**：「要不要预览」是后端的状态（state === 'preview'），这里只是镜像它。
 // 旧代码在前端又存了一份 ccdWanted，于是「谁说了算」有两个答案 —— 掉线后就对不上。
 let ccdLive = false;
-let ccdTimer = null;
 let ccdTicks = 0;
 let ccdFails = 0;
 let ccdLoadedAt = 0;
@@ -928,15 +1092,13 @@ function ccdTick() {
 }
 
 function syncCcdTimer() {
-  // 取帧计时器只由 state 决定：是 preview 就取帧，别的状态一律停（不再有两份真相）
-  if (ccdLive && ccdTimer === null) {
-    ccdTicks = 0;
-    ccdTick();
-    ccdTimer = setInterval(ccdTick, CCD_LIVE_MS);
-  } else if (!ccdLive && ccdTimer !== null) {
-    clearInterval(ccdTimer);
-    ccdTimer = null;
-  }
+  // 取帧计时器只由 state 决定：是 preview 就取帧，别的状态一律停（不再有两份真相）。
+  // ccdTicks 是"每 5 拍问一次状态"的计数器，**只在真的开起来那一次清零** ——
+  // 每来一次状态刷新都清的话，那个 5 永远数不到，状态就再也不问了。
+  if (!ccdLive) { ccdPoll.stop(); return; }
+  if (ccdPoll.running()) return;
+  ccdTicks = 0;
+  ccdPoll.start();
 }
 
 async function ccdLiveStart(quiet) {
@@ -964,7 +1126,7 @@ function ccdLiveStop() {
   fetch('/api/ccd/preview?on=false', { method: 'POST', keepalive: true })
     .then(function () { return ccdStatus(); })
     .catch(function () {});
-  if (ccdTimer) { clearInterval(ccdTimer); ccdTimer = null; }
+  ccdPoll.stop();
   ccdLive = false;
   $('ccd-img').src = '';
   $('ccd-img').hidden = true;
@@ -986,7 +1148,6 @@ const profPoint = { preview: null, lightbox: null };   // {x, y}；大图那条�
 const profCharts = {};                                 // host -> {h, v}
 const profSeq = { preview: 0, lightbox: 0 };           // 迟到的响应不许覆盖新的
 const profLast = { preview: null, lightbox: null };    // 最近一次剖面数据（"按数据铺满"要按它算）
-let profPinned = false;                                // 手填过纵轴范围就不再自动铺满
 
 /* 点击位置 → 图像像素坐标（纯算术，便于测）：box 是图片在屏幕上的矩形，nw/nh 是它的像素尺寸 */
 function profPixel(clientX, clientY, box, nw, nh) {
@@ -1002,29 +1163,15 @@ function profPixel(clientX, clientY, box, nw, nh) {
 
 function profBuild(host) {
   const cfg = PROF_HOSTS[host];
+  // 两张图都是吃满卡片高度的（makeChart 自己挂尺寸观察者）
   const mk = function (id, label, color) {
-    return new uPlot({
-      width: chartWidth($(id)),
-      height: chartHeight($(id), 150),
-      scales: { x: { time: false } },
-      legend: { show: true },
-      cursor: { drag: { x: false, y: false } },
-      series: [{ label: label }, { label: 'ADU', stroke: color, width: 1 }],
-      axes: [
-        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
-        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
-      ],
-    }, [[], []], $(id));
+    return makeChart(id, { xlabel: label, height: 150,
+                        series: [{ label: 'ADU', stroke: color, width: 1 }] });
   };
   profCharts[host] = {
     h: mk(cfg.h, '水平（整行）像素', '#2563eb'),
     v: mk(cfg.v, '垂直（整列）像素', '#0d9488'),
   };
-  // 剖面图也是吃满卡片高度的：卡片尺寸一变（切页、缩放窗口）就跟着重排
-  new ResizeObserver(function () {
-    fitChart(profCharts[host].h, cfg.h, 150);
-    fitChart(profCharts[host].v, cfg.v, 150);
-  }).observe($(cfg.h));
 }
 
 /* 把后端给的剖面上图：两张图各一条线，并在图上画出那两条切线 */
@@ -1060,8 +1207,7 @@ async function profFetch(host) {
   if (p) profApply(host, p);
 }
 
-/* 纵轴范围。与位置曲线同一套规矩：**输入框是唯一的准**，没手填过就按数据铺满；
-   钉住是个可见状态（头部「范围已钉住」），也是"范围为什么不动了"的说明。
+/* 纵轴范围 = 一个范围框（rangeBox，与位置曲线同一套规矩）。
    整行与整列共用一条纵轴 —— 各画各的自动范围，两张图就没法互相比较。
    大图弹窗那两张也认这个范围（同一个刻度才可比）；没钉住时各按各的数据铺满。 */
 function profExtent(p) {
@@ -1078,29 +1224,29 @@ function profExtent(p) {
   return [Math.max(0, lo - pad), hi + pad];
 }
 
-function profRange(host) {
-  const y0 = parseFloat($('prof-ymin').value), y1 = parseFloat($('prof-ymax').value);
-  if (profPinned) return (y0 < y1) ? { min: y0, max: y1 } : null;   // 填反/只填一半不套用，框留着等人改完
-  const r = profExtent(profLast[host]);
-  return r ? { min: r[0], max: r[1] } : null;
-}
+const profY = rangeBox({
+  min: 'prof-ymin', max: 'prof-ymax', pin: 'prof-pin', fit: 'btn-prof-fit',
+  decimals: 0,
+  fitValues: function () {
+    // 框里跟的是"当前有数据的那一张"：优先预览（框就在它下面），只有大图那条有数据时
+    // （比如没开预览、直接点图库）就跟大图 —— 不然点了「自动范围」、图上明明变了，
+    // 框里还留着旧值，看着像没生效。
+    return profExtent(profLast.preview) || profExtent(profLast.lightbox);
+  },
+  onApply: function (win, pinned) {
+    ['preview', 'lightbox'].forEach(function (host) {
+      const c = profCharts[host];
+      if (!c) return;
+      const r = pinned ? win : profExtent(profLast[host]);   // 钉住 = 同一个刻度；没钉住各按各的数据
+      if (!r) return;
+      c.h.setScale('y', { min: r[0], max: r[1] });
+      c.v.setScale('y', { min: r[0], max: r[1] });
+    });
+  },
+}).wire();
 
-function applyProfRange() {
-  $('prof-pin').hidden = !profPinned;
-  if (!profPinned) {
-    // 框里跟的是"当前有数据的那一张"：优先预览（框就在它下面），
-    // 只有大图那条有数据时（比如没开预览、直接点图库）就跟大图 —— 不然点了"自动范围"、
-    // 图上明明变了，框里还留着旧值，看着像没生效。
-    const r = profExtent(profLast.preview) || profExtent(profLast.lightbox);
-    if (r) { $('prof-ymin').value = Math.round(r[0]); $('prof-ymax').value = Math.round(r[1]); }
-  }
-  ['preview', 'lightbox'].forEach(function (host) {
-    const c = profCharts[host], r = profRange(host);
-    if (!c || !r) return;
-    c.h.setScale('y', { min: r.min, max: r.max });
-    c.v.setScale('y', { min: r.min, max: r.max });
-  });
-}
+/* 来了一段新剖面就重套一次（钉住时不动、自动时铺满） */
+function applyProfRange() { profY.apply(); }
 
 function profClear(host) {
   const cfg = PROF_HOSTS[host];
@@ -1114,6 +1260,13 @@ function profClear(host) {
   if (cfg.where) setText(cfg.where, '在预览图上点一下');
 }
 
+/* 缩略图 URL：**8 位映射**那条路（后端 >>2 → JPEG，与预览同一条口径）。
+   16 位 PNG 的原值只占 0~1022（满量程 65535 的 1.6%），把文件直接给浏览器看就是一片黑
+   （实测：均值 352 的帧在屏幕上只有 1.4/255）。max_side 是长边像素，不给就用后端的默认值。 */
+function thumbUrl(path, maxSide) {
+  return '/api/grabs/thumb?path=' + encodeURIComponent(path) +
+    (maxSide ? '&max_side=' + maxSide : '');
+}
 function grabMeta(path) {
   const items = (grabsData && grabsData.items) || [];
   for (let i = 0; i < items.length; i++) if (items[i].path === path) return items[i];
@@ -1158,7 +1311,7 @@ async function showLightbox(full, fallbackSrc, meta) {
   const enc = full.split('/').map(encodeURIComponent).join('/');
   lightboxPath = full;              // 点图取剖面时要拿它去问后端
   profClear('lightbox');            // 换了一张图：上一个点的剖面与切线都不算了
-  $('lightbox-img').src = '/api/grabs/thumb?path=' + encodeURIComponent(full) + '&max_side=1440';
+  $('lightbox-img').src = thumbUrl(full, 1440);   // 弹窗里要更大的一张
   raw.href = '/data/' + enc;        // 原始 16 位 PNG：下载/本地看，别指望浏览器显示
   line.textContent = meta ? metaLine(meta) : '读取中…';
   cap.hidden = false;
@@ -1168,6 +1321,23 @@ async function showLightbox(full, fallbackSrc, meta) {
   const token = lightboxToken;
   const m = await get('/api/image/meta?path=' + encodeURIComponent(full));
   if (token === lightboxToken && !$('lightbox').hidden) line.textContent = metaLine(m);
+}
+
+/* 点图取剖面 —— 预览图与图库大图**走同一条路**（点哪儿、算哪一行哪一列都是显示的事，
+   后端只管按坐标切）。img 是"看到的那一张"：预览是转过朝向的显示帧，大图是保存的 PNG 本身。
+   返回 false = 没点在图里（点在图上才算，见 profPixel）。 */
+function profPickFrom(host, img, ev) {
+  const pt = profPixel(ev.clientX, ev.clientY, img.getBoundingClientRect(),
+                       img.naturalWidth, img.naturalHeight);
+  if (!pt) return false;
+  if (host === 'lightbox') {
+    if (!lightboxPath) return false;
+    profPoint.lightbox = { path: lightboxPath, x: pt.x, y: pt.y };
+  } else {
+    profPoint.preview = pt;
+  }
+  profFetch(host);
+  return true;
 }
 
 /* 已保存的采集帧：**只管手动保存的那些**（后端登记表里的，不按文件名前缀猜）。
@@ -1191,7 +1361,7 @@ async function loadGrabs() {
     // 实测（同一真帧、对理想面积平均算 RMSE）：260/520/1440 三档配浏览器**平滑**缩放都是
     // 1.43~1.53 —— 档位本身差别很小；把格子里的图弄花的其实是 CSS 的
     // image-rendering: pixelated（最近邻抽样，源图越大越糟），那个删掉了（见 style.css）。
-    img.src = '/api/grabs/thumb?path=' + encodeURIComponent(it.path) + '&max_side=520';
+    img.src = thumbUrl(it.path, 520);
 
     // 名称：就是**文件名本身**，点一下改名 = 磁盘上真改（后端 rename + 改库记录）。
     // 还是默认名（grab_<时间戳>.png）时显示成时间，一眼知道是哪一帧。
@@ -1288,10 +1458,22 @@ async function ccdGrab() {
 async function loadHistory() {
   const list = await get('/api/scans');
   if (!list) return;
+  await loadCrops();          // 哪条裁过、裁到哪一块：这一列要照着写
   const tb = $('history').tBodies[0];
   const frag = document.createDocumentFragment();
   for (let i = 0; i < list.length; i++) {
     const s = list[i];
+    const rect = cropRects[s.id];
+    // 裁到多小单独一列（没裁过写 —）：那一列只放数，按钮那一列只放按钮
+    const sizeCell = rect
+      ? '<span title="整组一起裁的：原始坐标 x ' + rect[0] + '~' + (rect[0] + rect[2] - 1) +
+        '、y ' + rect[1] + '~' + (rect[1] + rect[3] - 1) + '">' + rect[2] + '×' + rect[3] + '</span>'
+      : '—';
+    // 裁剪的入口在这儿（一组 = 同名的扫描，点哪一条都是裁整组）。
+    // **裁过的也留着这个按钮**：还能往里再裁一刀（只能越裁越小）—— 按钮消失等于把路堵死。
+    const cropBtn = !s.done ? ''
+      : '<button class="ghost" data-crop="' + s.id + '" data-name="' + esc(s.name) +
+        '">裁剪</button>';
     const tr = document.createElement('tr');
     tr.innerHTML =
       '<td>' + s.id + '</td>' +
@@ -1301,13 +1483,14 @@ async function loadHistory() {
       '<td>' + s.done + '</td>' +
       '<td>' + (STATUS_CN[s.status] || esc(s.status)) + '</td>' +
       '<td>' + fmtTime(s.created_at) + '</td>' +
-      '<td><button class="ghost" data-open="' + s.id + '">查看</button> ' +
+      '<td>' + sizeCell + '</td>' +
+      '<td><button class="ghost" data-open="' + s.id + '">查看</button> ' + cropBtn + ' ' +
           '<button class="ghost" data-del="' + s.id + '">删除</button></td>';
     frag.appendChild(tr);
   }
   if (list.length >= 50) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="8" class="hint">最多显示最近 50 次扫描</td>';
+    tr.innerHTML = '<td colspan="9" class="hint">最多显示最近 50 次扫描</td>';
     frag.appendChild(tr);
   }
   tb.innerHTML = '';
@@ -1320,9 +1503,69 @@ async function loadHistory() {
    一次请求把整条序列取回来，界面只负责把它画出来、把口径写在脸上。
    **前端不做数据加工**：取哪个像素、算哪一段，全部照后端给的画。 */
 
+/* 横轴两种读法指的是**同一串数**：位置是台子走到哪（µm，采图那一刻的读数），
+   时间是光走那段往返光程要多久（fs）。换算是**后端算好的另一列**（光程差 = 2×位移，再除以 c），
+   这里只挑哪一列画 —— 所以切换**不重新取数**（两千张 PNG 现读要几秒，切换等不起）。
+
+   横轴是**四列里挑一列**：两种读法 × 两种口径，四列都由后端一次下发。
+   读法：位置 = 台子走到哪（采图那一刻的读数）；时间 = 光走那段往返光程要多久（系数与换算都在后端）。
+   口径：**折算** = 按设备声明的系数折成 µm；**原值** = 设备当时报的数（µm ÷ 系数；XMT 上是
+   4/3 µm，也就是厂商上位机显示的那套数）。串还是同一串、换的只是刻度 —— 所以钉住的范围框
+   要跟着换算，频谱的频率刻度也跟着变。 */
+const DATA_AXIS = {
+  pos: { um: { key: 'position_um', unit: 'µm', legend: '实际位置 (µm)',
+               span: '位置跨度 (µm)', btn: '横轴：位置 (µm)' },
+         raw: { key: 'position_raw', unit: '读回值', legend: '读回原值（设备单位）',
+                span: '位置跨度（读回值）', btn: '横轴：位置（读回原值）' } },
+  time: { um: { key: 'time_fs', unit: 'fs', legend: '时间 (fs)',
+                span: '时间跨度 (fs)', btn: '横轴：时间 (fs)' },
+          raw: { key: 'time_raw_fs', unit: 'fs', legend: '时间 (fs，按读回原值算)',
+                 span: '时间跨度 (fs，按原值)', btn: '横轴：时间（按原值）' } },
+};
+const DATA_SCALE_CN = { um: '折算 µm', raw: '读回原值' };
+
 let dataScans = [];        // 后端列的扫描（左栏下拉框的选项）
 let dataChart = null;      // 像素曲线
+let dataChartKey = null;   // 上面这张图是按哪一列画的：换了列就得重建（见 renderPixelCurve）
+let dataAxis = 'pos';      // 现在看的是哪种读法（默认位置：读数就是读数，时间轴是一种刻度）
+let dataScale = 'um';      // 位置口径：um = 折算后的 µm（默认）| raw = 设备读回原值
+let dataSources = [];      // 后端给的「读回口径」表 [{key,label,factor}]（系数只在后端一处）
+let dataScaleTitle = '';   // 「口径」按钮原样的说明（禁用时在后面补上"为什么不能切"）
+let dataLast = null;       // 最近一次取回来的响应：切横轴照它重画，不再取数
+let dataXs = [];           // 现在这条曲线的横坐标（"自动范围"照它铺满）
+let dataOrder = 'seq';     // 连线顺序：seq = 采图顺序（默认，如实） | sort = 按横轴读数排序
 let dataSeq = 0;           // 取数请求序号：慢响应回来时可能已经换了扫描或像素
+
+function dataAxisCur() { return DATA_AXIS[dataAxis][dataScale]; }
+
+/* 频谱要的是**时间**那一列（跟横轴按钮在看位置还是时间无关）：口径跟着横轴走。 */
+function dataTimeKey() { return dataScale === 'raw' ? 'time_raw_fs' : 'time_fs'; }
+
+/* 这条扫描能不能切到「原值」：系数记下了、而且不是 1。
+   不能切时**必须说清为什么** —— 按钮灰着不解释，看着就像功能坏了。 */
+function dataScaleState(d) {
+  if (!d) return { ok: false, why: '还没有取数。' };
+  const f = d.readback_to_um;
+  if (f === null || f === undefined) {
+    return { ok: false, why: '这条扫描没记下是哪台设备采的（加这一列之前的老数据）—— ' +
+      '在左边「这条是哪台设备采的」里指认一次就能切。' };
+  }
+  if (Math.abs(f - 1) < 1e-9) {
+    return { ok: false, why: '这台设备的位置读数本来就是 µm（折算系数是 1），切了也一样。' };
+  }
+  return { ok: true, why: '读回原值：1 个单位 = ' + f + ' µm（这条扫描记下的设备口径）' };
+}
+
+/* 按钮、跨度标题、范围框上的单位：横轴换读法时一起换 —— 框里填的数必须跟横轴同一个单位，
+   不然"我填的是 µm 还是 fs"就成了要猜的事。初值也由它写，免得 index.html 和这张表写岔。 */
+function dataAxisApplyLabels() {
+  const ax = dataAxisCur();
+  setText('btn-data-axis', ax.btn);
+  setText('btn-data-scale', '口径：' + DATA_SCALE_CN[dataScale]);
+  setText('data-span-k', ax.span);
+  setText('data-xmin-k', 'X 最小 (' + ax.unit + ')');
+  setText('data-xmax-k', 'X 最大 (' + ax.unit + ')');
+}
 
 async function loadDataScans() {
   const list = await get('/api/scans');
@@ -1359,19 +1602,90 @@ function dataScanInfo() {
   setText('data-scan-info', !s ? '没有可选的扫描。'
     : '共 ' + s.count + ' 点，已记录 ' + s.done + ' 点 · ' + s.start_um + ' → ' +
       s.stop_um + ' µm · ' + (STATUS_CN[s.status] || s.status));
+  dataSourceApply();          // 「哪台设备采的」跟着选中的那条走
+}
+
+/* 「这条是哪台设备采的」= 位置读回口径。系数是设备属性、**只在后端一处**（键 → 系数），
+   这里只送键；选项与文案也由后端下发 —— 前端一个系数都不写。
+   加这一列之前的老数据没记，只能人工指认一次：写进库的只有「这条是哪台设备」这一个字段，
+   各点的读数、图、曲线一个字节都不动（原值列是取数时按系数从已存的 µm 反推的）。 */
+async function loadDataSources() {
+  const r = await get('/api/readback-sources');
+  if (!r || !r.sources) return;
+  dataSources = r.sources;
+  const sel = $('data-source');
+  const frag = document.createDocumentFragment();
+  const un = document.createElement('option');
+  un.value = '';
+  un.textContent = '未记录（老数据：不知道是哪台采的）';
+  frag.appendChild(un);
+  for (let i = 0; i < dataSources.length; i++) {
+    const o = document.createElement('option');
+    o.value = dataSources[i].key;
+    o.textContent = dataSources[i].label;
+    frag.appendChild(o);
+  }
+  sel.innerHTML = '';
+  sel.appendChild(frag);
+  dataSourceApply();
+}
+
+/* 库里的系数对上是哪一项；对不上（设备表改过）就当未记录显示 —— 不猜。 */
+function dataSourceKey(f) {
+  if (f === null || f === undefined) return '';
+  for (let i = 0; i < dataSources.length; i++) {
+    if (Math.abs(dataSources[i].factor - f) < 1e-9) return dataSources[i].key;
+  }
+  return '';
+}
+
+function dataSourceApply() {
+  const s = dataScanPick();
+  const f = s ? s.readback_to_um : null;
+  $('data-source').value = dataSourceKey(f);
+  if (!s) { setText('data-source-note', '—'); return; }
+  if (f === null || f === undefined) {
+    setText('data-source-note', '未记录 —— 老数据没记是哪台设备采的，位置轴只能用折算后的 µm。' +
+      '指认一次（只写这一个字段）就能切「读回原值」。');
+  } else {
+    setText('data-source-note', 'µm = 读回值 × ' + f + '（建扫描时按当时那台设备记下的）');
+  }
+}
+
+/* 指认一次：只改这一个字段，然后把列表与曲线重新拉一遍（口径变了，原值列才有内容）。 */
+async function dataSourceSave() {
+  const s = dataScanPick();
+  if (!s) { toast('先选一条扫描', true); return; }
+  const key = $('data-source').value;
+  const r = await post('/api/scans/' + s.id + '/readback', { source: key || null });
+  if (!r) { dataSourceApply(); return; }        // 失败：把下拉框拨回库里的样子
+  let label = '未记录';
+  for (let i = 0; i < dataSources.length; i++) {
+    if (dataSources[i].key === key) label = dataSources[i].label;
+  }
+  await loadDataScans();
+  if (dataChart) drawPixelCurve();              // 正在看这条：重新取一次数（多出原值列）
+  toast('已记下：' + label);
 }
 
 /* 后端给的序列 → 图上的两条数组。
    **缺图的点：值原样是 null，线在那里断开**（uPlot 遇 null 断线）—— 不许拿邻点顶上。
-   没记下读出位置的点连横坐标都没有，上不了图：丢几个由统计里的「没图的点」一并如实说明。 */
+   没记下读出位置的点连横坐标都没有，上不了图：丢几个由统计里的「没图的点」一并如实说明。
+   横坐标整列照后端给的那一列搬（位置或时间），**前端一个系数都不乘**。
+   连线顺序两种：采图顺序（默认）或按横轴读数排序 —— 排序**只是一次置换**（每个点的值跟着
+   它自己的横坐标搬），不产生任何新数。 */
 function pixelSeries(d) {
-  const xs = [], ys = [];
+  const col = d[dataAxisCur().key];
+  const pts = [];
   for (let i = 0; i < d.value.length; i++) {
-    const px = d.position_um[i];
-    if (px === null || px === undefined) continue;
-    xs.push(px);
-    ys.push(d.value[i] === undefined ? null : d.value[i]);
+    const px = col[i];
+    if (px === null || px === undefined) continue;    // 没记下读数的点上不了图
+    pts.push([px, d.value[i] === undefined ? null : d.value[i]]);
   }
+  // sort 是稳定的（ES2019 起）：读数打平时保持采图顺序，不会因为排序把同一点前后挪来挪去
+  if (dataOrder === 'sort') pts.sort(function (a, b) { return a[0] - b[0]; });
+  const xs = [], ys = [];
+  for (let i = 0; i < pts.length; i++) { xs.push(pts[i][0]); ys.push(pts[i][1]); }
   return [xs, ys];
 }
 
@@ -1399,6 +1713,17 @@ async function drawPixelCurve() {
 }
 
 function renderPixelCurve(d) {
+  dataLast = d;
+  // 这条扫描没有原值列（系数没记下 / 本来就是 1）时**退回折算口径**：宁可显示折算过的，
+  // 也不能拿 undefined 当坐标画出一张空图。按钮那边会把原因写在 title 上。
+  if (dataScale === 'raw' && !d.position_raw) dataScale = 'um';
+  // 裁过的扫描在标题上写明：坐标口径**没变**（还是原始坐标），只是文件小了、读得快了
+  const cp = d.crop;
+  $('data-crop').hidden = !cp;
+  if (cp) {
+    setText('data-crop', '已裁剪 ' + cp[2] + '×' + cp[3] + ' @ (' + cp[0] + ',' + cp[1] +
+      ')｜坐标仍是原始坐标');
+  }
   const data = pixelSeries(d);
   const xs = data[0], ys = data[1];
   let ok = 0, peak = null, lo = null, hi = null;
@@ -1413,29 +1738,36 @@ function renderPixelCurve(d) {
     if (hi === null || xs[i] > hi) hi = xs[i];
   }
 
+  // 换过横轴（读法或口径）就**重建这张图**：图例上那个单位（"实际位置 (µm)" / "读回原值" …）
+  // 是建图时一次性写死的，uPlot 事后改 series.label 不会重画那一格 —— 留着它就是一行
+  // 写着 µm 的假图例。
+  if (dataChart && dataChartKey !== dataAxisCur().key) {
+    dataChart.destroy();
+    dataChart = null;
+  }
   if (!dataChart) {
-    dataChart = new uPlot({
-      width: chartWidth($('data-chart')),
-      height: chartHeight($('data-chart'), 240),   // 建图时的高度；随后 fitChart 按卡片实际尺寸校正
-      scales: { x: { time: false } },
-      legend: { show: true },
-      // 拖拽缩放会跟"输入框是唯一的准"打架（与位置曲线、剖面同一套理由），这里也关掉
-      cursor: { drag: { x: false, y: false } },
-      series: [
-        { label: '实际位置 (µm)' },
-        { label: '像素值 (ADU)', stroke: '#2563eb', width: 1.5,
-          points: { show: showPointsBelow(400), size: 4 } }
-      ],
-      axes: [
-        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
-        { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } }
-      ]
-    }, data, $('data-chart'));
-    new ResizeObserver(function () { fitChart(dataChart, 'data-chart', 240); }).observe($('data-chart'));
+    dataChartKey = dataAxisCur().key;
+    dataChart = makeChart('data-chart', {
+      xlabel: dataAxisCur().legend,
+      height: 240,
+      series: [{ label: '像素值 (ADU)', stroke: '#2563eb', width: 1.5,
+                 points: { show: showPointsBelow(400), size: 4 } }],
+      data: data,
+    });
+    dataX.attach(dataChart, 'x');   // 滚轮/拖动挂在新图上（重建后旧元素没了，见 rangeBox.attach）
   } else {
     dataChart.setData(data);
   }
   fitChart(dataChart, 'data-chart', 240);
+  dataXs = xs;
+  $('data-order-note').hidden = dataOrder !== 'sort';   // 排过序就得写在脸上，别让人以为这是采图顺序
+  // 口径也写在脸上：现在画的是折算过的 µm 还是设备原值，不写就要靠猜
+  const scale = dataScaleState(d);
+  $('data-scale-note').hidden = dataScale !== 'raw';
+  if (dataScale === 'raw') setText('data-scale-note', scale.why);
+  $('btn-data-scale').disabled = !scale.ok;
+  $('btn-data-scale').title = scale.ok ? dataScaleTitle : '不能切原值：' + scale.why;
+  applyDataXRange();                      // 横轴范围：没被手填过就按这一段数据铺满
 
   setText('data-title', '#' + d.scan_id + (d.name ? ' · ' + d.name : '') +
     '　像素 (' + d.x + ', ' + d.y + ')');
@@ -1457,6 +1789,390 @@ function renderPixelCurve(d) {
         ? '这条扫描没有可读的帧（没采图，或者图被删了）—— 没有值可画。'
         : '这个像素一个值都没取到。');
   }
+  renderSpectrum(d);     // 曲线画完就把它的谱跟上（同一份数据，不重新取数）
+}
+
+/* 横轴范围：一个范围框（rangeBox，与位置曲线同一套规矩），单轴 + 两条手势。 */
+const dataX = rangeBox({
+  min: 'data-xmin', max: 'data-xmax', pin: 'data-xpin', fit: 'btn-data-fit',
+  decimals: 3,
+  fitValues: function () {
+    if (!dataXs.length) return null;      // 还没有数据就别去动输入框
+    let lo = dataXs[0], hi = dataXs[0];
+    for (let i = 1; i < dataXs.length; i++) {
+      if (dataXs[i] < lo) lo = dataXs[i];
+      if (dataXs[i] > hi) hi = dataXs[i];
+    }
+    const pad = (hi - lo) * 0.05 || 0.0005;   // 两端各留 5%；一点跨度都没有时给个 0.001 的窗
+    return [lo - pad, hi + pad];
+  },
+  onApply: function (win) {
+    if (dataChart && win) dataChart.setScale('x', { min: win[0], max: win[1] });
+  },
+}).wire();
+
+/* 取了一段新数据就重套一次（钉住时不动、自动时铺满） */
+function applyDataXRange() { dataX.apply(); }
+
+/* ---- 手势只用得到的数学 ----
+   滚轮缩放与拖动平移本身在 rangeBox.attach 里（哪张图要就挂哪张），这里只剩纯函数：
+   离线测得了，也免得"缩放"这件事有两份实现。 */
+
+/* 以 anchor（鼠标底下那个值）为定点缩放：factor < 1 放大（窗口变窄），> 1 缩小。
+   定点缩放的意义就是**锚点不动** —— 盯着的那一点不会从鼠标底下跑掉。 */
+function zoomRange(lo, hi, factor, anchor) {
+  return [anchor + (lo - anchor) * factor, anchor + (hi - anchor) * factor];
+}
+
+/* 平移：dx 是值的位移，跨度不变 */
+function shiftRange(lo, hi, dx) {
+  return [lo + dx, hi + dx];
+}
+
+
+/* 换横轴读法：位置 ↔ 时间。**同一串数换刻度，不取数** —— 已经画过就照手里那份重画，
+   图例单位、横轴刻度、跨度统计都跟着换；还没画过就只换按钮文字，画的时候自然按新读法来。 */
+function dataAxisToggle() {
+  dataAxis = dataAxis === 'pos' ? 'time' : 'pos';
+  dataAxisApplyLabels();
+  // 范围框里填的是**当前单位**的数：钉住过就得把同一个视窗换算过去，不然 20–60 µm 会
+  // 原地变成 20–60 fs（那是另一段）。系数照旧来自后端（取数响应里那份），前端不写死。
+  const f = dataLast && dataLast.time_fs_per_um;
+  const win = dataX.pinned ? dataX.window() : null;
+  if (win && f) {
+    const k = dataAxis === 'time' ? f : 1 / f;
+    dataX.set(win[0] * k, win[1] * k);   // set = 写回框 + 钉住 + 套到图上
+  }
+  if (dataLast) renderPixelCurve(dataLast);
+}
+
+/* 换位置口径：折算 µm ↔ 设备读回原值。**同一串数换刻度，不取数** —— 四列都在手里。
+   钉住的范围框按系数换算过去（框里填的数永远跟横轴同一个口径），频谱跟着重算。 */
+function dataScaleToggle() {
+  const d = dataLast;
+  const st = dataScaleState(d);
+  if (!st.ok) { toast(st.why, true); return; }        // 不能切：说清为什么，不静默
+  const per = d.readback_to_um;                       // µm = 原值 × per
+  const win = dataX.pinned ? dataX.window() : null;
+  dataScale = dataScale === 'um' ? 'raw' : 'um';
+  if (win) {
+    const k = dataScale === 'raw' ? 1 / per : per;
+    dataX.set(win[0] * k, win[1] * k);
+  }
+  dataAxisApplyLabels();
+  renderPixelCurve(d);
+}
+
+/* ==================== 数据页：频谱（功率谱） ====================
+
+   对上面那条「指定像素在各扫描点上的值」做傅里叶变换：横轴频率（THz）、纵轴功率谱。
+   口径就是这块功能的全部内容，动其中任何一条之前先想清楚它意味着什么：
+
+   1) **采样位置用真实的**：每个点拿它自己那一刻的 time_fs 进变换（非均匀最小二乘），
+      不插值、不假设等间隔。XMT 上读数噪声与步距同量级（实测 0.055 µm 步距上 ±0.056 µm、
+      338 个间隔往回走），按"名义等间隔"算等于把那些间隔当成不存在。
+   2) **缺一个点整条不算**：没采到图、没记下读数都报错，说清是第几个点。谱里没有"断开"这回事 ——
+      补零、跳过、插值都是偷偷换了一条采样序列。
+   3) **按采图顺序**，与「连线顺序」按钮无关：排过序的序列不是时间序。
+   4) **整条扫描的全部点**，与可视范围框无关（框只管看，不参与变换）。
+   5) 已去均值（直流那根柱子会压掉别的峰，所以不画）、不加窗。
+   6) 频率格 k/T（T = 真实首末跨度），上限卡在**名义 Nyquist** = 1/(2×平均间距)：
+      越界给的是混叠，不是信息。
+   7) 纵轴是**功率**：(A²+B²)/2 —— 纯正弦幅度 A 进来，峰高就是 A²/2（单边均方功率）；
+      切到 dB 是相对这条谱里最强的那根（0 dB = 最强）。
+   8) 算在前端：那两列数据取一次就在手里，换读法、切 dB 都即时重算/重画，不再读几千张 PNG。
+      **物理系数（2 与 c）仍然只写在后端一处** —— 这里拿到的已经是 time_fs，只做 fs→THz 的换单位。 */
+/* 频谱横轴两种读法：频率（THz）与波长（µm）。λ = 系数 ÷ ν —— **同一串数换刻度**：
+   每根谱线的功率不变，只换横坐标（不是把功率谱按密度换算，也不乘雅可比因子）。
+   波长列是**降序**的（频率升 → 波长降），画之前倒一次（见 specXY）：一次置换，不产生新数。 */
+const SPEC_AXIS = {
+  freq: { btn: '横轴：频率 (THz)', legend: '频率 (THz)',
+          fmax: '频率上限 (THz)', peak: '最强分量 (THz)', unit: 'THz' },
+  wave: { btn: '横轴：波长 (µm)', legend: '波长 (µm)',
+          fmax: '波长范围 (µm)', peak: '最强分量 (µm)', unit: 'µm' },
+};
+
+const SPEC_MIN_POINTS = 16;     // 比这少就不出图：几个点算出来的"谱"没有意义
+const SPEC_BAD_SHOWN = 3;       // 不合格的点最多列几个（够定位就行，不刷屏）
+const SPEC_FS_TO_THZ = 1e3;     // 1/fs = 1e15 Hz = 1000 THz：只换单位，不含任何物理系数
+const SPEC_DB_FLOOR = -180;     // dB 下限：功率为 0 的频点 log 发散，压在它上面
+
+let specLast = null;            // 最近一次算出来的谱（切 dB 照它重画，不重算）
+let specSrc = null;             // 它是对哪一份取数结果算的：同一份就别再算一遍
+let specScale = null;           // 算它的时候用的是哪种口径（换口径时间列就变了）
+let specAxisTitle = '';         // 「频谱横轴」按钮原样的说明（禁用时在后面补"为什么切不了"）
+let specChart = null;
+let specChartDb = null;         // 上面那张图是按哪种纵轴画的（换读法要重建：图例写死了）
+let specChartAxis = null;       // 上面那张图是按哪种横轴画的（同理：重建）
+let specAxis = 'freq';          // 频谱横轴：freq = 频率 (THz) | wave = 波长 (µm)
+let specDb = false;             // 纵轴：false = 功率 (ADU²)，true = dB（0 = 最强那根）
+
+/* 这条序列的功率谱；不合格就返回 {error}（说清哪一点、为什么）。
+   非均匀 DFT：频率格 k/T，每个频率上解一次 cos/sin 的最小二乘（2×2 正规方程），功率 = (A²+B²)/2。
+   均匀采样时它就是教科书那个单边幅度谱的平方，非均匀采样时照样成立 —— 这正是"按真实点间距算"的意义。
+
+   三角函数用**递推**省掉：固定一个点，第 k 格的相位正好是第 1 格的 k 倍，复数乘一步就到下一格
+   （K 步累计误差 ~1e-11，可忽略）。2000 点 × 1000 格约 20 ms，所以同步算、不用等。 */
+function pixelSpectrum(d) {
+  const n = d.value.length;
+  const time = d[dataTimeKey()];        // 时间列跟着横轴口径走（原值口径下那串数大 1/系数）
+  const bad = [];
+  for (let i = 0; i < n; i++) {
+    const at = '第 ' + (i + 1) + ' 个点（idx ' + d.idx[i] + '）';
+    const tf = time[i];
+    if (tf === null || tf === undefined) bad.push(at + '没记下读出位置');
+    else if (d.value[i] === null || d.value[i] === undefined) bad.push(at + '没采到图');
+  }
+  if (bad.length) {
+    return { error: '这条扫描有 ' + bad.length + ' 个点不合格，整条做不了谱：' +
+      bad.slice(0, SPEC_BAD_SHOWN).join('；') + (bad.length > SPEC_BAD_SHOWN ? ' 等' : '') +
+      '。谱不补值、不插值、也不跳过 —— 缺一个点就是另一条采样序列。' };
+  }
+  if (n < SPEC_MIN_POINTS) {
+    return { error: n ? '只有 ' + n + ' 个点，做不了谱（至少要 ' + SPEC_MIN_POINTS + ' 个）。'
+                      : '这条扫描里还没有点。' };
+  }
+
+  let t0 = Infinity, t1 = -Infinity, mean = 0;
+  for (let i = 0; i < n; i++) {
+    const t = time[i];
+    if (t < t0) t0 = t;
+    if (t > t1) t1 = t;
+    mean += d.value[i];
+  }
+  mean /= n;
+  const span = t1 - t0;                     // fs：**真实首末跨度**，不是 点数 × 名义步距
+  if (!(span > 0)) return { error: '所有点的读出位置都在同一处（跨度 0），做不了谱。' };
+  const df = 1 / span;                      // 频率步长（1/fs）
+  const kMax = Math.floor((n - 1) / 2);     // 上限 = 1/(2×平均间距)，正好落在第 kMax 格
+
+  const scc = new Float64Array(kMax + 1), sss = new Float64Array(kMax + 1);
+  const scs = new Float64Array(kMax + 1), yc = new Float64Array(kMax + 1);
+  const ys = new Float64Array(kMax + 1);
+  const ph1 = 2 * Math.PI * df;
+  for (let i = 0; i < n; i++) {
+    const vi = d.value[i] - mean;           // 去均值：直流不画
+    const g = ph1 * (time[i] - t0);         // 第 1 格的相位
+    const c1 = Math.cos(g), s1 = Math.sin(g);
+    let c = c1, s = s1;
+    for (let k = 1; k <= kMax; k++) {
+      scc[k] += c * c; sss[k] += s * s; scs[k] += c * s;
+      yc[k] += vi * c; ys[k] += vi * s;
+      const nc = c * c1 - s * s1;           // 走到下一格
+      s = s * c1 + c * s1; c = nc;
+    }
+  }
+
+  const f = new Array(kMax), p = new Array(kMax);
+  let peakI = 0;
+  for (let k = 1; k <= kMax; k++) {
+    const det = scc[k] * sss[k] - scs[k] * scs[k];
+    let pw = 0;
+    if (det > 0) {
+      const A = (yc[k] * sss[k] - ys[k] * scs[k]) / det;
+      const B = (ys[k] * scc[k] - yc[k] * scs[k]) / det;
+      pw = (A * A + B * B) / 2;
+    }
+    f[k - 1] = k * df * SPEC_FS_TO_THZ;
+    p[k - 1] = pw;
+    if (pw > p[peakI]) peakI = k - 1;
+  }
+  if (!(p[peakI] > 0)) return { error: '这条序列一点起伏都没有（每个点的值都一样），做不了谱。' };
+  return {
+    f: f, p: p, n: n, span_fs: span, df_thz: df * SPEC_FS_TO_THZ,
+    fmax_thz: kMax * df * SPEC_FS_TO_THZ, peakF: f[peakI], peakP: p[peakI],
+  };
+}
+
+/* 图上的纵轴那一列：功率，或相对最强那根的 dB。**同一串数换刻度** —— 切 dB 不重算。 */
+function specSeries() {
+  if (!specDb) return specLast.p;
+  const p = specLast.p, out = new Array(p.length);
+  for (let i = 0; i < p.length; i++) {
+    const db = 10 * Math.log10(p[i] / specLast.peakP);
+    out[i] = db < SPEC_DB_FLOOR ? SPEC_DB_FLOOR : db;
+  }
+  return out;
+}
+
+function specYLabel() { return specDb ? '功率 (dB，0 = 最强分量)' : '功率 (ADU²)'; }
+
+/* 波长换算的系数来自后端（取数响应里那份）—— 前端一个物理常数都不写。 */
+function specC() { return dataLast ? dataLast.wavelength_um_per_thz : null; }
+
+/* 能不能切到波长轴：系数拿到了就能。拿不到（老响应）就禁用并说清为什么。 */
+function specAxisState() {
+  const c = specC();
+  if (!c) return { ok: false, why: '这次取数里没有波长换算系数（后端没给）—— 切不了。' };
+  return { ok: true, why: '波长 = ' + c + ' µm·THz ÷ 频率' };
+}
+
+/* 图上的两列（横轴照当前读法、纵轴照功率/dB）。波长那一列倒过来画：uPlot 要横坐标递增，
+   而 λ 随 ν 递减 —— 一次置换，每个点带着自己的值走，不产生新数。 */
+function specXY() {
+  const s = specLast, y = specSeries(), n = s.f.length;
+  if (specAxis !== 'wave') return [s.f, y];
+  const c = specC(), xs = new Array(n), ys = new Array(n);
+  for (let i = 0; i < n; i++) {
+    xs[i] = c / s.f[n - 1 - i];
+    ys[i] = y[n - 1 - i];
+  }
+  return [xs, ys];
+}
+
+/* 横轴读法换一个：按钮、统计条标题、范围框单位一起换 */
+function specAxisApplyLabels() {
+  const ax = SPEC_AXIS[specAxis];
+  setText('btn-spec-axis', ax.btn);
+  setText('spec-fmax-k', ax.fmax);
+  setText('spec-peak-k', ax.peak);
+}
+
+/* 数字别写成 0.00000483：功率跨好几个量级 */
+function specNum(x) {
+  if (!(x > 0)) return '0';
+  return (x >= 1e4 || x < 0.01) ? x.toExponential(2).replace('e+', 'e') : x.toPrecision(4);
+}
+
+/* 取数结果 → 频谱卡。同一份数据再来一次（换读法 / 换连线顺序 / 切 dB）不重算。 */
+function renderSpectrum(d) {
+  // 停在波长轴、这条响应却没有波长系数（老后端）→ **退回频率轴**：宁可显示频率，
+  // 也不能拿 undefined 当横坐标画出一张空图。按钮那边会把原因写在 title 上。
+  if (specAxis === 'wave' && !specC()) { specAxis = 'freq'; specAxisApplyLabels(); }
+  if (specSrc !== d || specScale !== dataScale) {   // 口径换了，时间列就换了，谱要重算
+    specLast = pixelSpectrum(d);
+    specSrc = d;
+    specScale = dataScale;
+  }
+  const spec = specLast;
+  const empty = $('spec-empty');
+  if (spec.error) {
+    setText('spec-title', '—');
+    ['spec-n', 'spec-span', 'spec-df', 'spec-fmax', 'spec-peak', 'spec-peakval']
+      .forEach(function (id) { setText(id, '—'); });
+    empty.hidden = false;
+    empty.className = 'hint warn';       // 不合格是"这条做不了"，不是"还没取数"
+    empty.textContent = spec.error;
+    if (specChart) specChart.setData([[], []]);   // 别把上一条的谱留在屏幕上冒充这一条
+    return;
+  }
+  empty.hidden = true;
+  empty.className = 'hint';
+
+  // 横轴或纵轴读法换了就得**重建这张图**：图例那一格是建图时写死的
+  // （与像素曲线换横轴读法同一个原因）
+  if (specChart && (specChartDb !== specDb || specChartAxis !== specAxis)) {
+    specChart.destroy();
+    specChart = null;
+  }
+  const data = specXY();
+  if (!specChart) {
+    specChartDb = specDb;
+    specChartAxis = specAxis;
+    specChart = makeChart('spec-chart', {
+      xlabel: SPEC_AXIS[specAxis].legend,
+      height: 180,
+      series: [{ label: specYLabel(), stroke: '#7c3aed', width: 1.2,
+                 points: { show: showPointsBelow(400), size: 4 } }],
+      data: data,
+    });
+    // 滚轮/拖动挂在新图上（重建后旧元素没了，见 rangeBox.attach）
+    specX.attach(specChart, 'x');
+    specY.attach(specChart, 'y');
+  } else {
+    specChart.setData(data);
+  }
+  fitChart(specChart, 'spec-chart', 180);
+  applySpecRange();                       // 没被手填过的轴按这条谱铺满
+
+  // 横轴按钮能不能用：后端给了波长系数才能切
+  const axSt = specAxisState();
+  $('btn-spec-axis').disabled = !axSt.ok;
+  $('btn-spec-axis').title = axSt.ok ? specAxisTitle : '切不了波长轴：' + axSt.why;
+
+  setText('spec-title', '#' + d.scan_id + (d.name ? ' · ' + d.name : '') +
+    '　像素 (' + d.x + ', ' + d.y + ') · 按采图顺序 · ' +
+    (dataScale === 'raw' ? '读回原值' : '折算 µm'));
+  setText('spec-n', String(spec.n));
+  setText('spec-span', spec.span_fs.toFixed(1));
+  setText('spec-df', spec.df_thz.toFixed(3));      // 分辨率永远按频率写（波长刻度上疏密不均）
+  if (specAxis === 'wave') {
+    const c = specC();
+    setText('spec-fmax', (c / spec.fmax_thz).toFixed(3) + ' ~ ' + (c / spec.f[0]).toFixed(1));
+    setText('spec-peak', (c / spec.peakF).toFixed(3));
+  } else {
+    setText('spec-fmax', spec.fmax_thz.toFixed(3));
+    setText('spec-peak', spec.peakF.toFixed(3));
+  }
+  setText('spec-peakval', specNum(spec.peakP));
+}
+
+/* 频率轴（X）与纵轴（Y）**各是一个范围框**（同一套规矩，见 rangeBox），各钉各的标记、各一个「自动范围」。 */
+function specApply() {
+  if (!specChart) return;
+  const wx = specX.window();
+  if (wx) specChart.setScale('x', { min: wx[0], max: wx[1] });
+  const wy = specY.window();
+  if (wy) specChart.setScale('y', { min: wy[0], max: wy[1] });
+}
+
+const specX = rangeBox({
+  min: 'spec-xmin', max: 'spec-xmax', pin: 'spec-xpin', fit: 'btn-spec-fit',
+  decimals: 3, onApply: specApply,
+  fitValues: function () {
+    const s = specLast;
+    if (!s || s.error) return null;         // 还没有谱就别去动输入框
+    const xs = specXY()[0];                 // 当前读法下真正画出来的那一列（升序）
+    const lo = xs[0], hi = xs[xs.length - 1];
+    const pad = (hi - lo) * 0.05 || 0.001;
+    return [Math.max(0, lo - pad), hi + pad];
+  },
+}).wire();
+
+const specY = rangeBox({
+  min: 'spec-ymin', max: 'spec-ymax', pin: 'spec-ypin', fit: 'btn-spec-yfit',
+  decimals: 4, onApply: specApply,
+  fitValues: function () {
+    const s = specLast;
+    if (!s || s.error) return null;
+    const ys = specSeries();
+    let lo = ys[0], hi = ys[0];
+    for (let i = 1; i < ys.length; i++) {
+      if (ys[i] < lo) lo = ys[i];
+      if (ys[i] > hi) hi = ys[i];
+    }
+    const pad = (hi - lo) * 0.05 || Math.abs(hi) * 0.05 || 0.001;
+    lo -= pad; hi += pad;
+    // 两条边不许越：功率没有负的；dB 的天花板就是最强那根（0 dB）
+    return [specDb ? lo : Math.max(0, lo), specDb ? Math.min(0, hi) : hi];
+  },
+}).wire();
+
+function applySpecRange() { specX.apply(); specY.apply(); }
+
+/* 横轴换读法：频率 ↔ 波长。**同一串数换刻度，不重算、不重新取数** —— 每根谱线的功率不变，
+   只换横坐标。钉住的范围框按 λ = 系数 ÷ ν 换算过去（**顺序会翻**：频率高的那头波长短），
+   所以窗口两端要对调着写。 */
+function specAxisToggle() {
+  const st = specAxisState();
+  if (!st.ok) { toast(st.why, true); return; }
+  const c = specC();
+  const win = specX.pinned ? specX.window() : null;
+  specAxis = specAxis === 'freq' ? 'wave' : 'freq';
+  if (win && win[0] > 0) specX.set(c / win[1], c / win[0]);   // 来回都是这个式子（对合）
+  specAxisApplyLabels();
+  if (specLast && !specLast.error) renderSpectrum(specSrc);
+}
+
+/* 纵轴换读法：功率 ↔ dB。**同一串数换刻度，不重算、不重新取数**；
+   但两个单位不是线性关系，换算不过去，所以纵轴重新按数据铺满（等于替你按一下「自动范围」）。 */
+function specToggleDb() {
+  specDb = !specDb;
+  $('spec-ymin-k').textContent = specDb ? 'dB 最小' : '功率最小 (ADU²)';
+  $('spec-ymax-k').textContent = specDb ? 'dB 最大' : '功率最大 (ADU²)';
+  setText('btn-spec-db', specDb ? '纵轴：dB（0 = 最强）' : '纵轴：功率 (ADU²)');
+  specY.pinned = false;
+  if (specLast && !specLast.error) renderSpectrum(specSrc);
 }
 
 /* ==================== 分栏拖动 ==================== */
@@ -1547,6 +2263,210 @@ function wireGutters() {
       gutterApply(g, view, name, gutterBox(g, axis, of) + sign * step, true);
     });
   }
+}
+
+
+/* ==================== 数据页：扫描组与裁剪 ====================
+   一组 = **同名的扫描**（后端按 scan.name 分）。裁剪把这一组每条扫描的每一帧都裁成同一块矩形、
+   就地换掉原图 —— 之后取数只解这一小块，快十几倍（实测 2000 张 4.8 s → 0.3 s）。
+   **坐标口径不变**：面板上这四个数、红框、后端收到的都是**原始坐标**，裁过的和没裁过的能混着比。
+   不可逆，所以先把预检（哪几条能裁、为什么不能）和红框摆出来，再动手。 */
+let cropRects = {};       // scan_id → [x0,y0,w,h]：历史表那一列照着它写「已裁剪」
+let cropSel = null;       // 面板里这一组的预检结果（GET /api/crops/suggest）
+let cropDef = { w: 400, h: 300 };   // 默认框尺寸由后端给（config.CROP_W/H），前端不写死
+
+const cropPolling = poller(cropPoll, 700);   // 裁剪进度（cropPoll 是函数声明，提升到位）
+
+function cropNameText(name) { return name ? name : '(没有名字)'; }
+
+function cropInt(id) {
+  const v = String($(id).value || '').trim();
+  return /^\d+$/.test(v) ? parseInt(v, 10) : NaN;
+}
+
+/* 拉一次裁剪状态：默认框尺寸 + 每条扫描裁到哪一块（历史表那一列要照着写）。
+   拿不到就当"都没裁过"（按钮能点，点了后端会如实拒），不猜、不缓存旧的。 */
+async function loadCrops() {
+  const d = await get('/api/crops');
+  if (!d) return null;
+  if (d.w) cropDef = { w: d.w, h: d.h };
+  cropRects = {};
+  (d.crops || []).forEach(function (c) { cropRects[c.id] = c.rect; });
+  return d;
+}
+
+async function openCropPanel(name) {
+  if (cropPolling.running()) { toast('上一次裁剪还在跑，等它结束', true); return; }
+  const d = await get('/api/crops/suggest?name=' + encodeURIComponent(name) +
+    '&w=' + cropDef.w + '&h=' + cropDef.h);
+  if (!d) return;                       // 整组不能裁：request() 已经把原因弹出来了
+  cropSel = d;
+  setText('crop-name', cropNameText(name) + ' · ' + d.scans.length + ' 条扫描');
+  // 走缩略图那条路（8 位映射 + 缓存）：16 位原值只占 0~1022，浏览器按满量程渲染是整片黑的，
+  // 拿它当预览等于没预览 —— 看不出光斑在哪，就没法判断框住没有
+  $('crop-img').src = thumbUrl(d.sample, 760);   // 要看得出光斑在哪，比格子里的缩略图大
+  cropFillSuggested();
+  cropScanList();
+  $('crop-progress').hidden = true;
+  $('croppanel').hidden = false;
+}
+
+/* 预检逐条列出来：能裁的才进这一批，不能裁的写清为什么（尺寸不一致 / 已经裁过 / 没有图） */
+function cropScanList() {
+  const box = $('crop-scans');
+  box.innerHTML = '';
+  let imgs = 0, n = 0;
+  for (let i = 0; i < cropSel.scans.length; i++) {
+    const s = cropSel.scans[i];
+    const row = document.createElement('div');
+    row.className = 'croprow' + (s.ok ? '' : ' dim');
+    const head = document.createElement('b');
+    head.textContent = '#' + s.id;
+    const mid = document.createElement('span');
+    mid.textContent = s.images + ' 张' + (s.size ? ' · ' + s.size[0] + '×' + s.size[1] : '') +
+      (s.ok ? '' : ' · ' + s.why);
+    row.appendChild(head);
+    row.appendChild(mid);
+    box.appendChild(row);
+    if (s.ok) { imgs += s.images; n++; }
+  }
+  const r = cropSel.rect;
+  const from = r.source === 'centroid'
+    ? '质心在 x ' + r.cx_range[0] + '~' + r.cx_range[1] + '、y ' + r.cy_range[0] + '~' +
+      r.cy_range[1] + '（抽样 ' + r.sampled + ' 帧），离框边最近还有 ' + r.margin + ' px'
+    : '这些帧没有质心记录（老图），按可裁区域中心给的建议框';
+  const b = cropSel.base;
+  const cur = b ? '现在已经裁到 ' + b[2] + '×' + b[3] + '（原始坐标 x ' + b[0] + '~' +
+    (b[0] + b[2] - 1) + '、y ' + b[1] + '~' + (b[1] + b[3] - 1) + '），再裁只能往里挑；' : '';
+  setText('crop-info', n + ' 条可裁 · 共 ' + imgs + ' 张 · ' +
+    (cropSel.bytes / 1048576).toFixed(1) + ' MB · 现在画面 ' + cropSel.frame[0] + '×' +
+    cropSel.frame[1] + '；' + cur + from + '。' +
+    (cropSel.note ? '　' + cropSel.note + '。' : ''));
+}
+
+function cropFillSuggested() {
+  const r = cropSel.rect;
+  $('crop-x0').value = r.x0;
+  $('crop-y0').value = r.y0;
+  $('crop-w').value = r.w;
+  $('crop-h').value = r.h;
+  cropDrawRect();
+}
+
+/* 红框 = 将要留下的那一块（框外压暗）。按百分比定位，不用知道图显示多大。
+   已经裁过的组：图上那张就是**现在这块地**（base，原始坐标），所以要先减掉 base 的原点，
+   再除以画面尺寸 —— 四个数本身永远是原始坐标，一个都没换算过。 */
+function cropDrawRect() {
+  const box = $('crop-rect');
+  if (!cropSel || !cropSel.frame) { box.hidden = true; return; }
+  const x0 = cropInt('crop-x0'), y0 = cropInt('crop-y0');
+  const w = cropInt('crop-w'), h = cropInt('crop-h');
+  const fw = cropSel.frame[0], fh = cropSel.frame[1];
+  const bx = cropSel.base ? cropSel.base[0] : 0;
+  const by = cropSel.base ? cropSel.base[1] : 0;
+  if (!(w > 0) || !(h > 0) || !(x0 >= 0) || !(y0 >= 0)) { box.hidden = true; return; }
+  box.hidden = false;
+  box.style.left = Math.min(100, Math.max(0, (x0 - bx) / fw * 100)) + '%';
+  box.style.top = Math.min(100, Math.max(0, (y0 - by) / fh * 100)) + '%';
+  box.style.width = Math.min(100, w / fw * 100) + '%';
+  box.style.height = Math.min(100, h / fh * 100) + '%';
+  cropWarn(x0, y0, w, h);
+}
+
+/* 框住没有：把**后端给的**质心范围与手里这四个数摆在一起比一下。
+   质心是整幅图的亮度重心（含背景），不等于亮斑中心，所以这是提醒、不是判据 ——
+   但范围都跑到框外去了，就说明有帧的亮心多半被切掉了（这个切掉是不可逆的）。
+   这一步只看数、不发请求，所以改一个数就能立刻跟着变。 */
+function cropWarn(x0, y0, w, h) {
+  const el = $('crop-warn');
+  const r = cropSel && cropSel.rect;
+  if (!r || !r.cx_range || !r.cy_range) { el.hidden = true; return; }
+  const b = cropSel.base || [0, 0, r.frame_w, r.frame_h];
+  const bad = [], gone = [];      // bad = 这一刀会切掉的；gone = 上一刀就已经切在外面的
+  const fits = function (lo, hi, o, s) { return o <= lo && hi <= o + s - 1; };
+  const axes = [['x', r.cx_range, b[0], b[2], x0, w], ['y', r.cy_range, b[1], b[3], y0, h]];
+  for (let i = 0; i < axes.length; i++) {
+    const ax = axes[i][0], rg = axes[i][1];
+    if (!fits(rg[0], rg[1], axes[i][2], axes[i][3])) {
+      gone.push(ax + ' ' + rg[0] + '~' + rg[1] +
+        '（可裁的只剩 ' + axes[i][2] + '~' + (axes[i][2] + axes[i][3] - 1) + '）');
+    } else if (!fits(rg[0], rg[1], axes[i][4], axes[i][5])) {
+      bad.push(ax + ' ' + rg[0] + '~' + rg[1] +
+        '（框里是 ' + axes[i][4] + '~' + (axes[i][4] + axes[i][5] - 1) + '）');
+    }
+  }
+  el.hidden = !bad.length && !gone.length;
+  // 两种情形分开说：混在一起会把"上一刀留下的旧账"说成"这一刀会切掉"，那就没人信这条提醒了
+  el.className = bad.length ? 'hint warn' : 'hint';
+  if (bad.length) {
+    setText('crop-warn', '注意：这一刀会把质心范围切在外面 —— ' + bad.join('，') +
+      '。质心是整幅亮度重心、不等于亮斑中心，但超出就说明有帧的亮心会被切掉（切掉就找不回来了）。' +
+      (gone.length ? '另外 ' + gone.join('，') + ' 是**上一刀**就已经在框外的。' : ''));
+  } else if (gone.length) {
+    setText('crop-warn', '提醒：' + gone.join('，') +
+      ' —— 这是**上一刀**就切在框外的，救不回来；这一刀动不到它，只是说明这一组里还有那样的帧。');
+  }
+}
+
+async function runCrop() {
+  if (!cropSel) return;
+  const x0 = cropInt('crop-x0'), y0 = cropInt('crop-y0');
+  const w = cropInt('crop-w'), h = cropInt('crop-h');
+  const fw = cropSel.frame[0], fh = cropSel.frame[1];
+  const b = cropSel.base;
+  const out = b ? (x0 < b[0] || y0 < b[1] || x0 + w > b[0] + b[2] || y0 + h > b[1] + b[3])
+                : (x0 + w > fw || y0 + h > fh);
+  if (!(w >= 16) || !(h >= 16) || !(x0 >= 0) || !(y0 >= 0) || out ||
+      (b && w * h >= b[2] * b[3])) {
+    // 前端这一道只为省一次往返：真正的拒绝在后端（同一个判据，别只信这里）
+    toast(b ? ('这一组现在就是 ' + b[2] + '×' + b[3] + '（原始坐标 x ' + b[0] + '~' +
+               (b[0] + b[2] - 1) + '、y ' + b[1] + '~' + (b[1] + b[3] - 1) +
+               '）—— 只能往里裁、而且要更小')
+            : ('矩形要填在画面 ' + fw + '×' + fh + ' 里，宽高至少 16'), true);
+    return;
+  }
+  const r = await request('POST', '/api/crops/run?name=' + encodeURIComponent(cropSel.name) +
+    '&x0=' + x0 + '&y0=' + y0 + '&w=' + w + '&h=' + h);
+  if (!r) return;
+  $('btn-crop-run').disabled = true;
+  $('crop-progress').hidden = false;
+  setText('crop-progress', '正在裁剪 0 / ' + r.images + ' 张 …（原图在全部校验通过之前不会动）');
+  $('croppanel').hidden = true;
+  cropPollStart();
+}
+
+function cropPollStart() { cropPolling.start(); }   // 立刻先问一次，再按节拍跟进度
+
+function cropPollStop() {
+  cropPolling.stop();
+  $('btn-crop-run').disabled = false;
+}
+
+async function cropPoll() {
+  const d = await get('/api/crops');
+  if (!d) return;
+  const j = d.job || {};
+  if (j.running) {
+    setText('crop-progress', '正在裁剪 ' + j.done + ' / ' + j.total + ' 张 …');
+    return;
+  }
+  cropPollStop();
+  if (j.error) {
+    setText('crop-progress', '裁剪失败，整组已回滚（原图一点没动）：' + j.error);
+    toast('裁剪失败：' + j.error, true);
+  } else if (j.result) {
+    const cut = j.result.edge_peak >= j.result.peak ? ' —— 边框上就有峰值，可能切到光斑了' : '';
+    setText('crop-progress', '裁完了：' + j.result.scans + ' 条扫描、' + j.result.frames +
+      ' 张，省 ' + (j.result.saved_bytes / 1048576).toFixed(1) + ' MB｜框内峰值 ' +
+      j.result.peak + '、边框最大 ' + j.result.edge_peak + cut);
+    toast('裁剪完成');
+  }
+  $('crop-progress').hidden = false;
+  await loadCrops();
+  loadHistory();            // 裁完历史表那一列要立刻变成「已裁剪」
+  // 正在看的那条就在这一组里就重画一次：现在读的是裁剪后的图，取到的值必须一模一样
+  const cur = dataScanPick();
+  if (cur && dataLast && cur.name === j.group) drawPixelCurve();
 }
 
 /* ==================== 交互 ==================== */
@@ -1654,7 +2574,29 @@ function wire() {
   // 数据页：选扫描、填像素、画曲线。换扫描时**已经画过就跟着重画** ——
   // 不然左边写着 #52、图上还是 #51 的那条，看着像没生效。
   $('btn-data-refresh').onclick = loadDataScans;
+  $('btn-crop-close').onclick = function () { $('croppanel').hidden = true; };
+  $('btn-crop-fit').onclick = function () { cropFillSuggested(); };
+  $('btn-crop-run').onclick = runCrop;
+  ['crop-x0', 'crop-y0', 'crop-w', 'crop-h'].forEach(function (id) {
+    $(id).oninput = cropDrawRect;      // 改一个数，红框跟着动（不改后端任何东西）
+  });
   $('btn-data-draw').onclick = drawPixelCurve;
+  $('btn-data-axis').onclick = dataAxisToggle;
+  $('btn-data-scale').onclick = dataScaleToggle;   // 口径：折算 µm ↔ 设备读回原值
+  dataScaleTitle = $('btn-data-scale').title;      // 原样的说明（禁用时在后面补"为什么不能切"）
+  $('data-source').onchange = dataSourceSave;      // 指认「这条是哪台设备采的」
+  $('btn-spec-db').onclick = specToggleDb;     // 纵轴：功率 ↔ dB（同一串数换刻度，不重算）
+  $('btn-spec-axis').onclick = specAxisToggle; // 横轴：频率 ↔ 波长（同一串数换刻度，不重算）
+  specAxisTitle = $('btn-spec-axis').title;    // 原样的说明（禁用时在后面补"为什么切不了"）
+  specAxisApplyLabels();                       // 按钮与统计条标题的初值
+  // 横轴范围框的接线（手填 = 钉住、「自动范围」= 松钉）由 rangeBox.wire 自己接好了
+  // 连线顺序：换一下就照手里那份重画，不重新取数（置换是纯显示的活）
+  $('data-order').onchange = function () {
+    dataOrder = $('data-order').value;
+    if (dataLast) renderPixelCurve(dataLast);
+    else $('data-order-note').hidden = dataOrder !== 'sort';
+  };
+  dataAxisApplyLabels();     // 按钮 / 跨度标题 / 范围框单位的初值，都由 DATA_AXIS 说了算
   $('data-scan').onchange = function () {
     dataScanInfo();
     if (dataChart) drawPixelCurve();
@@ -1668,19 +2610,15 @@ function wire() {
   // 曝光改完立刻生效（数字框用 change，回车或失焦才发，别每敲一个字符就打设备）
   $('ccd-preview-ms').onchange = ccdSetExposure;
 
-  $('btn-prof-fit').onclick = function () { profPinned = false; applyProfRange(); };
-  ['prof-ymin', 'prof-ymax'].forEach(function (id) {
-    // 手填过就不再自动铺满：想用同一个刻度对比两张图、或看真实动态范围，范围得留得住
-    $(id).oninput = function () { profPinned = true; applyProfRange(); };
-  });
+  // 纵轴范围框同上（手填过就不再自动铺满：想用同一个刻度对比两张图、或看真实动态范围）
 
   $('btn-trace').onclick = function () { if (traceActive) traceStop(); else traceStart(); };
-  $('btn-trace-fit').onclick = function () { tracePinned = false; applyTraceRange(); };
   $('trace-secs').oninput = syncTraceUI;
-  ['trace-xmin', 'trace-xmax', 'trace-ymin', 'trace-ymax'].forEach(function (id) {
-    // 手填过就不再自动铺满：想用同一个窗口对比两段记录，范围得留得住
-    $(id).oninput = function () { tracePinned = true; applyTraceRange(); };
-  });
+  // 两个轴各有各的框（rangeBox 自己接好了手填），但「自动范围」是**一对**：
+  // 这个按钮的意思是"都别钉了，按数据铺满"，所以两个一起松。
+  $('btn-trace-fit').onclick = function () {
+    traceX.pinned = false; traceY.pinned = false; applyTraceRange();
+  };
 
   $('btn-refresh').onclick = loadHistory;
 
@@ -1690,6 +2628,11 @@ function wire() {
     if (b.dataset.open) {
       pinnedScanId = Number(b.dataset.open);
       loadScan(pinnedScanId);
+      return;
+    }
+    // 一组 = 同名的扫描：点哪一条都是裁整组，所以名字从行上带着走（面板里会把整组列出来）
+    if (b.dataset.crop) {
+      openCropPanel(b.dataset.name || '');
       return;
     }
     // 手动查看不改 autoHandledScanId：否则自动路径会回头去拉已被删掉的那个扫描
@@ -1717,26 +2660,15 @@ function wire() {
     }
     if (t.id === 'lightbox-img') {
       // 点大图 = 取过该点的整行/整列剖面（读的是保存的那个 16 位 PNG）
-      const img = $(t.id);
-      const pt = profPixel(ev.clientX, ev.clientY, img.getBoundingClientRect(),
-                           img.naturalWidth, img.naturalHeight);
-      if (pt && lightboxPath) {
-        profPoint.lightbox = { path: lightboxPath, x: pt.x, y: pt.y };
-        profFetch('lightbox');
-      }
+      profPickFrom('lightbox', $(t.id), ev);
       return;
     }
     if (t.id === 'lightbox') closeLightbox();     // 点背景才关（点图现在是取剖面）
   });
 
   $('ccd-img').onclick = function (ev) {
-    if (!ccdLive) return;
-    const img = $('ccd-img');
-    const pt = profPixel(ev.clientX, ev.clientY, img.getBoundingClientRect(),
-                         img.naturalWidth, img.naturalHeight);
-    if (!pt) return;
-    profPoint.preview = pt;
-    profFetch('preview');
+    if (!ccdLive) return;                     // 没在取帧就没有"过该点的整行"可取
+    profPickFrom('preview', $('ccd-img'), ev);
   };
 
   document.addEventListener('keydown', function (e) {
@@ -1763,8 +2695,7 @@ openStream();
 renderTraceStats();   // 空统计 + 空态提示；曲线图等第一次记录再建，别摆一个空坐标系
 syncTraceUI();
 showView(location.hash.slice(1));   // 认 hash：刷新和双标签都停在自己那一页
-pollLink();
-setInterval(pollLink, 1000);   // 没有这行指示灯会永远停在启动瞬间的"已断开"
+linkPoll.start();   // 立刻问一次再按节拍问；没有它指示灯会永远停在启动瞬间的"已断开"
 loadHistory();
 loadGrabs();   // 原始帧列表：存一帧就多一张，开机先列出来
 // 相机可用性等切到「预览」那一页再问（首屏不必为一个可能用不到的设备多发一个请求）
@@ -1773,7 +2704,4 @@ loadGrabs();   // 原始帧列表：存一帧就多一张，开机先列出来
 window.addEventListener('beforeunload', ccdLiveStop);
 
 // 心跳只用于让后端知道界面还在；后端不会因为界面掉线而停扫描
-fetch('/api/heartbeat', { method: 'POST' }).catch(function () {});
-setInterval(function () {
-  fetch('/api/heartbeat', { method: 'POST' }).catch(function () {});
-}, 2000);
+beat.start();

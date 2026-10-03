@@ -203,6 +203,66 @@ main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
 }
 .tools label.mini { margin: 0; white-space: nowrap; }
 .tools input.mini { width: 86px; }
+/* 通用规则是 input, select 都 width:100%（表单里要撑满），工具行里不能那样：
+   一个下拉框会把整行吃掉、挤到下一行去。按内容宽度来。 */
+.tools select { width: auto; }
+/* 数据页的横轴能滚轮缩放、按住拖动平移：光标得说得出这件事（uPlot 自己不给 .u-over 定光标） */
+#data-chart .u-over { cursor: grab; }
+#data-chart .u-over.pan { cursor: grabbing; }
+/* 频谱图两条手势都能用：横轴（频率）与纵轴（功率/dB）各一个范围框 */
+#spec-chart .u-over { cursor: grab; }
+#spec-chart .u-over.pan { cursor: grabbing; }
+/* 频谱卡的高度由那根横向分栏线（--data-spec）说了算，像素曲线吃掉其余 */
+.view-data .col-data-curve > .card.spec { flex: 0 0 var(--data-spec, 380px); }
+/* dB 是负数、还带 4 位小数（-64.8366），86px 会把最后一位截掉 */
+.card.spec .tools input.mini { width: 96px; }
+
+/* 数据页：扫描组列表 + 裁剪面板 */
+.hint.warn { color: var(--bad); }
+.croplist { max-height: 200px; overflow: auto; margin-bottom: 8px; }
+.croprow {
+  display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
+  font: inherit; color: inherit; cursor: pointer;
+  background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+  padding: 5px 8px; margin-bottom: 4px;
+}
+.croprow:hover { background: #f8fafc; border-color: #cbd5e1; }
+.croprow b { flex: 0 0 auto; }
+.croprow span { flex: 1 1 auto; color: var(--muted); font-size: 12px; }
+.croprow em { flex: 0 0 auto; font-style: normal; font-size: 12px; color: var(--muted); }
+.croprow em.on { color: var(--ok); }
+.croprow em.no { color: var(--warn); }
+.croprow.dim { opacity: .55; }
+
+/* 裁剪面板：红框里是**将要留下**的那一块，框外压暗；四个数一律是原始坐标 */
+#croppanel {
+  position: fixed; inset: 0; z-index: 40; display: flex;
+  align-items: center; justify-content: center; background: rgba(15,23,42,.55);
+}
+#croppanel[hidden] { display: none; }
+.cropbox {
+  width: min(900px, 94vw); max-height: 92vh; overflow: auto;
+  background: var(--card); border-radius: var(--radius); padding: var(--pad) 16px;
+}
+.cropbody { display: flex; gap: 16px; align-items: flex-start; }
+.croppreview { flex: 0 0 380px; }
+/* 红框的百分比是相对**这一块**算的，所以图与框要单独包一层：
+   提示文字不能算进去，否则框的位置会跟着文字高度偏掉 */
+.cropframe {
+  position: relative; overflow: hidden;
+  border-radius: 6px; background: var(--dark);
+}
+.cropframe img { display: block; width: 100%; }
+#crop-rect {
+  position: absolute; border: 2px solid var(--bad);
+  box-shadow: 0 0 0 9999px rgba(15,23,42,.45); pointer-events: none;
+}
+.cropside { flex: 1 1 auto; min-width: 0; }
+.form4 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin-bottom: 8px; }
+@media (max-width: 900px) {
+  .cropbody { flex-direction: column; }
+  .croppreview { flex: 1 1 auto; width: 100%; }
+}
 .tsep { width: 1px; height: 20px; background: var(--line); }
 
 /* ---------- 控件 ---------- */

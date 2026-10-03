@@ -61,6 +61,7 @@ CAPS = Caps(
     has_velocity=True,
     unit="µm",
     default_settle_ms=DEFAULT_SETTLE_MS,
+    readback_to_um=1.0,     # PI 的位置读数本来就是 µm，没有折算
 )
 
 # Linux 下 E-709 以 FTDI 虚拟串口出现（内核 ftdi_sio 直接驱动，不需要 PI 的 .so）。

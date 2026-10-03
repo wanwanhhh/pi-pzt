@@ -33,6 +33,15 @@ class VelocityRequest(_Model):
     velocity: float = Field(gt=0, le=MAX_VELOCITY)
 
 
+class ReadbackRequest(_Model):
+    """给一条扫描标「这台设备采的」，或者清回未记录（source=None）。
+
+    能填的值由后端的 READBACK_SOURCES 说了算（键 → 系数），前端只送键、不送系数。
+    """
+
+    source: Optional[str] = None
+
+
 class ScanRequest(_Model):
     name: str = Field(default="", max_length=200)
     start_um: float

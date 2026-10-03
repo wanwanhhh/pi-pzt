@@ -244,7 +244,7 @@
           <table id="history">
             <thead><tr>
               <th>#</th><th>名称</th><th>范围 (µm)</th><th>点数</th>
-              <th>已采</th><th>状态</th><th>创建时间</th><th></th>
+              <th>已采</th><th>状态</th><th>创建时间</th><th>裁剪</th><th></th>
             </tr></thead>
             <tbody></tbody>
           </table>
@@ -388,6 +388,11 @@
           <label for="data-scan">选一条</label>
           <select id="data-scan"></select>
           <p class="hint" id="data-scan-info">—</p>
+
+          <label for="data-source">这条是哪台设备采的</label>
+          <select id="data-source"
+                  title="位置读回口径是**设备属性**（µm = 读回值 × 系数）：XMT 的读回是 4/3 µm，PI 报的就是 µm。建扫描时按当时那台设备自动记下；加这一列之前的老数据没记，只能在这里指认一次。指认只写「这条是哪台设备」这一个字段 —— 各点的读数、图、曲线一个字节都不动。"></select>
+          <p class="hint" id="data-source-note">—</p>
         </div>
       </section>
 
@@ -400,9 +405,11 @@
           </div>
           <div class="row top"><button id="btn-data-draw" class="primary grow1">画曲线</button></div>
           <p class="hint">坐标是<b>保存的 PNG 自己的</b>坐标（原生幅面、传感器朝向）——
-            与质心、图库大图上的剖面同一套，不受预览朝向影响。</p>
+            与质心、图库大图上的剖面同一套，不受预览朝向影响。
+            <b>裁剪过的扫描也是这一套坐标</b>：不用换算，也不用管裁没裁过。</p>
         </div>
       </section>
+
     </div>
 
     <!-- 分栏线：拖动改栏宽（双击复位，方向键微调）；拖出来的值记在 localStorage，刷新还在 -->
@@ -413,21 +420,107 @@
       <p class="coltitle">曲线 · 这个像素随扫描位置怎么变</p>
 
       <section class="card grow">
-        <div class="head"><h2>像素曲线<span class="sub" id="data-title">未取数</span></h2></div>
+        <div class="head">
+          <h2>像素曲线<span class="sub" id="data-title">未取数</span>
+            <span class="sub" id="data-xpin" hidden>横轴范围已钉住</span>
+            <span class="sub" id="data-order-note" hidden>已按横轴排序（不是采图顺序）</span>
+            <span class="sub" id="data-crop" hidden>已裁剪</span>
+            <span class="sub" id="data-scale-note" hidden>读回原值</span>
+          </h2>
+          <div class="right">
+            <button id="btn-data-scale" class="ghost"
+                    title="位置读回口径换一种读法：**折算** = 按设备声明的系数折成 µm（XMT 是 ×0.75）；**原值** = 设备当时报的数（µm ÷ 系数，XMT 上就是厂商上位机显示的那套数）。同一串位置的两种读法，后端四列一起下发 —— 切换不重新取数；范围和频谱跟着换算过去。系数没记下（老数据）或本来就是 1（PI）时禁用，按钮上会写明为什么。">口径：折算 µm</button>
+            <button id="btn-data-axis" class="ghost"
+                    title="横轴换一种读法：位置 = 台子走到哪（采图那一刻的读数）；时间 = 光走那段往返光程要多久（光程差 = 2×位移，再除以 c，跟波长无关）。同一串数换刻度，不重新取数。">横轴：位置 (µm)</button>
+          </div>
+        </div>
+        <div class="tools">
+          <label class="mini" for="data-xmin" id="data-xmin-k">X 最小 (µm)</label>
+          <input id="data-xmin" class="mini" type="number" step="any">
+          <label class="mini" for="data-xmax" id="data-xmax-k">X 最大 (µm)</label>
+          <input id="data-xmax" class="mini" type="number" step="any">
+          <button id="btn-data-fit" class="ghost"
+                  title="按这一段数据把横轴铺满；滚轮/拖动改过的范围也用它复位">自动范围</button>
+          <span class="tsep"></span>
+          <label class="mini" for="data-order">连线顺序</label>
+          <select id="data-order" title="采图顺序：相邻两次采样连线，读数往回走的地方就画回去（默认，如实）。按横轴排序：把点按横轴读数从小到大重排，曲线更顺 —— 但那是把定位散布排好了，不是消灭了它，丢帧那类「读数不动」的症状也会被藏起来。">
+            <option value="seq">采图顺序</option>
+            <option value="sort">按位置排序</option>
+          </select>
+        </div>
         <div class="chart" id="data-chart"></div>
         <dl class="stats">
           <div><dt>扫描点</dt><dd id="data-n">—</dd></div>
           <div><dt>有值</dt><dd id="data-ok">—</dd></div>
           <div><dt>没图的点</dt><dd id="data-missing">—</dd></div>
-          <div><dt>位置跨度 (µm)</dt><dd id="data-span">—</dd></div>
+          <div><dt id="data-span-k">位置跨度 (µm)</dt><dd id="data-span">—</dd></div>
           <div><dt>峰值 (ADU)</dt><dd id="data-peak">—</dd></div>
           <div><dt>幅面 · 位深 · 满量程</dt><dd id="data-size">—</dd></div>
         </dl>
         <p class="hint" id="data-empty">还没有取数。左边选一条扫描、填上像素坐标，点「画曲线」。</p>
-        <p class="hint">横轴是<b>采图那一刻记下来的读出位置</b>（µm —— 不是命令值、也不是点序号）；
+        <p class="hint">横轴默认是<b>采图那一刻记下来的读出位置</b>（µm —— 不是命令值、也不是点序号）；
+          点右上角那个按钮可换成<b>时间</b>（fs）：光在干涉仪里往返一趟，光程差 = 2×位移，
+          再除以 c（1 µm 位移 = 6.6713 fs，<b>跟波长无关</b>）。
+          横轴上<b>滚轮缩放、按住拖动平移</b>（改完就写进左边范围框、算钉住，「自动范围」一键复位）。
           纵轴是这一点上<b>那一个像素的原值</b>（ADU）：不平滑、不扣背景、不归一化。
           数据全部取自各点<b>已经落盘的帧</b>：不重采、不占设备，扫描跑着也能看已经采完的那一段；
           没图的点给不上值，曲线在那儿断开。</p>
+      </section>
+
+      <!-- 分栏线：拖动改频谱卡的高度（双击复位，方向键微调）；曲线吃掉其余。
+           与页面级那几根线走同一套（见 app.js 的 wireGutters）。 -->
+      <div class="gutter gutter-h" data-var="--data-spec" data-axis="y" data-of="next"
+           role="separator" aria-orientation="horizontal" aria-label="拖动调整频谱卡高度（双击复位，方向键微调）" tabindex="0"></div>
+
+      <!-- 频谱：对上面那条曲线做傅里叶变换。口径全写在下面那两句里 ——
+           动采样口径（真实点间距 / 整条 / 去均值 / 不加窗）之前先读它们。 -->
+      <section class="card spec">
+        <div class="head">
+          <h2>频谱<span class="sub" id="spec-title">未取数</span>
+            <span class="sub" id="spec-xpin" hidden>频率范围已钉住</span>
+            <span class="sub" id="spec-ypin" hidden>纵轴范围已钉住</span>
+          </h2>
+          <div class="right">
+            <button id="btn-spec-axis" class="ghost"
+                    title="频谱横轴换一种读法：频率（THz）或波长（µm，λ = c/ν）。**同一串数换刻度** —— 每根谱线的功率不变、只换横坐标（不是密度换算、不乘雅可比因子）；波长刻度上疏密不均（λ 与 1/ν 成正比），所以分辨率仍按频率写。换算系数来自后端，前端不写死。">横轴：频率 (THz)</button>
+            <button id="btn-spec-db" class="ghost"
+                    title="纵轴换一种读法：功率 = 该频率上正弦分量的均方功率（(A²+B²)/2，纯正弦幅度 A 进来峰高就是 A²/2）；dB = 相对这条谱里最强的那根（0 dB = 最强）。同一串数换刻度，不重算、不重新取数。">纵轴：功率 (ADU²)</button>
+          </div>
+        </div>
+        <div class="tools">
+          <label class="mini" for="spec-xmin">频率最小 (THz)</label>
+          <input id="spec-xmin" class="mini" type="number" step="any">
+          <label class="mini" for="spec-xmax">频率最大 (THz)</label>
+          <input id="spec-xmax" class="mini" type="number" step="any">
+          <button id="btn-spec-fit" class="ghost"
+                  title="按这条谱把频率轴铺满；滚轮/拖动改过的范围也用它复位">自动范围</button>
+          <span class="tsep"></span>
+          <label class="mini" for="spec-ymin" id="spec-ymin-k">功率最小 (ADU²)</label>
+          <input id="spec-ymin" class="mini" type="number" step="any">
+          <label class="mini" for="spec-ymax" id="spec-ymax-k">功率最大 (ADU²)</label>
+          <input id="spec-ymax" class="mini" type="number" step="any">
+          <button id="btn-spec-yfit" class="ghost"
+                  title="按这条谱把纵轴铺满；滚轮/拖动改过的范围也用它复位">自动范围</button>
+        </div>
+        <div class="chart" id="spec-chart"></div>
+        <dl class="stats stats-tight">
+          <div><dt>变换点数</dt><dd id="spec-n">—</dd></div>
+          <div><dt>真实跨度 (fs)</dt><dd id="spec-span">—</dd></div>
+          <div><dt id="spec-df-k">频率分辨率 (THz)</dt><dd id="spec-df">—</dd></div>
+          <div><dt id="spec-fmax-k">频率上限 (THz)</dt><dd id="spec-fmax">—</dd></div>
+          <div><dt id="spec-peak-k">最强分量 (THz)</dt><dd id="spec-peak">—</dd></div>
+          <div><dt>峰值 (ADU²)</dt><dd id="spec-peakval">—</dd></div>
+        </dl>
+        <p class="hint" id="spec-empty">还没有取数。上面画出曲线之后，这里就是它的频谱。</p>
+        <p class="hint">横轴可以换<b>频率</b>（THz）或<b>波长</b>（µm，λ = c/ν）—— 同一串数换刻度，
+          每根谱线的功率不变、只换横坐标（波长刻度上疏密不均，所以分辨率那一格仍按频率写）。
+          纵轴是<b>功率谱</b>：每个点按<b>它自己那一刻的时间</b>
+          （真实点间距 —— 不插值、不假设等间隔）拟合出这个频率上的正弦分量，功率 = (A²+B²)/2，
+          纯正弦幅度 A 进来峰高就是 A²/2；切到 dB 是相对这条谱里最强的那根。
+          已去均值（直流那根柱子会压掉别的峰，不画）、不加窗，<b>整条扫描的全部点</b>（可视范围只影响看，不参与变换），
+          一律按<b>采图顺序</b>（与上面那个「连线顺序」无关）。频率步长 = 1/T（T 是真实首末跨度），
+          上限卡在<b>名义 Nyquist</b> = 1/(2×平均间距)：越界给的是混叠，不是信息。
+          <b>缺一个点（没采到图 / 没记下读数）整条就不算</b> —— 谱里没有"断开"这回事，补一个数出来就是另一条序列。</p>
       </section>
     </div>
 
@@ -436,6 +529,43 @@
 </main>
 
 <div id="toast"></div>
+  <!-- 裁剪面板：点「扫描组」里的一组打开。矩形一律是**原始坐标**，
+       代表帧只是用来看框住没有（红框 = 将要留下的那一块） -->
+  <div id="croppanel" hidden>
+    <div class="cropbox">
+      <div class="head">
+        <h2>裁剪<span class="sub" id="crop-name">—</span></h2>
+        <div class="right"><button id="btn-crop-close" class="ghost">关闭</button></div>
+      </div>
+      <div class="cropbody">
+        <div class="croppreview">
+          <div class="cropframe">
+            <img id="crop-img" alt="这一组的代表帧">
+            <div id="crop-rect"></div>
+          </div>
+          <p class="hint">这是<b>8 位映射</b>（原值 ÷4，与图库同一口径）—— 16 位原值直接给浏览器看是整片黑的。
+            红框 = <b>将要留下的那一块</b>，框外压暗。</p>
+        </div>
+        <div class="cropside">
+          <div class="form4">
+            <div><label for="crop-x0">X0（列）</label><input id="crop-x0" type="number" min="0" step="1"></div>
+            <div><label for="crop-y0">Y0（行）</label><input id="crop-y0" type="number" min="0" step="1"></div>
+            <div><label for="crop-w">宽</label><input id="crop-w" type="number" min="16" step="1"></div>
+            <div><label for="crop-h">高</label><input id="crop-h" type="number" min="16" step="1"></div>
+          </div>
+          <div class="row top">
+            <button id="btn-crop-fit" class="ghost">用建议框</button>
+            <button id="btn-crop-run" class="primary grow1">裁剪这一组</button>
+          </div>
+          <p class="hint" id="crop-info">—</p>
+          <p class="hint warn" id="crop-warn" hidden></p>
+          <p class="hint" id="crop-progress" hidden></p>
+          <div id="crop-scans" class="croplist"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 <div id="lightbox" hidden>
   <div class="lb-imgwrap">
     <img id="lightbox-img" alt="">

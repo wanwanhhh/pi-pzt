@@ -80,12 +80,17 @@ def test_old_db_gets_the_new_column():
         cols = {r[1] for r in _query(t.db, "PRAGMA table_info(point)")}
         assert "settle_source" in cols, f"迁移没补列，现有列 {sorted(cols)}"
         assert "exposure_us" in cols, f"曝光列没补上，现有列 {sorted(cols)}"
+        scols = {r[1] for r in _query(t.db, "PRAGMA table_info(scan)")}
+        assert "readback_to_um" in scols, f"位置读回口径列没补上，现有列 {sorted(scols)}"
+        # 老扫描**不猜**口径：NULL = 未记录（猜一个系数会让整条曲线的横轴静默错位）
+        got = _query(t.db, "SELECT readback_to_um FROM scan")
+        assert got == [], got
 
 
 def test_add_point_round_trips_settle_source():
     with _TempStore() as t:
         store.init()
-        scan_id = store.create_scan("迁移测试", 0.0, 10.0, 2, 100)
+        scan_id = store.create_scan("迁移测试", 0.0, 10.0, 2, 100, 1.0)
         store.add_point(scan_id, 0, 1.0, 1.0, 5.0, True, SETTLE_SOFTWARE, None)
         got = _query(t.db, "SELECT settle_source FROM point")
         assert got and got[0][0] == SETTLE_SOFTWARE, got
@@ -95,11 +100,25 @@ def test_add_point_round_trips_exposure():
     """曝光随点入库；**没有**时留 NULL（不许倒填当前值）。"""
     with _TempStore() as t:
         store.init()
-        scan_id = store.create_scan("曝光", 0.0, 10.0, 2, 100)
+        scan_id = store.create_scan("曝光", 0.0, 10.0, 2, 100, 1.0)
         store.add_point(scan_id, 0, 1.0, 1.0, 5.0, True, SETTLE_SOFTWARE, "images/a.png", 12_000)
         store.add_point(scan_id, 1, 2.0, 2.0, 5.0, True, SETTLE_SOFTWARE, None)
         got = _query(t.db, "SELECT exposure_us FROM point ORDER BY idx")
         assert [r[0] for r in got] == [12_000, None], got
+
+
+def test_scan_readback_scale_round_trips():
+    """建扫描时抄下设备的口径；老扫描可以事后标一次（只改这一个字段）。"""
+    with _TempStore() as t:
+        store.init()
+        scan_id = store.create_scan("口径", 0.0, 10.0, 2, 100, 0.75)
+        assert store.get_scan(scan_id)["readback_to_um"] == 0.75
+        store.set_scan_readback(scan_id, 1.0)
+        assert store.get_scan(scan_id)["readback_to_um"] == 1.0
+        store.set_scan_readback(scan_id, None)          # 清回未记录
+        assert store.get_scan(scan_id)["readback_to_um"] is None, _query(
+            t.db, "SELECT readback_to_um FROM scan"
+        )
 
 
 # 模拟「上一版迁移已经补过列、但还没有回填逻辑」的库：

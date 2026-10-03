@@ -45,6 +45,8 @@ def test_series_reads_the_same_pixel_from_every_frame():
 
     assert got["value"] == [10, 20, 30], got["value"]
     assert got["idx"] == [0, 1, 2] and got["position_um"] == [5.0, 6.0, 7.0], got
+    # 横轴有两列（位置 / 时间），同长同序 —— 界面那个按钮就是在两列之间挑一列画
+    assert len(got["time_fs"]) == 3 and got["time_fs"][0] < got["time_fs"][1] < got["time_fs"][2], got["time_fs"]
     assert (got["x"], got["y"]) == (2, 1)
     assert (got["width"], got["height"], got["bits"], got["full_scale"]) == (7, 5, 16, 1022), got
     assert got["missing"] == 0
@@ -58,6 +60,77 @@ def test_position_is_passed_through_untouched():
         paths = _frames(Path(d), [1, 2])
         got = png_pixel_series([(0, None, paths[0]), (1, 12.5, paths[1])], 2, 1)
     assert got["position_um"] == [None, 12.5], got["position_um"]   # 没记下读数的点照实是 None
+    # 时间那一列与位置**一一对应**：位置没有的点时间也没有（不许拿 0 或序号顶上）
+    assert got["time_fs"][0] is None and got["time_fs"][1] > 0, got["time_fs"]
+
+
+def test_raw_columns_are_the_device_readback_without_the_coefficient():
+    """「没有系数」那一列 = 设备读回原值：µm ÷ 系数，时间同比例。
+
+    XMT 的读回是 4/3 µm（系数 0.75），所以原值比 µm 大 4/3 —— 那是同一串位置的**另一种读法**，
+    不是另一串数，也不是另一个物理量。
+    """
+    import tempfile
+
+    from backend.config import TIME_FS_PER_UM
+
+    with tempfile.TemporaryDirectory() as d:
+        paths = _frames(Path(d), [1, 2, 3])
+        items = [(0, 20.0, paths[0]), (1, 26.0, paths[1]), (2, None, paths[2])]
+        got = png_pixel_series(items, 2, 1, readback_to_um=0.75)
+
+    assert got["position_um"] == [20.0, 26.0, None], got["position_um"]
+    assert got["position_raw"][0] == 20.0 / 0.75, got["position_raw"]
+    assert got["position_raw"][1] == 26.0 / 0.75, got["position_raw"]
+    assert got["position_raw"][2] is None, got["position_raw"]     # 与折算列一一对应
+    assert got["time_raw_fs"][0] == 20.0 / 0.75 * TIME_FS_PER_UM, got["time_raw_fs"]
+    assert got["time_raw_fs"][2] is None, got["time_raw_fs"]
+
+
+def test_wavelength_constant_is_the_speed_of_light_in_other_units():
+    """频谱横轴「频率 → 波长」用的系数：λ[µm] = 系数 ÷ ν[THz]。
+
+    1 THz 的光波长就是 299.792458 µm（c 换个单位）—— 与 OPD_FACTOR 无关：波长是光自己的
+    性质，不取决于干涉仪里光走了几趟。这个数写错，整张波长谱会整体平移。
+    """
+    from backend.config import C_UM_PER_FS, WAVELENGTH_UM_PER_THZ
+
+    assert abs(WAVELENGTH_UM_PER_THZ - 299.792458) < 1e-6, WAVELENGTH_UM_PER_THZ
+    assert abs(WAVELENGTH_UM_PER_THZ - C_UM_PER_FS * 1e3) < 1e-9, WAVELENGTH_UM_PER_THZ
+
+
+def test_no_coefficient_means_no_raw_column():
+    """系数是 1（PI 的位置本来就是 µm）或没记下（老数据）时**不给原值列**。
+
+    拿 µm 冒充原值就是编数，比"没有这一列"更糟 —— 界面据此把「口径」按钮禁用。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        paths = _frames(Path(d), [1])
+        for factor in (None, 1.0):
+            got = png_pixel_series([(0, 12.5, paths[0])], 2, 1, readback_to_um=factor)
+            assert got["position_raw"] is None and got["time_raw_fs"] is None, (factor, got)
+            assert got["position_um"] == [12.5], got           # 折算那一列照旧要给
+            assert got["time_fs"][0] > 0, got["time_fs"]
+
+
+def test_time_axis_is_the_round_trip_light_path_over_c():
+    """横轴第二列：光程差 = **2×位移**（光在干涉仪里往返一趟），再除以 c。
+
+    1 µm 位移 = 2 / 0.299792458 = 6.6713 fs；1 fs 光走 0.299792458 µm（c = 299792458 m/s）。
+    系数钉在这里：**光路若只单程走一次，改 OPD_FACTOR 时这条会红**，改的人得先确认光路。
+    跟波长无关（(2x/λ)·(λ/c) = 2x/c），所以这条里没有任何波长。
+    """
+    from backend.config import C_UM_PER_FS, OPD_FACTOR, TIME_FS_PER_UM
+
+    assert OPD_FACTOR == 2.0, "往返：光程差是台子位移的两倍"
+    assert abs(C_UM_PER_FS - 0.299792458) < 1e-12, C_UM_PER_FS
+    assert abs(TIME_FS_PER_UM - 6.6712819) < 1e-6, TIME_FS_PER_UM
+
+    got = png_pixel_series([(0, 20.0, None), (1, 130.0, None)], 0, 0)["time_fs"]
+    # 截图那条扫描的两端：20 µm → 133.43 fs，130 µm → 867.27 fs
+    assert abs(got[0] - 133.4256) < 1e-3 and abs(got[1] - 867.2666) < 1e-3, got
 
 
 def test_points_without_a_frame_stay_none():

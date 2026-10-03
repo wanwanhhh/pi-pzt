@@ -71,6 +71,7 @@ CAPS = Caps(
     has_velocity=False,   # 协议表里没有速度指令，set_velocity 明确拒绝
     unit="µm",
     default_settle_ms=XMT_DEFAULT_SETTLE_MS,
+    readback_to_um=XMT_READBACK_TO_UM,   # 读回是 4/3 µm（实测，见 XMT_READBACK_TO_UM）
 )
 
 # 协议 §2.5 要求主机帧间隔最少 50 ms。实测不强制（背靠背连发两条都被处理），

@@ -79,7 +79,9 @@ class Scanner:
             if self._state["status"] in ("running", "paused"):
                 raise ScanError("已有扫描在运行，请先中止或等待结束")
             scan_id = store.create_scan(
-                req.name, req.start_um, req.stop_um, req.count, settle_ms
+                req.name, req.start_um, req.stop_um, req.count, settle_ms,
+                # 位置读回口径跟着设备走（设备属性）：这条扫描以后要按它反推原值
+                self._stage.caps.readback_to_um,
             )
             self._abort.clear()
             self._resume.set()

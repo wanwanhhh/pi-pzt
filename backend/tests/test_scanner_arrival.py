@@ -44,6 +44,9 @@ class FakeStage:
         name="假设备", platform="测试", has_on_target=True, has_stop_command=True,
         release_mode="servo_off", has_setpoint_ack=True, has_velocity=True,
         unit="µm", default_settle_ms=300,
+        # 读回口径是设备属性（XMT 那样 0.75，PI 是 1.0）：扫描要把它抄进 scan 表，
+        # 数据页才能按原值再看一遍同一串位置。这里故意给 0.75，好钉住"确实抄下来了"。
+        readback_to_um=0.75,
     )
 
     # 这台假设备声明"要做采图前的相对校验"（PI 那样）；XMT 声明 False，见下面那两条用例
@@ -141,6 +144,18 @@ def test_normal_scan_records_every_point():
         pts = store.get_points(int(st["scan_id"]))
         assert len(pts) == 5
         assert [round(p["target_um"], 4) for p in pts] == [10.0, 11.0, 12.0, 13.0, 14.0]
+
+
+def test_scan_records_the_readback_scale_of_that_device():
+    """位置读回口径跟着**设备**进库（不是全局常量）：数据页要按它把 µm 反推成原值。
+
+    设备换了、系数改了，老扫描也得算得对 —— 所以口径记在扫描上，不靠"现在配置的是哪台"。
+    """
+    with with_temp_store():
+        st = run_scan(ScanRequest(start_um=10.0, stop_um=11.0, count=2, settle_ms=0),
+                      FakeStage(), FakeCapture())
+        scan = store.get_scan(int(st["scan_id"]))
+        assert scan["readback_to_um"] == 0.75, scan
 
 
 def test_point_records_the_exposure_of_that_shot():

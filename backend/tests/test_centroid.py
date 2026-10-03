@@ -163,7 +163,8 @@ def test_png_without_text_blocks_says_none():
         p = Path(d) / "old.png"
         _save_png16(p, np.ones((4, 4), dtype=np.uint16))
         meta = read_png_meta(p)
-    assert meta == {"exposure_us": None, "centroid": None}, meta
+    # crop 是后加的第三块（裁剪记录），同样是"没有就说没有"
+    assert meta == {"exposure_us": None, "centroid": None, "crop": None}, meta
 
 
 def test_thumb_mapping_depends_on_bit_depth():

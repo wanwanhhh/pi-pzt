@@ -20,10 +20,10 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Any, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -36,20 +36,26 @@ from fastapi.staticfiles import StaticFiles
 from . import store
 from .ccd import make_capture
 from .config import (
+    CROP_H,
+    CROP_W,
     DATA_DIR,
     HEARTBEAT_TIMEOUT_S,
     HOST,
     IMAGE_DIR,
     PORT,
+    READBACK_SOURCES,
     STATIC_DIR,
     TELEMETRY_HZ,
     TELEMETRY_HZ_SCAN,
+    TIME_FS_PER_UM,
     TRACE_BUFFER_S,
     TRACE_MAX_S,
     TRACE_MIN_S,
+    WAVELENGTH_UM_PER_THZ,
 )
 from .models import (
     JogRequest,
+    ReadbackRequest,
     MoveRequest,
     ScanControl,
     ScanRequest,
@@ -160,6 +166,7 @@ async def lifespan(_: FastAPI):
         # 控制器没开也让服务起来，界面会显示未连接，之后可以点"重连"。
         # 这里不能只抓 StageError：DLL 加载/回执异常会是别的类型。
         log.error("设备连接失败：%s", exc, exc_info=True)
+    _recover_crops()          # 上次进程被杀在裁剪半路：先把现场收干净再对外服务
     telemetry.start()
     log.info("服务就绪：http://%s:%d", HOST, PORT)
     try:
@@ -209,12 +216,16 @@ def _require_servo() -> None:
 # ------------------------------------------------------------------ 状态
 @app.get("/api/status")
 def api_status() -> dict:
-    return {
-        "stage": stage.poll().as_dict(),
-        "scan": scanner.state(),
-        "caps": CAPS_DICT,
-        "frontend_online": time.time() - _last_heartbeat < HEARTBEAT_TIMEOUT_S,
-    }
+    """与 /api/events 推的**同一份快照**，不再自己问一次设备。
+
+    遥测线程才是唯一的设备轮询者（每次查询约 32 ms，多一个轮询者就是两份读数互相拖）：
+    这里现问一次设备，等于绕开它开了第二个轮询者，还可能让界面同时看到两个不一致的位置。
+    首帧之前（启动后约 100 ms 内）快照里还没有 stage，那一次现问 —— 只有这一次。
+    """
+    latest = telemetry.latest()
+    if latest.get("stage") is None:
+        latest = {**latest, "stage": stage.poll().as_dict()}
+    return latest
 
 
 @app.get("/api/events")
@@ -275,21 +286,49 @@ def _ccd_idle() -> None:
         raise HTTPException(409, "扫描进行中，相机归扫描用；先暂停或中止再看预览")
 
 
-@app.post("/api/ccd/preview")
-async def ccd_preview(on: bool = Query(True)) -> dict:
-    """开/关连续预览。开的时候要打开相机，慢，所以丢到线程里。"""
+def _camera() -> Any:
+    """相机接口**共同的那道门**：扫描占用 → 409，没接真相机 → 503；过了门才拿到相机对象。
+
+    预览 / 剖面 / 曝光 / 重开 / 朝向 / 存帧这六个接口本来各自抄一遍这三行，
+    状态码还各写各的（同一类失败有的 400 有的 503）—— 收在这里，「谁能进门」就一条规矩。
+    /api/ccd/status **故意不走这道门**：它每时每刻都得答得出来，
+    连不上相机时也要如实说连不上（见那个函数的说明）。
+    """
     _ccd_idle()
-    from .config import CCD_BACKEND
+    from .ccd import CCD_BACKEND
 
     if CCD_BACKEND != "thorlabs":
         raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
     from .ccd import thorlabs_camera
 
-    camera = thorlabs_camera()
+    return thorlabs_camera()
+
+
+CameraDep = Annotated[Any, Depends(_camera)]
+
+
+async def _camera_call(fn: Any, *args: Any) -> Any:
+    """把相机调用丢进线程，错误只在这里分一次类：**填错了 400、设备不可用 503**。
+
+    相机层本来就分好了（CameraInputError 是 CameraError 的子类），这里只做映射；
+    其余的（PIL / ctypes 原生错误…）一律算设备不可用 —— 那是相机的故障，不是用户填错。
+    """
+    from .thorlabs_ccd import CameraError, CameraInputError
+
     try:
-        return await asyncio.to_thread(camera.preview, on)
-    except Exception as exc:
+        return await asyncio.to_thread(fn, *args)
+    except CameraInputError as exc:               # 坐标越界、朝向不是 90° 的倍数…
+        raise HTTPException(400, str(exc)) from exc
+    except CameraError as exc:                    # 没有会话、没有帧、相机报错
         raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:                      # noqa: BLE001
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/api/ccd/preview")
+async def ccd_preview(on: bool = Query(True), cam: CameraDep = None) -> dict:
+    """开/关连续预览。开的时候要打开相机，慢，所以丢到线程里。"""
+    return await _camera_call(cam.preview, on)
 
 
 def _safe_image_path(path: str) -> Path:
@@ -447,23 +486,14 @@ def delete_grab(name: str) -> dict:
 async def ccd_profile(
     x: int = Query(..., ge=0, description="显示坐标（跟随预览朝向）"),
     y: int = Query(..., ge=0),
+    cam: CameraDep = None,
 ) -> dict:
     """过 (x, y) 的两条**全长**剖面：水平整行 + 垂直整列，取自最近一帧**原生 16 位**数据。
 
     坐标是**显示坐标** —— 先按当前朝向转成视图再切，所以转了 90° 之后"水平"仍是你看到的水平。
     不做任何处理（不扣背景、不平滑），值就是相机的 0~1022 ADU。
     """
-    _ccd_idle()
-    from .config import CCD_BACKEND
-
-    if CCD_BACKEND != "thorlabs":
-        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
-    from .ccd import thorlabs_camera
-
-    try:
-        return await asyncio.to_thread(thorlabs_camera().profile, x, y)
-    except Exception as exc:
-        raise HTTPException(400, str(exc)) from exc
+    return await _camera_call(cam.profile, x, y)
 
 
 @app.get("/api/image/profile")
@@ -511,63 +541,35 @@ def grab_thumb(
 @app.post("/api/ccd/exposure")
 async def ccd_exposure(
     exposure_us: int = Query(..., gt=0, le=270_000_000, description="曝光（µs），预览与采图共用"),
+    cam: CameraDep = None,
 ) -> dict:
     """改曝光（**预览与采图一起改**），立刻生效。范围由相机层按设备自报值校验（安全边界）。
 
     设完之后采的每一帧，元数据与 PNG 自带的 tEXt 里记的都是相机读回的实际曝光。
     """
-    _ccd_idle()
-    from .config import CCD_BACKEND
-
-    if CCD_BACKEND != "thorlabs":
-        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
-    from .ccd import thorlabs_camera
-
-    try:
-        return await asyncio.to_thread(thorlabs_camera().set_exposure, exposure_us)
-    except Exception as exc:
-        raise HTTPException(503, str(exc)) from exc
+    return await _camera_call(cam.set_exposure, exposure_us)
 
 
 @app.post("/api/ccd/reopen")
-async def ccd_reopen() -> dict:
+async def ccd_reopen(cam: CameraDep = None) -> dict:
     """重开相机：USB 接触不良 / 相机掉线之后，只有把旧句柄丢掉再开才能接回来。
 
     **手动功能，不做自动重连**（用户定的）：什么时候重开由人决定。
-    扫描进行中一律 409（相机归扫描用），与其它相机接口同规矩。
+    扫描进行中一律 409（相机归扫描用），与其它相机接口同规矩 —— 这道门在 _camera()。
     """
-    _ccd_idle()
-    from .config import CCD_BACKEND
-
-    if CCD_BACKEND != "thorlabs":
-        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
-    from .ccd import thorlabs_camera
-
-    try:
-        return await asyncio.to_thread(thorlabs_camera().reopen)
-    except Exception as exc:
-        raise HTTPException(503, str(exc)) from exc
+    return await _camera_call(cam.reopen)
 
 
 @app.post("/api/ccd/rotation")
 async def ccd_rotation(
     deg: int = Query(..., description="预览显示朝向，顺时针 0/90/180/270；**只转预览，不动保存的文件**"),
+    cam: CameraDep = None,
 ) -> dict:
     """转预览的显示朝向。不是设备设置、更不是数据加工：取帧后转过来显示而已（90° 整数倍是精确置换）。
 
     保存的原生帧永远是传感器朝向 —— 要"文件也转"是另一件事（会让像素坐标和传感器脱钩），没做。
     """
-    _ccd_idle()
-    from .config import CCD_BACKEND
-
-    if CCD_BACKEND != "thorlabs":
-        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
-    from .ccd import thorlabs_camera
-
-    try:
-        return await asyncio.to_thread(thorlabs_camera().set_rotation, deg)
-    except Exception as exc:
-        raise HTTPException(400, str(exc)) from exc
+    return await _camera_call(cam.set_rotation, deg)
 
 
 @app.post("/api/ccd/gain")
@@ -580,24 +582,14 @@ def ccd_gain_locked(gain: int = Query(0, description="已固定为 0")) -> dict:
 
 
 @app.post("/api/ccd/capture")
-async def ccd_capture() -> dict:
+async def ccd_capture(cam: CameraDep = None) -> dict:
     """采一帧原生全幅存盘（不裁剪）。走扫描采图同一段代码，但不属于任何扫描。
 
     **登记放在这一层**：相机层在 store 之下，不许反向依赖它（见 AGENTS.md 分层）。
     图库按登记表列，"存了盘"和"进图库"是两件事 —— 后者只有手动保存才有，
     扫描各点的图归 point.image_path。
     """
-    _ccd_idle()
-    from .config import CCD_BACKEND
-
-    if CCD_BACKEND != "thorlabs":
-        raise HTTPException(503, f"CCD 后端是 {CCD_BACKEND}，没有真相机")
-    from .ccd import thorlabs_camera
-
-    try:
-        info = await asyncio.to_thread(thorlabs_camera().save_raw)
-    except Exception as exc:
-        raise HTTPException(503, str(exc)) from exc
+    info = await _camera_call(cam.save_raw)
     store.register_grab(Path(info["path"]).name)
     return info
 
@@ -750,6 +742,38 @@ def api_scan_list(limit: int = 50) -> list[dict]:
     return store.list_scans(limit)
 
 
+@app.get("/api/readback-sources")
+def api_readback_sources() -> dict:
+    """「这条扫描的位置口径」能选的几项（键 / 文案 / 系数）。
+
+    系数是设备属性、**只写在后端这一处**：界面拿它建下拉框、判断能不能切原值，
+    送回来的只是键。数据页那个「口径」按钮用它决定禁用与文案。
+    """
+    return {"sources": [
+        {"key": k, "label": label, "factor": f} for k, label, f in READBACK_SOURCES
+    ]}
+
+
+@app.post("/api/scans/{scan_id}/readback")
+def api_scan_readback(scan_id: int, req: ReadbackRequest) -> dict:
+    """标一次「这条扫描是哪台设备采的」—— 加 readback_to_um 这一列之前的老数据没记。
+
+    只改 scan.readback_to_um 这一个字段：**测量数据一个字节都不动**（各点的位置读数、
+    图、曲线都是原样），原值那一列是取数时按这个系数从已存的 µm 反推出来的。
+    没记下口径就不给原值那一列 —— 拿 µm 冒充原值是编数，比没有更糟。
+    """
+    if store.get_scan(scan_id) is None:
+        raise HTTPException(404, "扫描不存在")
+    factor = None
+    if req.source:
+        hit = [f for k, _, f in READBACK_SOURCES if k == req.source]
+        if not hit:
+            raise HTTPException(400, f"不认识的口径：{req.source}")
+        factor = hit[0]
+    store.set_scan_readback(scan_id, factor)
+    return {"scan_id": scan_id, "readback_to_um": factor}
+
+
 @app.get("/api/scans/{scan_id}")
 def api_scan_detail(scan_id: int) -> dict:
     scan = store.get_scan(scan_id)
@@ -768,15 +792,24 @@ def api_scan_pixel(
     """一条扫描里、**每个扫描点上同一个像素**的值 —— 数据处理页那条曲线的取数口子。
 
     数据全部来自各点**已经落盘的 PNG**：不是重采、不碰设备、不占设备带宽（只是读文件）。
-    position_um 是**采图那一刻记下来的读出位置**（point.actual_um），曲线的横轴就是它 ——
+    position_um 是**采图那一刻记下来的读出位置**（point.actual_um）——
     命令值只说明"想让台子去哪"，这里的每一个点都是"当时读数是多少"。
+    time_fs 是同一串位置的另一种读法（光程差 2x ÷ c，系数见 config.py）：横轴那个
+    「位置 / 时间」按钮在两者之间挑一列。**两列一起给**，切换不必再取一次数。
     没图的点给 null，**不补值、不插值**：曲线在那里断开。
+
+    **x/y 永远是原始坐标**（跟质心、剖面、老数据同一套），这条扫描裁过也一样 ——
+    裁剪只改存盘方式，偏移在读文件那一层减一次（见 store.get_crop）。点在裁剪框外当场报错。
     """
     from .thorlabs_ccd import png_pixel_series
 
     scan = store.get_scan(scan_id)
     if scan is None:
         raise HTTPException(404, "扫描不存在")
+    crop = store.get_crop(scan_id)
+    if crop and crop["state"] != "done":
+        raise HTTPException(409, "这条扫描正在裁剪，等它跑完再取数")
+    rect = (crop["x0"], crop["y0"], crop["w"], crop["h"]) if crop else None
     points = store.get_points(scan_id)
     items = [
         (p["idx"], p["actual_um"],
@@ -784,7 +817,9 @@ def api_scan_pixel(
         for p in points
     ]
     try:
-        series = png_pixel_series(items, x, y)
+        series = png_pixel_series(
+            items, x, y, crop=rect, readback_to_um=scan.get("readback_to_um")
+        )
     except ValueError as exc:                 # 点落在画面外：这是坐标填错了，说清楚
         raise HTTPException(400, str(exc)) from exc
     return {
@@ -792,6 +827,15 @@ def api_scan_pixel(
         "name": scan["name"],
         "status": scan["status"],
         "count": len(points),
+        # 位置 → 时间的系数，**只给界面换算「横轴范围」那两个输入框用**（换读法时把同一个
+        # 视窗换过去）。曲线上的数一律照下面那几列搬 —— 前端不自己乘任何系数。
+        "time_fs_per_um": TIME_FS_PER_UM,
+        # 频谱图横轴「频率 → 波长」的换算系数（λ[µm] = 它 ÷ ν[THz]）。频谱本身是前端算的
+        # （频率格 k/T 在前端），所以这里给的是**系数**而不是一列数 —— 但系数只写在后端一处。
+        "wavelength_um_per_thz": WAVELENGTH_UM_PER_THZ,
+        # 这条扫描的位置读回口径（µm = 读回值 × 它）：NULL = 没记下是哪台设备采的，
+        # 那种扫描不给原值列（series.position_raw 是 None），界面据此禁用「口径」按钮。
+        "readback_to_um": scan.get("readback_to_um"),
         **series,
     }
 
@@ -805,6 +849,262 @@ def api_scan_delete(scan_id: int) -> dict:
         raise HTTPException(409, "扫描进行中，先中止再删除")
     store.delete_scan(scan_id)
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ 数据页：裁剪
+# 一组扫描（同名的那几条）裁成同一块矩形、就地换掉原图，**坐标口径不变**：
+# 库里和 PNG 里都记 (x0,y0,w,h)，只在读文件那一层减一次偏移（见 thorlabs_ccd.png_pixel_series）。
+# 整组要跑十几秒到几分钟（2000 张约 17 s），所以放后台线程 + 进度，不占 HTTP 连接。
+# 裁剪只读盘上的图，不碰设备 —— 但**扫描进行中一律拒绝**：别跟采图抢磁盘。
+
+_CROP_JOB: dict = {"running": False, "group": "", "done": 0, "total": 0,
+                   "error": None, "result": None}
+
+
+def _scan_id_of(filename: str) -> Optional[int]:
+    """scan0053_00000.png → 53（只认自家给帧起的名字）。"""
+    m = re.match(r"scan(\d+)_", filename)
+    return int(m.group(1)) if m else None
+
+
+def _recover_crops() -> None:
+    """收尾上一次进程被杀在半路的裁剪。
+
+    约定见 thorlabs_ccd.finish_staged_crops：orig/ 里还有原图 = 这一批没裁完（挪回来，
+    库里的 cropping 记录删掉）；orig/ 已经没了 = 图都就位了、只差改状态（改成 done）。
+    """
+    from .thorlabs_ccd import finish_staged_crops
+
+    try:
+        leftovers = finish_staged_crops()
+    except OSError as exc:
+        log.error("收拾上次的裁剪现场失败：%s", exc, exc_info=True)
+        return
+    if not leftovers:
+        return
+    back, finished = {}, False
+    for item in leftovers:
+        if item["rolled_back"]:
+            # 现场说明里记着"裁之前每条是什么样"：这批要是**再裁**，开工时库已经被改成新矩形了，
+            # 只有这里还留着旧的 —— 按它改回去
+            back |= {sid: None for sid in (_scan_id_of(n) for n in item["files"]) if sid is not None}
+            for k, v in ((item.get("plan") or {}).get("prev") or {}).items():
+                back[int(k)] = v
+        else:
+            finished = True
+    if back:
+        _crop_restore(back)
+        log.warning("上次裁剪没跑完，已把 %d 条扫描的原图放回、库改回裁之前：%s",
+                    len(back), sorted(back))
+    if finished:
+        rest = [c["scan_id"] for c in store.all_crops() if c["state"] == "cropping"]
+        if rest:
+            store.set_crop_state(rest, "done")
+            log.warning("上次裁剪其实已经完成，补记 %d 条：%s", len(rest), rest)
+
+
+def _crop_plan(name: str) -> dict:
+    """这一组能不能裁、要动哪些文件、现在这块地是哪儿（**原始坐标**）。
+
+    预检结果**如实回报、不替人做决定**：画面尺寸不一致（比如混进 64×64 的假相机测试扫描）、
+    裁剪记录不一致、没有图、正在扫、**库和文件对不上** —— 逐条列出来，能裁的那些才进 items。
+    **已经裁过的可以再裁**：base 就是现在这块地，框只能往里选（裁掉的找不回来）。
+    """
+    from .thorlabs_ccd import png_size, read_png_meta
+
+    scans = store.scans_named(name)
+    if not scans:
+        raise HTTPException(404, f"没有叫「{name}」的扫描")
+    st = scanner.state()
+    rows = []
+    for s in scans:
+        paths = [DATA_DIR / p["image_path"]
+                 for p in store.get_points(s["id"]) if p["image_path"]]
+        rec = store.get_crop(s["id"])
+        db_rect = [rec["x0"], rec["y0"], rec["w"], rec["h"]] if rec else None
+        why, box, file_rect = "", None, None
+        if not paths:
+            why = "没有图"
+        elif st["scan_id"] == s["id"] and st["status"] in ("running", "paused"):
+            why = "正在扫描"
+        else:
+            try:
+                box = png_size(paths[0])
+                file_rect = read_png_meta(paths[0])["crop"]
+            except OSError:
+                why = "第一张图读不动"
+        if not why and file_rect != db_rect:
+            # 库说有、文件说没有（或者反过来、数值不同）：这是"坐标会悄悄错位"的那一类，
+            # 停下来查 —— 我们正踩在唯一能自动发现它的地方
+            why = (f"库和文件对不上（库 {db_rect or '没记录'}，"
+                   f"文件 {file_rect or '没记录'}）")
+        rows.append({"id": s["id"], "points": len(store.get_points(s["id"])),
+                     "images": len(paths), "size": list(box) if box else None,
+                     "rect": db_rect, "ok": not why, "why": why, "paths": paths})
+    # 参考 = 组里**出现次数最多**的那一对（画面尺寸, 裁剪记录）（并列取面积大的）。
+    # 一组里混进 64×64 的假相机占位帧时，要按真正的相机画面裁；混进裁过的、没裁过的、
+    # 或者两种裁剪记录，也不能挑错 —— 挑错的后果是裁出来一批"看着成功、其实框错了"的图。
+    key = None
+    if rows:
+        count: dict = {}
+        for r in rows:
+            if r["ok"] and r["size"]:
+                k = (tuple(r["size"]), tuple(r["rect"]) if r["rect"] else None)
+                count[k] = count.get(k, 0) + 1
+        if count:
+            key = max(count, key=lambda k: (count[k], k[0][0] * k[0][1]))
+    items, total = [], 0
+    for r in rows:
+        if r["ok"] and key:
+            if tuple(r["size"]) != key[0]:
+                r["ok"], r["why"] = False, (
+                    f"画面尺寸不一致（{r['size'][0]}×{r['size'][1]}，"
+                    f"这一组按 {key[0][0]}×{key[0][1]} 裁）")
+            elif (tuple(r["rect"]) if r["rect"] else None) != key[1]:
+                was = "×".join(str(v) for v in (r["rect"][2:4] if r["rect"] else [])) or "没裁过"
+                now = "×".join(str(v) for v in (key[1][2:4] if key[1] else [])) or "没裁过"
+                r["ok"], r["why"] = False, f"裁剪记录不一致（它是 {was}，这一组按 {now} 算）"
+        if r["ok"]:
+            items += [(r["id"], p) for p in r["paths"]]
+            total += sum(p.stat().st_size for p in r["paths"])
+        r.pop("paths")
+    base = list(key[1]) if key and key[1] else None
+    bad = "、".join(f"#{r['id']} {r['why']}" for r in rows if not r["ok"])
+    return {
+        "items": items,
+        "prev": {r["id"]: r["rect"] for r in rows if r["ok"]},   # 开工前的库记录，回滚要按它改回去
+        "out": {"name": name, "scans": rows, "images": len(items), "bytes": total,
+                "frame": list(key[0]) if key else None, "base": base,
+                # 代表帧（相对 data/ 的路径）：面板上把它显示出来 + 画红框，
+                # 框住没框住一眼就能看出来，比只看四个数可靠
+                "sample": items[0][1].relative_to(DATA_DIR).as_posix() if items else None},
+        "ok": bool(items),
+        "why": f"这一组没有能裁的扫描（{bad}）" if bad else "这一组没有能裁的扫描",
+    }
+
+
+def _crop_restore(prev: dict) -> None:
+    """把库里的裁剪记录改回**这一批开工之前**的样子（文件已经回滚了，库得跟着回）。
+
+    裁之前没记录的（第一次裁）就把记录删掉；有记录的按 plan 里记的矩形改回去 ——
+    少了这一步，再裁失败之后库和文件就再也对不上，而那是不会自己报错的。
+    """
+    keep = [{"scan_id": sid, "x0": r[0], "y0": r[1], "w": r[2], "h": r[3]}
+            for sid, r in prev.items() if r]
+    if keep:
+        store.set_crop_rects(keep)
+    gone = [sid for sid, r in prev.items() if not r]
+    if gone:
+        store.delete_crops(gone)
+
+
+def _crop_worker(ids: list, items: list, rect: tuple, prev: dict) -> None:
+    """后台把整组裁完。**失败就什么都不留**：文件由 crop_frames 回滚，库改回裁之前的样子。"""
+    from .thorlabs_ccd import crop_frames
+
+    x0, y0, w, h = rect
+
+    def progress(done: int, total: int) -> None:
+        _CROP_JOB.update({"done": done, "total": total})
+
+    try:
+        report = crop_frames(items, x0, y0, w, h, progress=progress, prev=prev)
+    except Exception as exc:                     # noqa: BLE001 —— 裁剪失败不该带走服务
+        _crop_restore(prev)
+        log.error("裁剪失败（整组已回滚，原图没动）：%s", exc)
+        _CROP_JOB.update({"running": False, "error": str(exc)})
+        return
+    for sid in ids:
+        one = report["per_scan"].get(sid, {"frames": 0, "saved_bytes": 0})
+        store.finish_crop(sid, one["frames"], one["saved_bytes"])
+    log.info("裁剪完成：%s 条扫描、%d 张，省了 %.1f MB", len(ids), report["frames"],
+             report["saved_bytes"] / 1e6)
+    _CROP_JOB.update({
+        "running": False, "done": report["frames"], "total": report["frames"],
+        "result": {"scans": len(ids), "frames": report["frames"],
+                   "saved_bytes": report["saved_bytes"], "peak": report["peak"],
+                   "edge_peak": report["edge_peak"], "rect": list(rect)},
+    })
+
+
+@app.get("/api/crops")
+def api_crop_list() -> dict:
+    """扫描组 + 每组裁没裁过；外加**每条扫描**的裁剪状态（历史表那一列照着它写）。"""
+    return {"groups": store.scan_groups(), "job": _CROP_JOB, "w": CROP_W, "h": CROP_H,
+            "crops": [{"id": c["scan_id"], "rect": [c["x0"], c["y0"], c["w"], c["h"]],
+                       "frames": c["frames"], "state": c["state"]}
+                      for c in store.all_crops()]}
+
+
+@app.get("/api/crops/suggest")
+def api_crop_suggest(name: str = Query(..., description="组名（同名的扫描算一组）"),
+                     w: int = Query(CROP_W, ge=16, le=8192),
+                     h: int = Query(CROP_H, ge=16, le=8192)) -> dict:
+    """建议矩形 + 预检。只读文件头和 tEXt（不解码），几百张的组也是秒回。"""
+    from .thorlabs_ccd import suggest_crop
+
+    plan = _crop_plan(name)
+    if not plan["ok"]:
+        raise HTTPException(400, plan["why"])
+    base = plan["out"]["base"]
+    out = {**plan["out"], "rect": suggest_crop(plan["items"], size=(w, h), base=base)}
+    # 建议框把**现在这块地**整个框进去了 = 这一步裁了不会更快（假相机采的占位小图就是这样）。
+    # 话说在面板上，别让人点一下才被拒。**不拦**：框小一点照样能裁（只是没收益）。
+    bw, bh = (base[2], base[3]) if base else (out["frame"][0], out["frame"][1])
+    if out["rect"]["w"] >= bw and out["rect"]["h"] >= bh:
+        out["note"] = (f"这一组现在是 {bw}×{bh}，建议框就是这一整幅 —— "
+                       + ("再裁就把框改小一点。" if base else "裁了不会更快（多半是假相机采的占位小图）。"))
+    return out
+
+
+@app.post("/api/crops/run")
+def api_crop_run(name: str = Query(...),
+                 x0: int = Query(..., ge=0), y0: int = Query(..., ge=0),
+                 w: int = Query(..., ge=16), h: int = Query(..., ge=16)) -> dict:
+    """把这一组每一帧裁成 (x0,y0,w,h)（**原始坐标**），就地换掉原图 —— **不可逆**。
+
+    先落库（state=cropping）再动文件：进程被杀在半路时靠它判断该往哪边收尾。
+    整组一起裁、一起校验，任何一张不过就整组回滚 —— 原图在全部校验通过之前一个字节都不动。
+    """
+    if _CROP_JOB["running"]:
+        raise HTTPException(409, "上一次裁剪还没跑完，等它结束")
+    if scanner.state()["status"] == "running":
+        raise HTTPException(409, "扫描进行中：裁剪要读一整组的图，等扫描跑完再来")
+    plan = _crop_plan(name)
+    if not plan["ok"]:
+        raise HTTPException(400, plan["why"])
+    fw, fh = plan["out"]["frame"]
+    base = plan["out"]["base"]
+    if base:
+        # 已经裁过一次：只能在**现在这块地**里挑（原始坐标），而且要严格更小才有意义
+        bx, by, bw, bh = base
+        if x0 < bx or y0 < by or x0 + w > bx + bw or y0 + h > by + bh:
+            raise HTTPException(400, (
+                f"矩形 ({x0},{y0},{w},{h}) 超出了现在可裁的 x {bx}~{bx + bw - 1}、"
+                f"y {by}~{by + bh - 1} —— 这一组已经裁过一次，只能往里裁（裁掉的找不回来）"))
+        if w * h >= bw * bh:
+            raise HTTPException(400, f"这一组现在是 {bw}×{bh}，新框得比它小才有意义")
+    else:
+        if x0 + w > fw or y0 + h > fh:
+            raise HTTPException(400, f"矩形 ({x0},{y0},{w},{h}) 超出了画面 {fw}×{fh}")
+        if w == fw and h == fh:
+            # 整幅"裁"一遍只是白重编码一次（还会因为 level=1 略微变大），一点不会更快
+            raise HTTPException(400, f"这个矩形就是整幅画面 {fw}×{fh}，裁了不会更快，把框缩小一点")
+
+    prev = plan["prev"]                    # 开工前的库记录：写新记录之前先留一份，回滚要按它改回去
+    ids = sorted({sid for sid, _ in plan["items"]})
+    store.put_crops([
+        {"scan_id": sid, "group_name": name, "x0": x0, "y0": y0, "w": w, "h": h,
+         "frames": 0, "saved_bytes": 0, "state": "cropping", "created_at": time.time()}
+        for sid in ids
+    ])
+    _CROP_JOB.update({"running": True, "group": name, "done": 0,
+                      "total": len(plan["items"]), "error": None, "result": None})
+    threading.Thread(target=_crop_worker, args=(ids, plan["items"], (x0, y0, w, h), prev),
+                     daemon=True, name="crop").start()
+    log.info("开始裁剪：组「%s」%d 条扫描 %d 张 → %s", name, len(ids), len(plan["items"]),
+             (x0, y0, w, h))
+    return {"ok": True, "scans": ids, "images": len(plan["items"]), "rect": [x0, y0, w, h]}
 
 
 # ------------------------------------------------------------------ 静态页面

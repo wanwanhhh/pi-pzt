@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ctypes
 import io
+import json
 import logging
 import os
 import queue
@@ -36,7 +37,13 @@ from pathlib import Path
 from typing import Optional
 
 from .config import (
+    CROP_EDGE_PX,
+    CROP_H,
+    CROP_PNG_LEVEL,
+    CROP_SAMPLES,
+    CROP_W,
     IMAGE_DIR,
+    TIME_FS_PER_UM,
     TL_CAPTURE_TIMEOUT_S,
     TL_DLL_DIR,
     TL_EXPOSURE_US,
@@ -781,7 +788,8 @@ class ThorlabsCamera:
         view = np.rot90(frame, -(rotation // 90)) if rotation else frame
         h, w = view.shape
         if not (0 <= x < w and 0 <= y < h):
-            raise CameraError(f"点 ({x}, {y}) 超出画面 {w}×{h}")
+            # 坐标越界是**填错了**，不是相机坏了：服务层据此给 400（见 server._camera_call）
+            raise CameraInputError(f"点 ({x}, {y}) 超出画面 {w}×{h}")
         return {
             "x": int(x), "y": int(y), "width": int(w), "height": int(h),
             "rotation": rotation, "bits": 16, "full_scale": TL_SATURATION_ADU,
@@ -985,28 +993,62 @@ def _pixel_of(path: Path, x: int, y: int):
     return int(arr[y, x])
 
 
-def png_pixel_series(items, x: int, y: int, workers: int = 8) -> dict:
+def png_pixel_series(items, x: int, y: int, workers: int = 8,
+                     crop: Optional[tuple] = None,
+                     readback_to_um: Optional[float] = None) -> dict:
     """一条扫描里、**每个扫描点上同一个像素**的值 —— 数据处理页那条曲线的取数。
 
     items 是 [(序号, 读出位置 µm, PNG 路径 | None), ...]，按扫描顺序给全。
     没图的点（没采到图 / CCD 后端是 null）给 None —— **不补值、不插值**，曲线在那里断开。
     位置原样带回（那是扫描记下来的读出位置，本函数只负责读像素）。
 
+    横轴给**四列**：position_um 是台子走到哪（µm，按设备声明的系数折算过），time_fs 是光走那段
+    往返光程要多久（fs，光程差 = OPD_FACTOR × 位移，再除以 c，算式与系数在 config.py）；
+    position_raw / time_raw_fs 是**同一串位置的设备原值读法**（µm ÷ readback_to_um），
+    系数没记下（老数据没记设备）或本来就是 1（PI）时这两列是 None。
+
+    数据处理页那两个按钮就是在**四列里挑一列**画：「位置 / 时间」挑读法、「折算 / 原值」挑口径。
+    **四列一起下发**：切换不再取一次数（两千张 PNG 现读要几秒，等不起）。每列的 None 一一对应
+    —— 没记下读数的点四列都没有、那一点上不了图，这跟它有没有采到图无关。
+
     几何（宽高 / 位深 / 满量程）以**第一张读得动的图**为准；点落在画面外直接报错 ——
     不然整条曲线会全是 None，看着像"这个像素没光"，其实是指错了地方。
-    整幅解码是 CPU 活，几百张串行约 2.5 s、8 线程约 0.8 s，所以这里铺开读。
+    整幅解码是 CPU 活（PNG 没有"只解一块"的办法，滤波要按行递推），2000 张串行约 12 s、
+    8 线程约 4.8 s，所以这里铺开读。**裁剪过就快得多**：图只有 400×300 时 2000 张约 0.3 s
+    —— 解码代价基本与像素数成正比，见 config.CROP_* 那一节。
+
+    crop 给了就是 (x0, y0, w, h)：这条扫描的帧已经被裁成**原始坐标**里的那一块。
+    传进来的 x/y 和返回的 width/height 一律还是**原始坐标**，只在读文件那一刻减一次偏移；
+    没裁过（crop=None）就是偏移 0、尺寸照文件 —— 两条路走的是同一段代码。
     """
     import numpy as np
     from concurrent.futures import ThreadPoolExecutor
 
+    x0, y0 = (crop[0], crop[1]) if crop else (0, 0)
+    fx, fy = int(x) - x0, int(y) - y0            # 文件里的坐标：唯一的减法就在这
     out = {
         "x": int(x), "y": int(y),
         "width": None, "height": None, "bits": None, "full_scale": None,
+        "crop": [int(v) for v in crop] if crop else None,
         "idx": [int(it[0]) for it in items],
         "position_um": [it[1] for it in items],
         "value": [None] * len(items),
         "missing": 0,          # 没图 / 图读不出来的点数（曲线在这里断开）
     }
+    # 横轴的第二列：同一串位置换成时间（光程差 2x ÷ c）。**None 一一对应** ——
+    # 没记下读数的点两列都没有，那一点上不了图。换算只做一次乘法，跟读图无关。
+    out["time_fs"] = [None if p is None else p * TIME_FS_PER_UM for p in out["position_um"]]
+    # 横轴的第三、四列：**设备原值**（采这条扫描的那台设备当时报的数，不做折算）。
+    # µm = 原值 × readback_to_um，所以原值 = µm ÷ readback_to_um；时间同比例（t = 2x/c）。
+    # 系数没记下（加这一列之前的老数据）或本来就是 1（PI 的位置就是 µm）时**不给这两列**：
+    # 给了就是编数 —— 界面据此把「口径」那个按钮禁用，而不是拿 µm 冒充原值。
+    raw = readback_to_um if readback_to_um and readback_to_um != 1.0 else None
+    out["position_raw"] = (
+        None if raw is None else [None if p is None else p / raw for p in out["position_um"]]
+    )
+    out["time_raw_fs"] = (
+        None if raw is None else [None if t is None else t / raw for t in out["time_fs"]]
+    )
     todo = []
     for i, (_, _, path) in enumerate(items):
         if path is None:
@@ -1018,22 +1060,271 @@ def png_pixel_series(items, x: int, y: int, workers: int = 8) -> dict:
                 out["missing"] += 1
                 continue
             h, w = arr.shape
-            if not (0 <= x < w and 0 <= y < h):
+            if crop and (w, h) != (int(crop[2]), int(crop[3])):
+                # 库里的裁剪记录和文件本身对不上：这是"坐标会悄悄错位"的那一类，必须当场停
+                raise ValueError(
+                    f"这张图是 {w}×{h}，裁剪记录写着 {crop[2]}×{crop[3]} —— 库和文件对不上，先查清"
+                )
+            if not (0 <= fx < w and 0 <= fy < h):
+                if crop:
+                    raise ValueError(
+                        f"点 ({x}, {y}) 在裁剪范围外：这条扫描只留了"
+                        f" x {x0}~{x0 + w - 1}、y {y0}~{y0 + h - 1}（都是原始坐标）"
+                    )
                 raise ValueError(f"点 ({x}, {y}) 超出画面 {w}×{h}")
             bits = 16 if arr.dtype == np.uint16 else 8
             out.update(width=int(w), height=int(h), bits=bits,
                        full_scale=TL_SATURATION_ADU if bits == 16 else 255)
-            out["value"][i] = int(arr[y, x])
+            out["value"][i] = int(arr[fy, fx])
             continue
         todo.append((i, path))
 
     if todo:
         with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-            got = pool.map(lambda it: _pixel_of(it[1], x, y), todo)
+            got = pool.map(lambda it: _pixel_of(it[1], fx, fy), todo)
             for (i, _), v in zip(todo, got):
                 out["value"][i] = v
                 if v is None:
                     out["missing"] += 1
+    return out
+
+
+# ------------------------------------------------------------------ 裁剪
+# 把**一组扫描**（同名的那几条）里每一帧裁成同一块矩形，就地换掉原图（文件名不变）。
+# 规则与理由：
+#   - **坐标口径不变**：x0/y0 是这一刀在原始帧里的左上角，对外一律原始坐标；
+#     只在 png_pixel_series 里减一次偏移。裁过的和没裁过的扫描可以混着比对。
+#   - **校验通过之前原图一个字节都不动**：先裁进 .crop-<批>/new/ 并逐张校验，
+#     整组都对了才 rename 就位。宁可白干一趟，不能留"一半裁了一半没裁"——
+#     那种状态读出来的坐标是错的，而且不报错。
+#   - **质心只搬不重算**：它是整幅的强度加权重心（不扣背景、不设阈值），裁掉背景就不是那个数了。
+
+_CARRY_TEXT = ("ExposureUs", "CentroidPx")
+
+
+def png_size(path: Path) -> tuple:
+    """PNG 头里的宽高（只读 IHDR，不解码）—— 判一组扫描的画面尺寸一不一样用。"""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        return im.size
+
+
+def _carry_text(text: dict) -> list:
+    """把原图 tEXt 里那两条**原样**搬过去（一个字节都不改）。"""
+    return [(k.encode("ascii"), v.encode("ascii"))
+            for k, v in (text or {}).items() if k in _CARRY_TEXT]
+
+
+def _save_cropped(dst: Path, part, texts: list) -> None:
+    """落一张裁好的图，位深照原样（16 位走自家零依赖写法，8 位占位图走 PIL）。"""
+    import numpy as np
+    from PIL import Image
+
+    if part.dtype == np.uint16:
+        _save_png16(dst, part, extra_text=texts, level=CROP_PNG_LEVEL)
+        return
+    from PIL.PngImagePlugin import PngInfo
+
+    info = PngInfo()
+    for k, v in texts:
+        info.add_text(k.decode("ascii"), v.decode("ascii"))
+    Image.fromarray(part).save(dst, "PNG", pnginfo=info)
+
+
+def suggest_crop(items, size=(CROP_W, CROP_H), edge=CROP_EDGE_PX,
+                 samples=CROP_SAMPLES, base=None) -> dict:
+    """给一组帧算建议矩形（**原始坐标**）。
+
+    把这些帧的质心范围整个框住、四周至少留 edge 像素、至少 size 那么大，再夹回**可裁的那块地**里。
+    质心取自每张 PNG 自己的 tEXt；老图没有这个块就退回可裁区域的中心（source 字段如实说明）。
+    抽样 samples 帧就够 —— 要的是"光斑在这组扫描里跑到过哪"，不是每一张。
+
+    base = 现在这一组**已经裁到**的矩形（原始坐标，没裁过就是 None = 整幅都可裁）。
+    再裁只能在它里面挑 —— 裁掉的部分找不回来，所以框只能越选越小。
+    """
+    from PIL import Image
+
+    files = [p for _, p in items if p is not None]
+    if not files:
+        raise ValueError("这一组没有可用的图")
+    if len(files) <= samples:
+        picked = files
+    else:
+        picked = [files[round(i * (len(files) - 1) / (samples - 1))] for i in range(samples)]
+    with Image.open(picked[0]) as im:
+        W, H = im.size                      # 现在文件自己的大小（可能就是裁过的那块）
+    bx, by, bw, bh = base if base else (0, 0, W, H)
+    cs = [m for m in (read_png_meta(f)["centroid"] for f in picked) if m]
+    if cs:
+        xs = [c[0] for c in cs]
+        ys = [c[1] for c in cs]
+        w = min(bw, max(size[0], int(max(xs) - min(xs)) + 2 * edge + 1))
+        h = min(bh, max(size[1], int(max(ys) - min(ys)) + 2 * edge + 1))
+        cx, cy, source = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, "centroid"
+    else:
+        xs = ys = None
+        w, h = min(bw, size[0]), min(bh, size[1])
+        cx, cy, source = bx + bw / 2, by + bh / 2, "center"
+    x0 = min(max(int(round(cx - w / 2)), bx), bx + bw - w)
+    y0 = min(max(int(round(cy - h / 2)), by), by + bh - h)
+    return {
+        "x0": x0, "y0": y0, "w": w, "h": h,
+        # frame 是**现在文件**的大小（界面上那张图就是这个尺寸）；
+        # base 是这些文件在**原始坐标**里占的那块地 —— 红框按 (x0-base[0])/frame 换算着画
+        "frame_w": W, "frame_h": H, "base": [bx, by, bw, bh],
+        "cropped": bool(base), "source": source, "sampled": len(picked),
+        "cx_range": [round(min(xs), 1), round(max(xs), 1)] if cs else None,
+        "cy_range": [round(min(ys), 1), round(max(ys), 1)] if cs else None,
+        # 光斑漂移范围离框最近还有多少像素：贴边了就说明这一组不该共用一个框
+        "margin": int(min(min(xs) - x0, x0 + w - max(xs),
+                          min(ys) - y0, y0 + h - max(ys))) if cs else None,
+    }
+
+
+def crop_frames(items, x0: int, y0: int, w: int, h: int, progress=None,
+                prev: dict | None = None) -> dict:
+    """把一组帧裁成原始坐标里的 (x0,y0,w,h)，**就地替换、文件名不变**。
+
+    items 是 [(扫描号, PNG 路径 | None), ...]：一组扫描的所有点一起给，整组同进同退。
+    prev = {扫描号: 现在库里记着的矩形 | None}：**已经裁过的可以再裁**，但只能在现在这块地里
+    挑（x0,y0,w,h 仍然是原始坐标，文件里的偏移是累加的，口径一直不变）。
+
+    三步，顺序是刻意的 —— 校验通过之前原图一个字节都不动：
+
+      1. 逐张读原图 → 裁 → 写进 data/images/.crop-<批>/new/，当场校验落盘的那一张
+         （尺寸、位深、用原始坐标取 5 个点与原图逐点相等）
+      2. 整组都过了才动原图：原图 rename 进 .crop-<批>/orig/，新图 rename 到位
+         （**半裁**的窗口只剩这一串 rename，而且这一小段里图是"缺的"而不是"错的"）
+      3. 删掉 orig/ —— 到这里才算裁完（调用方这时才把库里状态改成 done）
+
+    任何一步出错：把 orig/ 里的原图挪回来、删掉 new/。回滚本身失败就**把现场留着**并报错，
+    绝不接着删 —— 宁可留一堆待查的文件，不可把唯一的原图删掉。
+    """
+    import shutil
+
+    import numpy as np
+    from PIL import Image
+
+    todo = [(sid, p) for sid, p in items if p is not None]
+    if not todo:
+        raise ValueError("这一组没有可用的图")
+    batch = IMAGE_DIR / f".crop-{int(time.time())}"
+    (batch / "new").mkdir(parents=True, exist_ok=True)
+    (batch / "orig").mkdir(parents=True, exist_ok=True)
+    # 现场说明：万一进程死在这一批里，启动时要靠它把库里的矩形改回**裁之前**的样子
+    # （改之前是什么样，只有这里知道 —— 库已经被改成新的了）
+    (batch / "plan.json").write_text(
+        json.dumps({"rect": [x0, y0, w, h], "prev": prev or {}}, ensure_ascii=False), "utf-8")
+    probes = [(x0, y0), (x0 + w - 1, y0), (x0, y0 + h - 1),
+              (x0 + w - 1, y0 + h - 1), (x0 + w // 2, y0 + h // 2)]
+    saved, peak, edge_peak = 0, 0, 0
+    per_scan: dict = {}          # 每条扫描各裁了多少张、省了多少字节（界面按条显示）
+    try:
+        for n, (sid, src) in enumerate(todo, 1):
+            with Image.open(src) as im:
+                text = dict(im.text or {})
+                arr = np.asarray(im)
+            fh, fw = arr.shape
+            # 这张图现在是从原始坐标的哪一块裁出来的（没裁过就是整幅）
+            old = text.get(CROP_KEY.decode())
+            known = (prev or {}).get(sid)
+            if (old is None) != (known is None):
+                raise ValueError(
+                    f"{src.name} 的裁剪记录和库里对不上（文件{'有' if old else '没有'}、"
+                    f"库{'有' if known else '没有'}）—— 先查清再动")
+            if old is None:
+                sx0, sy0 = 0, 0
+            else:
+                sx0, sy0, sw, sh = (int(v) for v in old.split(","))
+                if (sw, sh) != (fw, fh):
+                    raise ValueError(f"{src.name} 自己写着 {sw}×{sh}，实际是 {fw}×{fh} —— 先查清再动")
+            if x0 < sx0 or y0 < sy0 or x0 + w > sx0 + fw or y0 + h > sy0 + fh:
+                raise ValueError(
+                    f"矩形 ({x0},{y0},{w},{h}) 超出可裁的 x {sx0}~{sx0 + fw - 1}、"
+                    f"y {sy0}~{sy0 + fh - 1}（{src.name}）—— 只能往里裁，裁掉的找不回来")
+            part = arr[y0 - sy0:y0 - sy0 + h, x0 - sx0:x0 - sx0 + w]
+            dst = batch / "new" / src.name
+            _save_cropped(dst, part, _carry_text(text) + [(CROP_KEY, f"{x0},{y0},{w},{h}".encode())])
+            # 校验的是**落盘后的那张**：要保证最终产物对，不是保证内存里的数组对
+            got = np.asarray(Image.open(dst))
+            if got.shape != (h, w) or got.dtype != arr.dtype:
+                raise ValueError(f"裁出来的尺寸/位深不对：{got.shape} {got.dtype}（{src.name}）")
+            for px, py in probes:
+                if int(got[py - y0, px - x0]) != int(arr[py - sy0, px - sx0]):
+                    raise ValueError(f"逐点校验不过：原始坐标 ({px},{py})（{src.name}）")
+            was, now = src.stat().st_size, dst.stat().st_size
+            saved += was - now
+            one = per_scan.setdefault(sid, {"frames": 0, "saved_bytes": 0})
+            one["frames"] += 1
+            one["saved_bytes"] += was - now
+            peak = max(peak, int(part.max()))
+            edge_peak = max(edge_peak, int(part[0].max()), int(part[-1].max()),
+                            int(part[:, 0].max()), int(part[:, -1].max()))
+            if progress:
+                progress(n, len(todo))
+
+        for _, src in todo:                                  # 2) 原图挪走
+            os.replace(src, batch / "orig" / src.name)
+        for _, src in todo:                                  #    新图到位
+            os.replace(batch / "new" / src.name, src)
+        shutil.rmtree(batch / "orig")                        # 3) 到这儿才算裁完
+        (batch / "plan.json").unlink()
+        (batch / "new").rmdir()
+        batch.rmdir()
+    except Exception:
+        stuck = 0
+        for _, src in todo:
+            stashed, fresh = batch / "orig" / src.name, batch / "new" / src.name
+            try:
+                if stashed.exists():                         # 动过这一张：新图删掉，原图挪回来
+                    fresh.unlink(missing_ok=True)
+                    os.replace(stashed, src)
+            except OSError as exc:
+                stuck += 1
+                log.error("裁剪回滚失败：%s（原图还在 %s）", exc, stashed)
+        if stuck:
+            log.error("有 %d 张原图没能挪回来，现场留在 %s —— 别删，先查", stuck, batch)
+        else:
+            shutil.rmtree(batch, ignore_errors=True)
+        raise
+    return {"frames": len(todo), "saved_bytes": saved, "peak": peak,
+            "edge_peak": edge_peak, "per_scan": per_scan}
+
+
+def finish_staged_crops() -> list:
+    """启动时收尾上一次没跑完的裁剪（进程被杀 / 断电留下的 .crop-<批>/ 目录）。
+
+    约定：**orig/ 里还有原图 = 这一批没裁完**（第 3 步没走到）→ 全部挪回来，等于没裁过；
+    orig/ 已经没了 = 图都就位了、只差把库里那几条记录改成 done → 什么都不动，交给调用方改。
+
+    files 是**挪回来的文件名**：调用方靠它认出是哪些扫描（scan0053_00000.png → 53）。
+    plan 是这一批开工前写的现场（这次要裁成什么样、**裁之前每条是什么样**）：
+    回滚过的批次，库里的矩形要按 plan["prev"] 改回去；再裁的批次，库里那时已经是新矩形了，
+    只有这里还留着旧的 —— 没有它就再也回不到"和文件对得上"的状态。
+    """
+    import shutil
+
+    out = []
+    for batch in sorted(IMAGE_DIR.glob(".crop-*")):
+        if not batch.is_dir():
+            continue
+        orig = batch / "orig"
+        stashed = sorted(orig.glob("*.png")) if orig.is_dir() else []
+        for f in stashed:
+            os.replace(f, IMAGE_DIR / f.name)
+        plan, broken = None, False
+        pf = batch / "plan.json"
+        if pf.is_file():
+            try:
+                plan = json.loads(pf.read_text("utf-8"))
+            except ValueError as exc:
+                broken = True
+                log.error("裁剪现场 %s 读不动（%s）—— 整批留着别删，先查", pf, exc)
+        out.append({"batch": batch.name, "rolled_back": bool(stashed),
+                    "files": [f.name for f in stashed], "plan": plan})
+        if not broken:                           # 读不动的整批留着，别把唯一的线索删了
+            shutil.rmtree(batch, ignore_errors=True)
     return out
 
 
@@ -1054,6 +1345,11 @@ def _to_jpeg(img, quality: int) -> bytes:
 
 EXPOSURE_KEY = b"ExposureUs"      # 写进 PNG 的 tEXt 块：这一帧是用多少 µs 采的
 CENTROID_KEY = b"CentroidPx"      # 同一个 tEXt：这一帧的质心 "cx,cy"（**传感器坐标**，与像素同一套）
+# 裁剪：这一帧是从**原始帧**的哪一块裁下来的 "x0,y0,w,h"。
+# **坐标口径不因裁剪而变**：接口、界面、曲线、剖面一律还是原始坐标，只有读文件那一刻
+# 减一次偏移。库里也记一份，两份对不上就报错 —— 原点偏移错了不会报错，只会让整条曲线
+# 悄悄错位，这是唯一能自动发现它的地方。
+CROP_KEY = b"CropRect"
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -1074,7 +1370,7 @@ def read_png_meta(path: Path) -> dict:
     """
     import struct
 
-    out = {"exposure_us": None, "centroid": None}
+    out = {"exposure_us": None, "centroid": None, "crop": None}
     try:
         data = path.read_bytes()
     except OSError:
@@ -1097,6 +1393,12 @@ def read_png_meta(path: Path) -> dict:
                     out["centroid"] = [float(cx), float(cy)]
                 except ValueError:
                     pass
+            elif key == CROP_KEY:
+                try:
+                    x0, y0, w, h = (int(v) for v in value.decode("ascii").split(","))
+                    out["crop"] = [x0, y0, w, h]
+                except ValueError:
+                    pass
         elif tag == b"IEND":
             break
         pos += 12 + length
@@ -1104,13 +1406,18 @@ def read_png_meta(path: Path) -> dict:
 
 
 def _save_png16(path: Path, img, exposure_us: Optional[int] = None,
-                centroid: Optional[dict] = None) -> int:
+                centroid: Optional[dict] = None, extra_text=(),
+                level: int = 6) -> int:
     """16 位灰度 PNG，零依赖（与 tools/png16.py 同一实现，后端不能 import tools/）。
 
     给了就写进 tEXt 块：曝光（µs）与**质心**（"cx,cy"，传感器坐标）——
     让文件自带"这张图是怎么采的、亮心在哪"，不依赖数据库。
     质心在文件里只保留 2 位小数（够用且短），接口另外返回内存里那份全精度值 ——
     **要对数就拿文件里的**，那才是跟着图走的那份。
+
+    extra_text 是 [(键, 值), ...]，原样写进去 —— 裁剪时靠它把 ExposureUs / CentroidPx
+    **一个字节不改**地搬过来（质心是整幅算的，裁掉背景就不是那个数了：只搬，不重算）。
+    level 是 zlib 压缩级别：裁剪那条路用 1（实测比默认 6 快 2.5 倍，文件只大 10%）。
     """
     import zlib
 
@@ -1125,12 +1432,14 @@ def _save_png16(path: Path, img, exposure_us: Optional[int] = None,
     if centroid and centroid.get("cx") is not None:
         pair = f"{centroid['cx']:.2f},{centroid['cy']:.2f}".encode("ascii")
         text += _png_chunk(b"tEXt", CENTROID_KEY + b"\x00" + pair)
+    for key, value in extra_text:
+        text += _png_chunk(b"tEXt", key + b"\x00" + value)
 
     data = (
         b"\x89PNG\r\n\x1a\n"
         + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 16, 0, 0, 0, 0))
         + text
-        + _png_chunk(b"IDAT", zlib.compress(raw))
+        + _png_chunk(b"IDAT", zlib.compress(raw, level))
         + _png_chunk(b"IEND", b"")
     )
     path.write_bytes(data)
