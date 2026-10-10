@@ -566,6 +566,31 @@
     </div>
   </div>
 
+  <!-- 导出面板：把**这一条扫描**的原始帧与每点元数据抄一份到 data/export/ 下。
+       源文件一个字节都不动，也不碰设备 —— 所以扫描跑着也能导，只是会先提醒一句会跟采图抢磁盘。
+       入口在历史扫描表那一行上：导的是**那一条**，不是同名整组（整组请逐条导）。 -->
+  <div id="exportpanel" hidden>
+    <div class="cropbox expbox">
+      <div class="head">
+        <h2>导出原始数据<span class="sub" id="exp-name">—</span></h2>
+        <div class="right"><button id="btn-exp-close" class="ghost">关闭</button></div>
+      </div>
+      <div class="cropside">
+        <p class="hint" id="exp-info">—</p>
+        <p class="hint warn" id="exp-warn" hidden></p>
+        <label class="chk" for="exp-zip"><input id="exp-zip" type="checkbox">打包成一个 zip
+          （<b>只装不压</b>：PNG 本来就压过，再压一遍省不到东西、只是白花时间；不勾就是散图 + 两张表）</label>
+        <p class="hint" id="exp-dest">—</p>
+        <div class="row top">
+          <button id="btn-exp-run" class="primary">开始导出</button>
+          <button id="btn-exp-copy" class="ghost" hidden>复制路径</button>
+        </div>
+        <p class="hint" id="exp-progress" hidden></p>
+        <p class="hint" id="exp-recent">—</p>
+      </div>
+    </div>
+  </div>
+
 <div id="lightbox" hidden>
   <div class="lb-imgwrap">
     <img id="lightbox-img" alt="">

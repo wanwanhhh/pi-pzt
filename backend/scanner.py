@@ -15,6 +15,7 @@ from . import store
 from .ccd import Capture
 from .config import (
     APPROACH_OFFSET_UM,
+    FIRST_POINT_SETTLE_MS,
     ON_TARGET_TIMEOUT_S,
     SCAN_ARRIVAL_FRACTION,
     SOFT_LIMIT_MARGIN,
@@ -233,7 +234,20 @@ class Scanner:
         st = self._stage.status()
         pre = req.start_um - (APPROACH_OFFSET_UM if step >= 0 else -APPROACH_OFFSET_UM)
         if not st.travel_min <= pre <= st.travel_max:
+            # 退不出去（起点贴着行程端点）：首点只能从别处直接过来 —— 而控制器的 ONT
+            # 会在台子**还在整定时**就置位（实测：一次 90 µm 移动，ONT 在 MOV 后 61 ms
+            # 置位，此时离目标还差 0.32 µm；到 +450 ms 才进 0.013）。照界面设的稳定延时
+            # （可能只有 20 ms）采，首点读数就会超过半个步距、整条扫描判失败 ——
+            # 库里 #70/#72/#74 三条正是这么失败的。所以这里补一次「走到起点 + 等它停稳」，
+            # 首点自己的稳定延时仍按界面设的走（A8/B4 见 docs/pi/设备认识账.xml）。
             log.warning("扫描起点 %.4f µm 贴行程端点，首点无法与其他点同侧逼近", req.start_um)
+            self._stage.move(req.start_um)
+            if not self._stage.wait_on_target(
+                ON_TARGET_TIMEOUT_S,
+                cancel=self._abort.is_set,
+                settle_s=FIRST_POINT_SETTLE_MS / 1000.0,
+            ):
+                log.warning("首点预停稳到 %.4f µm 没确认到位：首点可能仍在整定", req.start_um)
             return
         self._stage.move(pre)
         if not self._stage.wait_on_target(

@@ -21,7 +21,17 @@
    全被误判成"光太强、要加衰减片"。
 
 4. **ROI 会被硬件按对齐改写**（要 518x518 实际是 520x520），所有地方一律读回实际值。
-   预览用小 ROI（相机端裁剪，帧率更高），**保存一律切回原生全幅**，一个像素都不裁。
+   一台相机**只有一套 ROI**（原生全幅）：预览、手动保存、扫描共用同一套设置、同一个像素网格，
+   一个像素都不裁 —— 预览里看到的就是存下来的那一幅。
+
+5. **一个会话最多 arm 一次；arm 之后不许再 disarm、不许再重写设置。**
+   实测（2026-10-08，`tools/thorlabs_stream_probe.py cycles 2`）：预览连续出帧时做**两轮** disarm→arm，
+   第二轮之后相机一帧都不再出（1.4 s 后被判"没出新帧"，会话丢掉）；只做一轮则安然无恙。
+   设置写与取帧都不是必要条件 —— 两轮 arm 里一个设置不写、一帧不取，照样停摆。
+   所以：设置只在**会话出生时**写一次（`_open_session` → `_apply`），arm 只在**第一次要帧时**
+   做一次（`_ensure_armed`）；此后预览 / 手动保存 / 扫描共用这**一条连续流**，谁都不再动相机。
+   （旧代码正是在这条上翻车：手动保存走"disarm → 改设置 → arm → 取帧 → 再 disarm → 改回来 →
+   再 arm"，于是每点一次「保存原生帧」，预览就死一次。）
 """
 from __future__ import annotations
 
@@ -43,7 +53,9 @@ from .config import (
     CROP_SAMPLES,
     CROP_W,
     IMAGE_DIR,
+    SCAN_PNG_LEVEL,
     TIME_FS_PER_UM,
+    raw_readback_factor,
     TL_CAPTURE_TIMEOUT_S,
     TL_DLL_DIR,
     TL_EXPOSURE_US,
@@ -54,7 +66,6 @@ from .config import (
     TL_OPEN_WAIT_S,
     TL_SCAN_OPEN_WAIT_S,
     TL_PREVIEW_FPS,
-    TL_PREVIEW_ROI,
     TL_PREVIEW_ROTATION,
     TL_SATURATION_ADU,
 )
@@ -149,14 +160,14 @@ class _Session:
     `(200001, 29184, -200000, 1)` 这种值毒死 ROI 缓存的）。
     """
 
-    def __init__(self, sdk, cam, serial: str, roi_cfg: tuple) -> None:
+    def __init__(self, sdk, cam, serial: str, roi: tuple) -> None:
         self.sdk = sdk
         self.cam = cam
         self.serial = serial
         self.model = cam.model
         rng = cam.exposure_time_range_us
         self.exposure_min_us, self.exposure_max_us = int(rng.min), int(rng.max)
-        self.preview_roi, self.full_roi = roi_cfg
+        self.roi = tuple(roi)          # 本会话唯一的一套 ROI（写进去后按读回值记账，见 _apply）
         self.armed = False
         self.last_trigger = 0.0
         self.jpeg: Optional[bytes] = None
@@ -165,6 +176,7 @@ class _Session:
         self.shot: Optional[tuple] = None     # 最近一次整帧采集
         self.frames = 0
         self.last_frame_at = 0.0
+        self.frames_expected_since = 0.0   # 从这一刻起"应该出帧"（见 _expect_frames_from_now）
         self.opened_at = time.time()
 
 
@@ -188,8 +200,7 @@ class ThorlabsCamera:
         dll_dir: str = TL_DLL_DIR,
         gain: int = TL_GAIN,
         exposure_us: int = TL_EXPOSURE_US,
-        preview_roi: tuple = TL_PREVIEW_ROI,
-        full_roi: tuple = TL_FULL_ROI,
+        roi: tuple = TL_FULL_ROI,
         preview_fps: float = TL_PREVIEW_FPS,
         jpeg_quality: int = TL_JPEG_QUALITY,
     ) -> None:
@@ -200,9 +211,10 @@ class ThorlabsCamera:
         self._exposure_us = exposure_us
         self._preview_fps = preview_fps
         self._jpeg_quality = jpeg_quality
-        # 配置里的 ROI 是**出厂值**：每个新会话都从它开始。当前 ROI 只存在于会话里，
-        # 所以不存在「被掉线时的垃圾读回污染」这回事（旧代码的 1003 就是这么来的）。
-        self._roi_cfg = (tuple(preview_roi), tuple(full_roi))
+        # 唯一的一套 ROI（原生全幅）。配置里的是**出厂值**：每个新会话都从它开始。
+        # 当前值只存在于会话里，所以不存在「被掉线时的垃圾读回污染」这回事
+        # （旧代码的 1003 就是这么来的）。
+        self._roi = tuple(roi)
         # 预览显示朝向（0/90/180/270，顺时针）。**只影响预览**：保存永远写传感器原始朝向。
         # 环境变量写错（比如 45）只该退成 0 并说清楚 —— 一个显示偏好不该让相机对象建不起来，
         # 那会把 /api/ccd/status 变成一直 500，反而看不出是配置写错了。
@@ -288,8 +300,7 @@ class ThorlabsCamera:
             "gain_locked": True,
             "exposure_min_us": sess.exposure_min_us if sess else 0,
             "exposure_max_us": sess.exposure_max_us if sess else 0,
-            "preview_roi": list(sess.preview_roi if sess else self._roi_cfg[0]),
-            "full_roi": list(sess.full_roi if sess else self._roi_cfg[1]),
+            "roi": list(sess.roi if sess else self._roi),
             "centroid": sess.centroid if sess else None,
             "rotation": self._rotation,   # 预览朝向（保存的文件不受它影响）
             "saturation_adu": TL_SATURATION_ADU,
@@ -402,8 +413,8 @@ class ThorlabsCamera:
             self._preview_wanted = on
             if on:
                 sess = self._ensure_session(wait_s)
-                self._apply(sess, preview=True)
-                self._arm(sess)
+                self._ensure_armed(sess)
+                self._expect_frames_from_now(sess)
                 self._pump(sess)
             elif not self._hold:
                 self._discard("预览已停", failed=False)   # 窗口结束：会话收掉
@@ -417,46 +428,41 @@ class ThorlabsCamera:
             # （掉线前预览本来是开着的，_preview_wanted 也一直是 True，这条只补「空闲时点重开」那种情况）
             self._preview_wanted = True
             sess = self._ensure_session(wait_s)
-            self._apply(sess, preview=True)
-            self._arm(sess)
+            self._ensure_armed(sess)
+            self._expect_frames_from_now(sess)
             self._pump(sess)
             return self.status()
         if kind == "begin_scan":
             self._hold += 1
-            sess = self._ensure_session(TL_SCAN_OPEN_WAIT_S)
-            # **配置只在这一次**：整个扫描期间相机就停在全幅 + 采图曝光上，一直 arm 着。
-            # 从前是每点配一遍（disarm → 设 ROI/曝光/增益 → 读回 → arm），实测 ~585 ms/点，
-            # 全是白花的 —— 扫描期间相机本来就归扫描独占，中途没人会改它。
+            reusing = self._sess is not None
             t0 = time.perf_counter()
-            self._apply(sess, preview=False)
-            self._arm(sess)
-            log.info("扫描接手相机：全幅配置一次 %.0f ms（%dx%d，曝光 %d us）—— 之后每点只补触发",
-                     1000 * (time.perf_counter() - t0), sess.full_roi[2], sess.full_roi[3],
-                     sess.cam.exposure_time_us)
+            sess = self._ensure_session(TL_SCAN_OPEN_WAIT_S)
+            self._ensure_armed(sess)
+            # 不用清帧队列：实测（tools/thorlabs_stream_probe.py backlog）停取帧 3 s 之后队列里仍是 0 帧 ——
+            # 没人取帧时驱动直接丢帧，不攒；所以接手后第一帧本来就是新的，位置与图不会错配。
+            log.info("扫描接手相机：%s（%.0f ms，%dx%d）—— 之后每点只补触发",
+                     "接着用预览那条流" if reusing else "新建会话",
+                     1000 * (time.perf_counter() - t0), sess.roi[2], sess.roi[3])
             return self.status()
         if kind == "end_scan":
             self._hold = max(0, self._hold - 1)
             sess = self._sess
-            if sess is not None and sess.armed:
-                # 先退出触发模式：扫描结束不该把相机留在 armed 上（预览要不要另说）
-                sess.cam.disarm()
-                sess.armed = False
             if sess is not None and not self._hold:
                 if self._preview_wanted:
-                    self._apply(sess, preview=True)
-                    self._arm(sess)
+                    # 交还给预览：新鲜度**从现在重新起算**。扫描期间没人取帧（相机归扫描），
+                    # 那段时间不该算进"预览没出新帧"—— 不刷新的话扫描一结束就会立刻被判掉线。
+                    self._expect_frames_from_now(sess)
                 else:
+                    # 没人要预览：使用窗口结束，会话（句柄 + SDK）一起收掉。
+                    # **不 disarm**：这台相机 disarm 之后再 arm 会让出帧停摆（文件头第 5 条），
+                    # 而"用过就丢、下个会话重建"本来就更省心（重建 ~800 ms，只在人再点预览时付）。
                     self._discard("扫描结束、没人要预览", failed=False)
             return self.status()
         if kind == "trigger":
             sess = self._sess
             if sess is None:
                 raise CameraError("相机没有会话（掉线？）—— 扫描中止")
-            if not sess.armed:
-                self._arm(sess)                  # arm 掉过就补上（幂等）
-            else:
-                sess.cam.issue_software_trigger()
-                sess.last_trigger = time.monotonic()
+            self._fire(sess)
             return None
         if kind == "capture":
             return self._grab_frame(*job[1:])
@@ -486,10 +492,20 @@ class ThorlabsCamera:
             self._rotation = _norm_rotation(int(job[1]))   # 输入校验：非法值抛 CameraInputError
             return self.status()
         if kind == "save":
-            # 用一个不落盘的编号采一帧：图像由调用方自己存（见 save_raw）
-            self._capture_once()
-            sess = self._sess
-            return {"shot": sess.shot if sess else None}   # 侧信道（_last_shot）删掉了
+            # 「保存原生帧」= 从**当前这条流**里取一帧，图像由调用方写盘（见 save_raw）。
+            # 不重配、不 disarm、不重新 arm：设置是会话出生时写好的那一套，预览 / 保存 / 扫描
+            # 共用同一条连续流 —— 预览中途保存因此不会打断预览（文件头第 5 条）。
+            # 预览关着（没有会话）时才开一个**一次性**会话：会话只在「使用窗口」内存在（R1）。
+            one_shot = self._sess is None
+            sess = self._ensure_session(0.0)
+            try:
+                self._fire(sess)
+                self._grab_frame(0, 0, 0.0, save=False)
+                shot = sess.shot          # 拿走这一帧再谈收工（会话可能随后就被丢掉）
+            finally:
+                if one_shot and not self._preview_wanted and not self._hold:
+                    self._discard("采完一帧就收工", failed=False)
+            return {"shot": shot}
         raise CameraInputError(f"未知相机任务 {kind!r}")
 
     # ------------------------------------------------------------ 会话
@@ -511,15 +527,20 @@ class ThorlabsCamera:
         return sess
 
     def _open_session(self, wait_s: float) -> _Session:
-        """建一个新会话：SDK 实例 + 相机句柄，读一次型号/曝光范围/ROI 出厂值。
+        """建一个新会话：SDK 实例 + 相机句柄 + **把这一套设置写进去**（文件头第 5 条）。
 
         **SDK 只建一次**：它是进程级单例，建第二个会抛 "TLCameraSDK is already in use"
         （旧代码在重试循环里反复 new，于是第一次 discover 为空之后就永远失败、还报成
         「打不开相机 SDK…确认 ThorCam 已关闭」）。等设备只用重跑 discover。
+
+        设置写在这里、而不是"用的时候再配"：这台相机只要在流跑着的时候 disarm + 重写设置 +
+        再 arm，连续出帧就停摆（文件头第 5 条的实测）。会话出生时还没有 arm、没有触发，
+        是唯一安全的写设置窗口 —— 而且这是唯一一次。
         """
         _require_dll_dir()          # 再确认一次：PATH 是启动前设的，进程内改不了
         t0 = time.perf_counter()
         sdk = _sdk_class()()
+        cam = None
         try:
             deadline = time.monotonic() + max(0.0, wait_s)
             while True:
@@ -532,38 +553,48 @@ class ThorlabsCamera:
                 time.sleep(0.5)     # 等它枚举出来
             serial = serials[0]
             cam = sdk.open_camera(serial)
+            cam.frames_per_trigger_zero_for_unlimited = 0
+            cam.image_poll_timeout_ms = 2000
+            sess = _Session(sdk, cam, serial, self._roi)
+            t_cfg = time.perf_counter()
+            self._apply(sess)
         except BaseException:
-            # 建不起来就别把 SDK 实例留着（闩锁 + 占着设备）
-            try:
-                sdk.dispose()
-            except Exception as exc:                      # noqa: BLE001
-                log.warning("放弃会话时关 SDK 失败：%s（之后可能只能重启后端）", exc)
+            # 建不起来（含"设置写不进去"）就别把句柄/SDK 留着（闩锁 + 占着设备）
+            self._teardown(sdk, cam)
             raise
-        cam.frames_per_trigger_zero_for_unlimited = 0
-        cam.image_poll_timeout_ms = 2000
-        sess = _Session(sdk, cam, serial, self._roi_cfg)
-        log.info("相机会话已建立：%s %s（%.0f ms）", sess.model, sess.serial,
-                 1000 * (time.perf_counter() - t0))
+        log.info("相机会话已建立并配好：%s %s（开 %.0f ms + 配置 %.0f ms）",
+                 sess.model, sess.serial, 1000 * (t_cfg - t0),
+                 1000 * (time.perf_counter() - t_cfg))
         return sess
 
-    def _discard(self, why: str, failed: bool = True) -> None:
-        """终结当前会话：**句柄和它用的 SDK 实例一起丢**。
+    def _teardown(self, sdk, cam=None) -> None:
+        """关掉句柄与它用的 SDK 实例 —— **两个都要关**（丢弃会话、建到一半失败共用这条路）。
 
         为什么 SDK 也要丢：实测（tools/thorlabs_replug_probe.py）拔插之后，旧 SDK 实例的
         discover 还看得见设备，但在它上面 open_camera 会触发原生 access violation ——
         进程直接死。所以「只换句柄、留着 SDK」是不行的；重建必须两者一起重建。
+        """
+        if cam is not None:
+            try:
+                cam.dispose()
+            except Exception as exc:                      # noqa: BLE001
+                log.warning("放弃会话时关句柄失败：%s（之后可能只能重启后端）", exc)
+        try:
+            sdk.dispose()
+        except Exception as exc:                          # noqa: BLE001
+            # SDK 的 dispose 失败会让它的类级闩锁一直为 True —— 之后再建实例会抛
+            # "already in use"，那种情况只能重启后端。如实记下来，不假装还能重开。
+            log.warning("放弃会话时关 SDK 失败：%s（之后可能只能重启后端）", exc)
+
+    def _discard(self, why: str, failed: bool = True) -> None:
+        """终结当前会话：**句柄和它用的 SDK 实例一起丢**（见 _teardown）。
+
         failed=True 时把原因记进 _failure（界面据此显示「点重开相机」）。
         """
         sess, self._sess = self._sess, None
         if sess is None:
             return
-        for label, obj in (("句柄", sess.cam), ("SDK 实例", sess.sdk)):
-            try:
-                obj.dispose()
-            except Exception as exc:                      # noqa: BLE001
-                # SDK 的 dispose 失败会让它的类级闩锁一直为 True —— 之后再建实例会抛
-                # "already in use"，那种情况只能重启后端。如实记下来，不假装还能重开。
-                log.warning("关%s失败：%s", label, exc)
+        self._teardown(sess.sdk, sess.cam)
         if failed and not self._stop.is_set():
             with self._lock:
                 self._failure = why
@@ -585,10 +616,13 @@ class ThorlabsCamera:
         if sess is None or not self._preview_wanted or self._hold:
             return next_frame_at
         now = time.monotonic()
-        if sess.frames and now - sess.last_frame_at > self._frame_budget():
+        # 只在"应该出帧"的时间里计时：last_frame_at 是最后一次真出帧，frames_expected_since 是
+        # 最近一次"重新开始要帧"（开预览 / 重开 / 扫描交还）。取两者较晚的那个，
+        # 那段时间没人取帧（相机归扫描）就不会被算成"预览没出新帧"。
+        idle_since = max(sess.last_frame_at, sess.frames_expected_since)
+        if sess.frames and now - idle_since > self._frame_budget():
             # 预算跟着曝光/帧周期走：长曝光不会被误判（旧代码写死 1 s，>1 s 曝光必误报）
-            self._discard(
-                f"预览 {now - sess.last_frame_at:.1f}s 没出新帧（相机掉线？）", failed=True)
+            self._discard(f"预览 {now - idle_since:.1f}s 没出新帧（相机掉线？）", failed=True)
             return now
         if now < next_frame_at:
             return next_frame_at
@@ -611,23 +645,18 @@ class ThorlabsCamera:
             raise CameraError(f"曝光没生效：要 {exposure_us} µs，相机读回 {real} µs")
         log.debug("实时改曝光：%d µs（读回 %d）", exposure_us, real)
 
-    def _apply(self, sess: _Session, preview: bool) -> None:
-        """停流、写设置、**读回确认** —— 增益和曝光是掉电保持的，不能假设。
+    def _apply(self, sess: _Session) -> None:
+        """把这一套设置写进相机并**逐项读回确认** —— **一个会话只在出生时调这一次**。
 
-        **必须先 disarm**：实测在采集中改 ROI，固件会直接拒绝
-        （tl_camera_set_roi() → error code 1005 "Camera Running Error"）。
+        增益和曝光都是掉电保持的（A5：不写就是上一个进程留下的值），ROI 会被硬件按对齐改写
+        （A6），所以一切记账都用读回值。写 ROI 必须先退出采集（error 1005 "Camera Running
+        Error"）—— 而这里本来就还没 arm、还没有触发。这台相机**在流跑着的时候 disarm +
+        重写设置 + 再 arm 会让出帧停摆**（文件头第 5 条的实测），所以设置只许在这个窗口里写，
+        之后谁也不许再动；会话存续期间唯一允许的改设置是"不停流直接改曝光"
+        （_set_exposure_now，A5 实测 1~2 帧内生效）。
         """
         cam = sess.cam
-        # SDK 文档（tl_camera.py:918）明写：**发出软触发后至少等 300 ms 才能设曝光**。
-        # 不等的话 set 不报错、但固件不认账 —— 实测就是这样：要 8000 us，读回还是预览的 2011 us。
-        if sess.last_trigger:
-            wait = 0.3 - (time.monotonic() - sess.last_trigger)
-            if wait > 0:
-                time.sleep(wait)
-        if sess.armed:
-            cam.disarm()
-            sess.armed = False
-        roi = sess.preview_roi if preview else sess.full_roi
+        roi = self._roi
         exposure = self._exposure_us      # 预览与采图同一个曝光
         cam.roi = roi                     # 设完读回：相机会按硬件对齐改写（角点语义，见 _roi_ok）
         cam.exposure_time_us = exposure
@@ -638,23 +667,50 @@ class ThorlabsCamera:
             # 读回是垃圾（设备半死）→ **不缓存、不修**：抛出去让上层丢掉这个会话。
             # 旧代码把垃圾值缓存下来，于是之后每次 set_roi 都撞 error 1003，换句柄也救不回来。
             raise CameraError(f"相机读回的 ROI {actual!r} 不合法（设备掉线？）")
-        if preview:
-            sess.preview_roi = actual
-        else:
-            sess.full_roi = actual
+        sess.roi = actual
         if cam.gain != self._gain:
             raise CameraError(f"增益没设上：要 {self._gain}，读回 {cam.gain}")
         # 曝光也要读回：掉电保持 + 固件按步进取整，设了不等于生效。
-        # 只警告不抛：真出问题会在图像亮度上现形，而这里抛会把整条扫描打断。
+        # 只警告不抛：真出问题会在图像亮度上现形，抛出去只会把这次打开白白废掉。
         if abs(cam.exposure_time_us - exposure) > max(50, exposure * 0.02):
-            log.warning("曝光没设上：要 %d us，读回 %d us（%s）",
-                        exposure, cam.exposure_time_us, "预览" if preview else "采图")
+            log.warning("曝光没设上：要 %d us，读回 %d us", exposure, cam.exposure_time_us)
+
+    def _ensure_armed(self, sess: _Session) -> None:
+        """要帧就得 arm —— **一个会话最多 arm 一次**（文件头第 5 条）。
+
+        arm 过就一直是 arm 的：此后不再 disarm、不再重写设置，预览 / 手动保存 / 扫描共用
+        这**一条连续流**。`arm()` 会顺手清空帧队列（SDK 文档），所以"再 arm 一次"看着无害，
+        实际会让这台相机彻底不再出帧 —— 实测见文件头第 5 条。
+        """
+        if not sess.armed:
+            self._arm(sess)
 
     def _arm(self, sess: _Session) -> None:
+        """冷会话的第一次（也是唯一一次）进入连续出帧：arm + 第一发软触发。"""
         sess.cam.arm(2)
         sess.cam.issue_software_trigger()
         sess.last_trigger = time.monotonic()
         sess.armed = True
+
+    def _fire(self, sess: _Session) -> None:
+        """补一发软触发。扫描路径在**读位置之前**调它，让那次串口读数落进曝光窗（A7）。
+
+        冷会话（还没 arm）由这里补上 arm；连续出帧时多发几发触发是无害的
+        （SDK 文档：disarm 之前可以发多次）。
+        """
+        if not sess.armed:
+            self._arm(sess)
+            return
+        sess.cam.issue_software_trigger()
+        sess.last_trigger = time.monotonic()
+
+    def _expect_frames_from_now(self, sess: _Session) -> None:
+        """从这一刻起重新"应该出帧" —— 判掉线只在应该出帧的时间里计时（见 _maybe_pump）。
+
+        开预览、重开相机、扫描交还这三个时刻都要刷新：扫描期间相机归扫描、没人取帧，
+        那段时间长短由扫描决定，不刷新的话交还瞬间就会按"很久没出新帧"把好好的会话丢掉。
+        """
+        sess.frames_expected_since = time.monotonic()
 
     def _next_frame(self, sess: _Session):
         """拿一帧（uint16，是临时缓冲，调用方要用就得自己 copy）。"""
@@ -666,9 +722,7 @@ class ThorlabsCamera:
 
     def _pump(self, sess: _Session) -> None:
         """预览取一帧：转 8 位、编码 JPEG、存成"最近一帧"。"""
-        if not sess.armed:
-            self._apply(sess, preview=True)
-            self._arm(sess)
+        self._ensure_armed(sess)
         t0 = time.perf_counter()
         frame = self._next_frame(sess)
         t_grab = time.perf_counter()
@@ -734,13 +788,15 @@ class ThorlabsCamera:
         # 同一帧只算一次 —— 存盘写进文件自己身上，save_raw 也拿这一份。
         cen = global_centroid(img)
         with self._lock:
-            sess.shot = (img, shot_exposure, sess.full_roi, cen)
+            sess.shot = (img, shot_exposure, sess.roi, cen)
         if not save:
             log.info("采了一帧原生全幅（不落盘）：%dx%d，曝光 %d us，均值 %.1f",
                      img.shape[1], img.shape[0], shot_exposure, float(img.mean()))
             return None, shot_exposure
         path = _image_path(scan_id, index)
-        size = _save_png16(path, img, shot_exposure, cen)
+        # 压缩级别用 config.SCAN_PNG_LEVEL（1）：这一步在点周期里仅次于设备往返，
+        # level=1 比默认的 6 快 2.5 倍、文件只大 10%（实测见 config 与认识账 A7）。
+        size = _save_png16(path, img, shot_exposure, cen, level=SCAN_PNG_LEVEL)
         t_end = time.perf_counter()
         log.info("第 %d 点采图：%s（%dx%d，%d 字节，曝光 %d us，均值 %.1f；"
                  "等帧 %.0f + 落盘 %.0f = %.0f ms）",
@@ -748,26 +804,6 @@ class ThorlabsCamera:
                  float(img.mean()), 1000 * (t_frame - t0), 1000 * (t_end - t_frame),
                  1000 * (t_end - t0))
         return f"images/{path.name}", shot_exposure
-
-    def _capture_once(self) -> None:
-        """一次性采一帧（手动「保存原生帧」用）：自己配置、自己触发、采完恢复预览设置。
-
-        **扫描不走这里** —— 那边 begin_scan 配一次就够（见 _run 的 begin_scan）。
-        这条路上配置是必须的：用户可能正开着预览，而预览的 ROI/曝光跟采图不是一套。
-        """
-        sess = self._ensure_session(0.0)
-        armed_before = sess.armed
-        self._apply(sess, preview=False)
-        self._arm(sess)
-        try:
-            self._grab_frame(0, 0, 0.0, save=False)
-        finally:
-            if sess.armed:
-                sess.cam.disarm()
-                sess.armed = False
-            if armed_before:              # 预览还开着就恢复，别把预览弄死
-                self._apply(sess, preview=True)
-                self._arm(sess)
 
     def profile(self, x: int, y: int) -> dict:
         """过 (x, y) 的两条**全长**剖面：水平取整行、垂直取整列。
@@ -827,8 +863,10 @@ class ThorlabsCamera:
     def save_raw(self) -> dict:
         """采一帧**原生全幅**存 16 位 PNG，给界面上的「保存原生帧」用。
 
-        与扫描采图走同一段代码（同样的曝光、同样的不裁剪），但不占扫描的编号，
-        也不额外多做一次曝光 —— 采完的帧就在会话里（_run 的 save 分支带回来）。
+        与扫描采图走同一段代码（同样的曝光、同样的不裁剪），但不占扫描的编号。
+        **预览开着的时候这一帧就取自那条正在跑的流**：不 disarm、不重配、不重新 arm，
+        所以预览不会被打断 —— 旧代码在这里把相机重配一轮，实测每保存一次就把预览弄死一次
+        （见文件头第 5 条）。预览关着时开一个一次性会话，采完就丢。
         """
         self._ensure_thread()
         st = self._submit(("save",), timeout=TL_CAPTURE_TIMEOUT_S)
@@ -1042,7 +1080,8 @@ def png_pixel_series(items, x: int, y: int, workers: int = 8,
     # µm = 原值 × readback_to_um，所以原值 = µm ÷ readback_to_um；时间同比例（t = 2x/c）。
     # 系数没记下（加这一列之前的老数据）或本来就是 1（PI 的位置就是 µm）时**不给这两列**：
     # 给了就是编数 —— 界面据此把「口径」那个按钮禁用，而不是拿 µm 冒充原值。
-    raw = readback_to_um if readback_to_um and readback_to_um != 1.0 else None
+    # 「有没有原值可给」的判定只有一处：config.raw_readback_factor（导出 CSV 用的是同一个）。
+    raw = raw_readback_factor(readback_to_um)
     out["position_raw"] = (
         None if raw is None else [None if p is None else p / raw for p in out["position_um"]]
     )
@@ -1102,12 +1141,28 @@ def png_pixel_series(items, x: int, y: int, workers: int = 8,
 _CARRY_TEXT = ("ExposureUs", "CentroidPx")
 
 
+def png_ihdr(path: Path) -> tuple:
+    """PNG 头里的 (宽, 高, 位深)：**只读开头 33 个字节**，不解码、不依赖 PIL。
+
+    PIL 只是相机那一路的可选依赖（见 requirements.txt：只有 PI_CCD=thorlabs 才需要），
+    而导出原始帧那条路要逐张记下尺寸 —— 那条路不该因为没装相机就走不通。
+    读不动（不是 PNG / 文件短了）就抛 OSError，跟 PIL 那边的语义一致，调用方按 OSError 接。
+    """
+    import struct
+
+    with open(path, "rb") as f:
+        head = f.read(33)
+    # 8 字节签名 + 4 字节长度 + "IHDR" + 13 字节块体（宽 4 + 高 4 + 位深 1 + …）
+    if len(head) < 33 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        raise OSError(f"{path.name} 不像一张 PNG（读不出画面尺寸）")
+    w, h, bits = struct.unpack(">IIB", head[16:25])
+    return (w, h, bits)
+
+
 def png_size(path: Path) -> tuple:
     """PNG 头里的宽高（只读 IHDR，不解码）—— 判一组扫描的画面尺寸一不一样用。"""
-    from PIL import Image
-
-    with Image.open(path) as im:
-        return im.size
+    w, h, _ = png_ihdr(path)
+    return (w, h)
 
 
 def _carry_text(text: dict) -> list:
@@ -1417,14 +1472,23 @@ def _save_png16(path: Path, img, exposure_us: Optional[int] = None,
 
     extra_text 是 [(键, 值), ...]，原样写进去 —— 裁剪时靠它把 ExposureUs / CentroidPx
     **一个字节不改**地搬过来（质心是整幅算的，裁掉背景就不是那个数了：只搬，不重算）。
-    level 是 zlib 压缩级别：裁剪那条路用 1（实测比默认 6 快 2.5 倍，文件只大 10%）。
+    level 是 zlib 压缩级别：**裁剪与扫描都用 1**（config.CROP_PNG_LEVEL / SCAN_PNG_LEVEL）
+    —— 实测比默认的 6 快 2.5 倍、文件只大 10%。手动保存（save_raw）仍走默认。
     """
     import zlib
 
     import struct
 
+    import numpy as np
+
     h, w = img.shape
-    raw = b"".join(b"\x00" + img[y].astype(">u2").tobytes() for y in range(h))
+    # 一次成型：原来逐行 astype(">u2") 是 h 次 Python 循环 + h 个小对象（全幅 1080 次），
+    # 改成整块转大端、再连同每行的 filter 字节写进预分配缓冲，**输出字节完全相同**。
+    be = np.ascontiguousarray(img.astype(">u2")).view(np.uint8).reshape(h, w * 2)
+    buf = np.empty((h, w * 2 + 1), dtype=np.uint8)
+    buf[:, 0] = 0                     # PNG 每行开头的 filter 字节（0 = None）
+    buf[:, 1:] = be
+    raw = buf.tobytes()
 
     text = b""
     if exposure_us is not None:

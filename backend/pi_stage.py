@@ -68,6 +68,11 @@ CAPS = Caps(
 # 按 by-id 路径找，不写死 ttyUSB0：换 USB 口或插别的串口设备时编号会变。
 SERIAL_BY_ID = "/dev/serial/by-id"
 
+# Windows 上 E-709 同样以 FTDI 虚拟串口（VCP）出现，**也能走这条纯 Python 命令层**，
+# 不需要 PI Software Suite。按 VID:PID 认设备，不写死 COM 号（换 USB 口编号会变）。
+PI_USB_VID = 0x1A72
+PI_USB_PID = 0x100E
+
 
 def resolve_link() -> str:
     """实际使用的连接方式：'usb'（GCS DLL）或 'serial'（FTDI 虚拟串口）。"""
@@ -79,11 +84,30 @@ def resolve_link() -> str:
 
 
 def find_serial_port() -> str:
-    """找 PI 的串口设备路径；多个取第一个，一个都没有则报错。"""
+    """找 PI 的串口设备路径；多个取第一个，一个都没有则报错。
+
+    Linux 走 /dev/serial/by-id（内核 ftdi_sio 给的 FTDI 虚拟串口）；
+    Windows 走 VID:PID —— FTDI 的 VCP 驱动同样给一个 COM 口，**不需要 PI Software Suite**，
+    所以这里是"按设备认口"，换 USB 口、COM 号变了都不用改配置。
+    """
+    if sys.platform == "win32":
+        from serial.tools import list_ports      # 用到才拉（与其它地方同一个规矩）
+
+        ports = [p for p in list_ports.comports()
+                 if (p.vid, p.pid) == (PI_USB_VID, PI_USB_PID)]
+        if not ports:
+            raise StageNotConnected(
+                f"没有 VID:PID={PI_USB_VID:04X}:{PI_USB_PID:04X} 的串口（PI 控制器）。"
+                "确认控制器已上电、USB 线插好；或用 PI_SERIAL_PORT 直接指定 COM 口。"
+            )
+        if len(ports) > 1:
+            log.warning("发现多个 PI 串口，使用第一个：%s", [p.device for p in ports])
+        return ports[0].device
+
     found = sorted(Path(SERIAL_BY_ID).glob("usb-PI_*"))
     if not found:
         raise StageNotConnected(
-            f"{SERIAL_BY_ID}/usb-PI_* 下没有设备。确认控制器已上电、USB 线已插好。"
+            f"{SERIAL_BY_ID}/usb-PI_* 下没有设备。确认控制器已上电、USB 线插好。"
         )
     if len(found) > 1:
         log.warning("发现多个 PI 串口，使用第一个：%s", [p.name for p in found])
@@ -305,6 +329,14 @@ class Stage:
         if not self._status.servo:
             log.info("控制器处于开环，按当前位置开启闭环保持")
             self._set_servo(True)
+        # 目标值与速度**只在连接时取一次真值**：周期慢查询不再问它们（见 _refresh_slow），
+        # 这两个值此后只有本进程会改。这里读设备而不是拿位置顶替 —— 开环转闭环那一下
+        # 目标可能被控制器夹到行程端点（见上面那条注释），位置不等于目标寄存器。
+        target = float(dev.qMOV()[self._axis])
+        velocity = float(dev.qVEL()[self._axis])
+        with self._status_lock:
+            self._status.target = target
+            self._status.velocity = velocity
 
     def _close(self) -> None:
         if self._dev is not None:
@@ -342,19 +374,21 @@ class Stage:
             self._status.updated_at = time.time()
 
     def _refresh_slow(self) -> None:
+        """慢查询：只问**会自己变**的三样（伺服 / 过冲 / 错误码）。
+
+        **不再问 qMOV? 与 qVEL?**（2026-10）：目标值由 _move 就地写、速度由
+        _set_velocity 就地写，这两个值只有本进程能改，读回来是白花两趟（每趟还得
+        陪一条 ERR?）。慢查询因此从 9 次往返降到 5 次。连接时那一次初值在 _open 里取。
+        """
         dev = self._require()
         servo = bool(dev.qSVO()[self._axis])
         overflow = bool(dev.qOVF()[self._axis])
         error_code = int(dev.qERR())
-        target = float(dev.qMOV()[self._axis])
-        velocity = float(dev.qVEL()[self._axis])
         with self._status_lock:
             st = self._status
             st.servo = servo
             st.overflow = overflow
             st.error_code = error_code
-            st.target = target
-            st.velocity = velocity
 
     def _tick_once(self) -> None:
         self._refresh_fast()
@@ -363,10 +397,20 @@ class Stage:
             self._refresh_slow()
 
     def _move(self, target: float) -> None:
+        """下发目标。**写完不再立刻读回**（2026-10 起）。
+
+        MOV 是异步的：紧跟的那次 qPOS? 读到的是"刚起步的位置"，对扫描毫无用处 ——
+        扫描紧接着就要等到位信号、再读一次，**那一次才是入库的读数**。每点省 2 条查询。
+        代价：手动移动后界面上的位置/到位晚一个遥测周期刷新（空闲 ≤100 ms）。
+        _jog 自己先 _refresh_fast、_hold_here 与 _stop 各自也会刷新，不受影响。
+        XMT 早就是这么做的（docs/xmt/设备认识账.xml 的 P1），这里同一个道理。
+        """
         self._require().MOV(self._axis, float(target))
         with self._status_lock:
             self._status.target = float(target)
-        self._refresh_fast()
+            # 下了新目标就还没到位：别让界面把上一状态的"是"当成现在的
+            # （真值归控制器，下一个遥测周期就会刷出来）。
+            self._status.on_target = False
 
     def _jog(self, delta: float) -> float:
         self._refresh_fast()
@@ -375,12 +419,26 @@ class Stage:
         return target
 
     def _set_servo(self, on: bool) -> None:
+        """开/关伺服。
+
+        **开的那一下会把当前位置写进目标寄存器**（SVO 1 的语义，见 _open 里那条注释），
+        所以目标值要跟着走：它不再由周期慢查询从设备读回（见 _refresh_slow），
+        这里不补，界面上的「目标」就会停在开伺服之前那个值。
+        """
         self._require().SVO(self._axis, 1 if on else 0)
         self._refresh_slow()
+        if on:
+            self._refresh_fast()
+            with self._status_lock:
+                self._status.target = self._status.position
 
     def _set_velocity(self, velocity: float) -> None:
+        """写速度。**写完不再读回**：qVEL? 已从周期慢查询里去掉（见 _refresh_slow），
+        这里就地记账；下发值本身已在公开的 set_velocity 里夹过范围。
+        """
         self._require().VEL(self._axis, float(velocity))
-        self._refresh_slow()
+        with self._status_lock:
+            self._status.velocity = float(velocity)
 
     def _stop(self) -> None:
         stp(self._require())

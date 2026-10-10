@@ -234,12 +234,18 @@ main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
 .croprow em.no { color: var(--warn); }
 .croprow.dim { opacity: .55; }
 
-/* 裁剪面板：红框里是**将要留下**的那一块，框外压暗；四个数一律是原始坐标 */
-#croppanel {
+/* 裁剪面板：红框里是**将要留下**的那一块，框外压暗；四个数一律是原始坐标。
+   导出面板跟它共用这套遮罩与盒子（.cropbox / .cropside），只是里面没有图要看。 */
+#croppanel, #exportpanel {
   position: fixed; inset: 0; z-index: 40; display: flex;
   align-items: center; justify-content: center; background: rgba(15,23,42,.55);
 }
-#croppanel[hidden] { display: none; }
+#croppanel[hidden], #exportpanel[hidden] { display: none; }
+.expbox { width: min(620px, 94vw); }
+/* 全局的 input 是"占满一行的输入框"，复选框不能跟着长成一条 */
+.chk { display: flex; align-items: flex-start; gap: 6px; margin: 12px 0 0;
+       color: var(--muted); font-size: 12px; }
+.chk input { width: auto; margin: 2px 0 0; flex: 0 0 auto; }
 .cropbox {
   width: min(900px, 94vw); max-height: 92vh; overflow: auto;
   background: var(--card); border-radius: var(--radius); padding: var(--pad) 16px;

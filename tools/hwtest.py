@@ -44,22 +44,25 @@ def run(s: Stage) -> None:
     check("伺服保持中", st.servo)
     check("错误码为 0", st.error_code == 0, str(st.error_code))
 
+    # 到位信号只是"控制器认为到了"，**不等于台子停稳**：实测（2026-10-10）一次 90 µm
+    # 移动里 ONT 在 MOV 后 61 ms 就置位，此刻离目标还差 0.32 µm，要到 +450 ms 才进 0.013。
+    # 所以判位置之前先按扫描首点那条规矩等一段（config.FIRST_POINT_SETTLE_MS）。
     print("\n[1] 绝对移动 0 -> 10 µm")
     s.move(10.0)
     t0 = time.monotonic()
-    check("到位信号", s.wait_on_target(10.0))
+    check("到位信号", s.wait_on_target(10.0, settle_s=0.5))
     dt = time.monotonic() - t0
     st = s.poll()
-    print("   ", show(st), f"| ONT? 等待 {dt * 1000:.0f} ms")
+    print("   ", show(st), f"| ONT? 等待 {dt * 1000:.0f} ms（含 0.5 s 停稳）")
     check("位置正确", abs(st.position - 10.0) < 0.15, f"{st.position:.4f}")
 
     print("\n[2] 绝对移动 10 -> 50 µm")
     s.move(50.0)
     t0 = time.monotonic()
-    check("到位信号", s.wait_on_target(10.0))
+    check("到位信号", s.wait_on_target(10.0, settle_s=0.5))
     dt = time.monotonic() - t0
     st = s.poll()
-    print("   ", show(st), f"| ONT? 等待 {dt * 1000:.0f} ms")
+    print("   ", show(st), f"| ONT? 等待 {dt * 1000:.0f} ms（含 0.5 s 停稳）")
     check("位置正确", abs(st.position - 50.0) < 0.15, f"{st.position:.4f}")
 
     print("\n[3] 降速 + 中途停止（STP 保持伺服）")

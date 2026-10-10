@@ -640,7 +640,7 @@ const count = (m) => calls.filter((c) => c === m).length;
     available: true, state: 'preview', open: true, model: 'CS165MU', serial: '1', frames: 7,
     exposure_us: 12000, gain: 0, gain_locked: true,
     exposure_min_us: 40, exposure_max_us: 26843432,
-    preview_roi: [0, 0, 1440, 1080], full_roi: [0, 0, 1440, 1080], saturation_adu: 1022, centroid,
+    roi: [0, 0, 1440, 1080], saturation_adu: 1022, centroid,
   });
   const cen = (over) => Object.assign(
     { cx: 718.2, cy: 540.0, sum: 6.339e8, peak: 463, saturated: 0, width: 1440, height: 1080 }, over || {});
@@ -1584,6 +1584,112 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('crop-warn').textContent").indexOf('上一刀**就已经在框外') < 0 &&
      read("$('crop-warn').textContent").indexOf('这是') > 0,
      read("$('crop-warn').textContent"));
+
+
+  // ==================== 历史扫描：导出原始数据 ====================
+  // 抄一份出去（源文件一个字节都不动）。前端这一层要盯的是：预检如实写出来（缺图 / 裁剪 /
+  // 正在采图）、勾 zip 要重新问一次预检（路径的名字由后端定）、点「开始导出」把**面板上那个
+  // 批次标记**带回去（这样面板写的路径就是最终的路径）、进度与结果照后端报的写。
+  // 真正的复制与校验在后端（backend/tests/test_export.py 盯着）。
+  console.log('\n[U] 历史扫描：导出原始数据');
+  const expJob = { running: false, scan_id: null, done: 0, total: 0, error: null, result: null };
+  const expPlanBody = {
+    scan_id: 41, name: 'xmt 联调', status: 'done', stamp: '20260101-120000', zipped: false,
+    dest: 'C:\\data\\export\\xmt 联调_41_20260101-120000', dir: 'C:\\data\\export',
+    points: 3, images: 2, bytes: 2097152, missing: ['images/scan0041_00002.png'],
+    crop: [520, 390, 400, 300], sample: 'images/scan0041_00000.png',
+    readback_to_um: 0.75, raw_available: true,
+    scanner: { status: 'running', scan_id: 52 },
+  };
+  let expFail = null;      // 想让预检失败（400）就把它设成 detail 文本
+  const expRoute = (m, url) => {
+    if (url.indexOf('/api/exports') === 0) {
+      return { body: { job: expJob, dir: 'C:\\data\\export', recent: [] } };
+    }
+    if (url.indexOf('/api/scans/41/export') === 0) {
+      return expFail ? { ok: false, status: 400, body: { detail: expFail } } : { body: expPlanBody };
+    }
+    if (url.indexOf('/api/scans') === 0) return { body: histBody };
+    return { body: {} };
+  };
+  route = expRoute;
+  await run('loadHistory()'); await tick(); await tick();
+  const expHist = htmlOf('history');
+  ok('历史表里给出「导出」入口（点哪一条导**哪一条**，不是同名整组）',
+     expHist.indexOf('data-exp="41"') > 0 && expHist.indexOf('data-exp="36"') > 0,
+     expHist.slice(-220));
+  ok('一个图都没有的扫描不给导出按钮',
+     (expHist.match(/data-exp=/g) || []).length === 2, expHist.match(/data-exp="\d+"/g));
+
+  calls.length = 0;
+  click({ exp: '41' }); await tick(); await tick();
+  ok('点「导出」先拉预检：多少点、多少张、多大（动手前就知道要抄多少）',
+     calls[0] === 'GET /api/scans/41/export?zip=0' &&
+     read("$('exportpanel').hidden") === false &&
+     read("$('exp-info').textContent").indexOf('3 个扫描点 · 2 张原图 · 2.0 MB') === 0,
+     read("$('exp-info').textContent"));
+  ok('面板上写的就是最终路径（批次标记是后端给的，前端不自己拼名字）',
+     read("$('exp-dest').textContent").indexOf('_41_20260101-120000') > 0,
+     read("$('exp-dest').textContent"));
+  ok('三件事都先提醒：正在采图会抢磁盘、缺图不假装没事、裁过的导不出原生全幅',
+     read("$('exp-warn').hidden") === false &&
+     read("$('exp-warn').textContent").indexOf('会跟采图抢磁盘') > 0 &&
+     read("$('exp-warn').textContent").indexOf('盘上却没有') > 0 &&
+     read("$('exp-warn').textContent").indexOf('导不出原生全幅') > 0,
+     read("$('exp-warn').textContent"));
+  ok('设备原值这一列有没有，照后端说的写（前端不猜系数）',
+     read("$('exp-info').textContent").indexOf('设备原值未记录') < 0,
+     read("$('exp-info').textContent"));
+
+  calls.length = 0;
+  run("$('exp-zip').checked = true; $('exp-zip').onchange();"); await tick(); await tick();
+  ok('勾了 zip 重新问一次预检（带不带 .zip 是后端定的，前端不拼路径）',
+     calls[0] === 'GET /api/scans/41/export?zip=1', JSON.stringify(calls));
+
+  expJob.running = true; expJob.done = 0; expJob.total = 2;
+  calls.length = 0; posts.length = 0;
+  await run('runExport()'); await tick(); await tick();
+  ok('点「开始导出」把面板上那个批次标记一起发回去（最终路径才不会差几秒）',
+     calls[0] === 'POST /api/scans/41/export' &&
+     JSON.parse(posts[0].body).stamp === '20260101-120000' &&
+     JSON.parse(posts[0].body).zip === true,
+     posts[0] && posts[0].body);
+  ok('跑起来就锁住按钮、进度行只照后端报的数写',
+     read("$('btn-exp-run').disabled") === true &&
+     read("$('exp-progress').textContent").indexOf('正在导出') === 0,
+     read("$('exp-progress').textContent"));
+
+  expJob.running = false; expJob.done = 2;
+  expJob.result = { scan_id: 41, name: 'xmt 联调', zipped: true, points: 3, images: 2,
+                    bytes: 2097152, missing: ['images/scan0041_00002.png'], status: 'done',
+                    path: 'C:\\data\\export\\xmt 联调_41_20260101-120000.zip' };
+  calls.length = 0;
+  await run('expPoll()'); await tick(); await tick();
+  ok('导完报到结果：几张、多大、导到哪儿，并把「复制路径」放出来',
+     read("$('exp-progress').textContent").indexOf('导完了：2 张 / 2.0 MB → ') === 0 &&
+     read("$('btn-exp-copy').hidden") === false &&
+     read("$('btn-exp-run').disabled") === false,
+     read("$('exp-progress').textContent"));
+  ok('复制的是**导完之后的那个真实路径**（不是动手前猜的那个）',
+     read('expPath') === 'C:\\data\\export\\xmt 联调_41_20260101-120000.zip', read('expPath'));
+  ok('顺带把"上次导哪儿了"重新拉一遍',
+     calls.indexOf('GET /api/exports') >= 0, JSON.stringify(calls));
+
+  expJob.result = null;
+  expJob.error = '库里的裁剪记录和文件对不上（库 [520, 390, 400, 300]，文件 没记录）';
+  await run('expPoll()'); await tick();
+  ok('失败就说失败，并写明**源文件一点没动**（后端已经回滚/本就只读）',
+     read("$('exp-progress').textContent").indexOf('导出失败（源文件一点没动）：') === 0,
+     read("$('exp-progress').textContent"));
+
+  expFail = '这条扫描盘上一张图都没有，没什么可导的';
+  await run("openExportPanel(41)"); await tick(); await tick();
+  ok('预检就被拒（图都没有 / 正在裁剪）：面板说清"现在导不了"，按钮锁住不让点',
+     read("$('exp-info').textContent").indexOf('现在导不了') > 0 &&
+     read("$('btn-exp-run').disabled") === true &&
+     read("$('exp-dest').textContent") === '—',
+     read("$('exp-info').textContent"));
+  expFail = null;
 
   // ==================== 数据页：频谱（功率谱） ====================
   // 这块的规矩：**真实点间距**（非均匀最小二乘，不插值）、**整条扫描的全部点**、**缺一个点整条不算**、

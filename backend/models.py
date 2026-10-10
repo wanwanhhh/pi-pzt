@@ -53,6 +53,18 @@ class ScanRequest(_Model):
     )
 
 
+class ExportRequest(_Model):
+    """把一条扫描的原始帧与每点元数据抄一份出去。
+
+    zip=True 打成一个 zip（ZIP_STORED，只装不压：PNG 已经压过了），False 落地成目录。
+    stamp 是面板上先看到的那次导出的批次标记，带回来是为了**面板写的路径就是最终的路径**
+    （不带就现取一个，中间隔几秒名字就变了，人照着面板去找会找不到）。
+    """
+
+    zip: bool = False
+    stamp: Optional[str] = Field(default=None, max_length=32)
+
+
 class ScanControl(_Model):
     """暂停 / 继续 / 中止三个独立动作，一次只做一个。"""
 

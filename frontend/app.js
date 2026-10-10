@@ -922,7 +922,7 @@ async function ccdStatus() {
   // **这段文字只能在这里写一次**：以前 index.html 里也写了一份，结果被这一行整段覆盖，
   // 界面上永远看不到新加的口径说明（评审抓到的）。数字一律取后端下发的值，别在 JS 里写死。
   $('ccd-note').innerHTML = ccdAvailable
-    ? '保存一律<b>原生全幅</b> ' + d.full_roi[2] + '×' + d.full_roi[3] + '、16 位、不裁剪也不拉伸；' +
+    ? '保存一律<b>原生全幅</b> ' + d.roi[2] + '×' + d.roi[3] + '、16 位、不裁剪也不拉伸；' +
       '预览也是全幅，看到的就是存下来的那一片。曝光（相机读回值）写在<b>图片自己身上</b>，列表里直接能看到。<br>' +
       '质心是<b>整幅图的强度加权重心、不做任何处理</b>（不扣背景、不设阈值、不开窗）：' +
       '背景也照权重参与，所以光斑占总强度越小，它越偏向背景的重心；峰值到 ' + d.saturation_adu + ' 就是饱和。<br>' +
@@ -1041,7 +1041,7 @@ function ccdPaint(st) {
     : (state === 'failed')
       ? ('掉线：' + (st.failure || '原因未知') + ' —— 点「重开相机」')
       : (CCD_STATE_TEXT[state] || state);
-  setText('ccd-res', st.preview_roi ? st.preview_roi[2] + '×' + st.preview_roi[3] : '—');
+  setText('ccd-res', st.roi ? st.roi[2] + '×' + st.roi[3] : '—');
   // 这一格是**相机读回的实际值**（不是输入框里填的请求值）：固件会取整，以读回为准
   setText('ccd-exp', st.exposure_us ? (st.exposure_us / 1000).toFixed(2) : '—');
   setText('ccd-gain', (st.gain === undefined || st.gain === null) ? '—' : String(st.gain));
@@ -1112,7 +1112,7 @@ async function ccdLiveStart(quiet) {
   ccdLoadedAt = 0;
   ccdPaint(st);                               // state=preview → syncCcdTimer 开始取帧
   if (!quiet && ccdLive) {
-    toast('预览已开（' + st.preview_roi[2] + '×' + st.preview_roi[3] + '，曝光 ' +
+    toast('预览已开（' + st.roi[2] + '×' + st.roi[3] + '，曝光 ' +
       (st.exposure_us / 1000).toFixed(1) + ' ms）');
   }
 }
@@ -1474,6 +1474,9 @@ async function loadHistory() {
     const cropBtn = !s.done ? ''
       : '<button class="ghost" data-crop="' + s.id + '" data-name="' + esc(s.name) +
         '">裁剪</button>';
+    // 导出按**这一条**走（不是同名整组）：点了哪一条就导哪一条，最不容易误操作
+    const expBtn = !s.done ? ''
+      : '<button class="ghost" data-exp="' + s.id + '">导出</button>';
     const tr = document.createElement('tr');
     tr.innerHTML =
       '<td>' + s.id + '</td>' +
@@ -1484,8 +1487,8 @@ async function loadHistory() {
       '<td>' + (STATUS_CN[s.status] || esc(s.status)) + '</td>' +
       '<td>' + fmtTime(s.created_at) + '</td>' +
       '<td>' + sizeCell + '</td>' +
-      '<td><button class="ghost" data-open="' + s.id + '">查看</button> ' + cropBtn + ' ' +
-          '<button class="ghost" data-del="' + s.id + '">删除</button></td>';
+      '<td><button class="ghost" data-open="' + s.id + '">查看</button> ' + expBtn + ' ' +
+          cropBtn + ' <button class="ghost" data-del="' + s.id + '">删除</button></td>';
     frag.appendChild(tr);
   }
   if (list.length >= 50) {
@@ -2266,6 +2269,124 @@ function wireGutters() {
 }
 
 
+/* ==================== 导出：一条扫描的原始帧 + 每点元数据 ====================
+   抄一份出去，不是搬出去：源文件一个字节都不动，也不碰设备 —— 所以扫描跑着也能导，
+   只是读盘会跟采图抢磁盘，面板上先说一句。一条扫描可以到 2 GB / 3000 张，
+   所以走后端的后台线程 + 进度，不占 HTTP 连接（跟裁剪同一套）。
+   **目标路径的名字由后端定**（zip 勾不勾、批次标记都是后端给的），前端只显示，不自己拼。 */
+
+let expPlan = null;        // 面板里这一条扫描的预检（GET /api/scans/{id}/export），含 scanner 状态
+let expPath = '';          // 导完之后的完整路径（「复制路径」用）
+const expPolling = poller(expPoll, 700);
+
+async function openExportPanel(scanId) {
+  if (expPolling.running()) { toast('上一次导出还在跑，等它结束', true); return; }
+  expPlan = null;
+  expPath = '';
+  setText('exp-name', '#' + scanId);
+  setText('exp-info', '正在看这一条有哪些图 …');
+  setText('exp-dest', '—');
+  $('exp-warn').hidden = true;
+  $('exp-progress').hidden = true;
+  $('btn-exp-copy').hidden = true;
+  $('btn-exp-run').disabled = true;
+  $('exp-zip').checked = false;
+  $('exportpanel').hidden = false;
+  await loadExportPlan(scanId);
+  showRecentExports(await get('/api/exports'));
+}
+
+/* 勾/取消 zip 都要重新问一次预检：名字里带不带 .zip 是后端定的，前端不拼路径 */
+async function loadExportPlan(scanId) {
+  const d = await get('/api/scans/' + scanId + '/export?zip=' + ($('exp-zip').checked ? '1' : '0'));
+  if (!d) {   // 导不了：后端把原因说清楚了（正在裁剪 / 一张图都没有 / 库与文件对不上）
+    setText('exp-info', '这一条现在导不了 —— 原因见上面的提示。');
+    setText('exp-dest', '—');
+    $('btn-exp-run').disabled = true;
+    return;
+  }
+  expPlan = d;
+  renderExportPlan();
+}
+
+function renderExportPlan() {
+  const d = expPlan;
+  const gone = d.crop && d.crop.length ? d.crop : null;
+  setText('exp-name', '#' + d.scan_id + ' · ' + (d.name || '(没有名字)'));
+  setText('exp-info', d.points + ' 个扫描点 · ' + d.images + ' 张原图 · ' +
+    (d.bytes / 1048576).toFixed(1) + ' MB' +
+    (gone ? '　已裁剪 ' + gone[2] + '×' + gone[3] : '') +
+    (d.raw_available ? '' : '　设备原值未记录（表里那一列会留空）'));
+
+  const warn = [];
+  // 这一条自己正在采集中：导出去的**不是完整的这一次扫描**（后面还在采点）
+  if (d.status === 'running') {
+    warn.push('这一条正在采集中：导出去的这份不是完整的一次扫描（后面还在采点）');
+  }
+  if (d.scanner && d.scanner.status === 'running') {
+    warn.push('有扫描正在跑：导出只读盘、不碰设备，但会跟采图抢磁盘，慢一点是正常的');
+  }
+  if (d.missing && d.missing.length) {
+    warn.push('有 ' + d.missing.length + ' 个点库里记着图、盘上却没有 —— 清单和表里都会写明，不假装没事');
+  }
+  if (gone) {
+    warn.push('这一组裁剪过：盘上就是这块 ' + gone[2] + '×' + gone[3] + '（原始坐标 x ' +
+      gone[0] + '~' + (gone[0] + gone[2] - 1) + '、y ' + gone[1] + '~' + (gone[1] + gone[3] - 1) +
+      '），导不出原生全幅 —— 裁剪矩形写在清单和每张 PNG 自己身上');
+  }
+  setText('exp-warn', warn.length ? warn.join('；') + '。' : '');
+  $('exp-warn').hidden = !warn.length;
+  setText('exp-dest', '将写到：' + d.dest);
+  $('btn-exp-run').disabled = d.images === 0;
+}
+
+async function runExport() {
+  if (!expPlan) return;
+  // 带上面板上那个批次标记：最终路径与面板上写的就是同一个（不带就现取，名字会差几秒）
+  const r = await post('/api/scans/' + expPlan.scan_id + '/export',
+    { zip: $('exp-zip').checked, stamp: expPlan.stamp });
+  if (!r) return;                    // 被拒（上一次还没跑完 / 预检不过）：后端的话已经弹出来了
+  $('btn-exp-run').disabled = true;
+  $('btn-exp-copy').hidden = true;
+  $('exp-progress').hidden = false;
+  setText('exp-progress', '正在导出 0 / ' + r.images + ' 张 …（源文件一个字节都不动）');
+  setText('exp-dest', '将写到：' + r.dest);
+  expPolling.start();                // 先定时、再立刻问一次（poller 的规矩）
+}
+
+async function expPoll() {
+  const d = await get('/api/exports');
+  if (!d) return;
+  const j = d.job;
+  if (j.running) {
+    setText('exp-progress', '正在导出 ' + j.done + ' / ' + j.total + ' 张 …');
+    return;
+  }
+  expPolling.stop();
+  $('btn-exp-run').disabled = false;
+  if (j.error) {
+    setText('exp-progress', '导出失败（源文件一点没动）：' + j.error);
+    return;
+  }
+  if (!j.result) return;
+  expPath = j.result.path;
+  setText('exp-progress', '导完了：' + j.result.images + ' 张 / ' +
+    (j.result.bytes / 1048576).toFixed(1) + ' MB → ' + j.result.path);
+  $('btn-exp-copy').hidden = false;
+  toast('导出完成：' + j.result.path);
+  showRecentExports(d);
+}
+
+/* 「上次导哪儿了」：清单在 = 导完了；没清单 = 没导完（清单是最后一步写的） */
+function showRecentExports(d) {
+  if (!d) return;
+  const dir = d.dir ? '导出都落在 ' + d.dir + '。' : '';
+  const r = (d.recent || [])[0];
+  if (!r) { setText('exp-recent', dir + '还没有导出过。'); return; }
+  setText('exp-recent', dir + '最近一次：' + r.name + '（' + fmtTime(r.mtime) +
+    (r.done ? '' : '，没导完') + '）');
+}
+
 /* ==================== 数据页：扫描组与裁剪 ====================
    一组 = **同名的扫描**（后端按 scan.name 分）。裁剪把这一组每条扫描的每一帧都裁成同一块矩形、
    就地换掉原图 —— 之后取数只解这一小块，快十几倍（实测 2000 张 4.8 s → 0.3 s）。
@@ -2574,6 +2695,18 @@ function wire() {
   // 数据页：选扫描、填像素、画曲线。换扫描时**已经画过就跟着重画** ——
   // 不然左边写着 #52、图上还是 #51 的那条，看着像没生效。
   $('btn-data-refresh').onclick = loadDataScans;
+  $('btn-exp-close').onclick = function () { $('exportpanel').hidden = true; };
+  $('btn-exp-run').onclick = runExport;
+  // 勾/取消 zip 会让目标名从「…_批次」变成「…_批次.zip」，所以重新问一次预检
+  $('exp-zip').onchange = function () { if (expPlan) loadExportPlan(expPlan.scan_id); };
+  $('btn-exp-copy').onclick = async function () {
+    try {
+      await navigator.clipboard.writeText(expPath);
+      toast('路径已复制');
+    } catch (err) {
+      toast('浏览器不给剪贴板权限，自己选中上面那行路径复制', true);
+    }
+  };
   $('btn-crop-close').onclick = function () { $('croppanel').hidden = true; };
   $('btn-crop-fit').onclick = function () { cropFillSuggested(); };
   $('btn-crop-run').onclick = runCrop;
@@ -2633,6 +2766,11 @@ function wire() {
     // 一组 = 同名的扫描：点哪一条都是裁整组，所以名字从行上带着走（面板里会把整组列出来）
     if (b.dataset.crop) {
       openCropPanel(b.dataset.name || '');
+      return;
+    }
+    // 导出相反：点哪一条导**哪一条**（原始帧与每点元数据抄一份出去）
+    if (b.dataset.exp) {
+      openExportPanel(Number(b.dataset.exp));
       return;
     }
     // 手动查看不改 autoHandledScanId：否则自动路径会回头去拉已被删掉的那个扫描

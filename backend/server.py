@@ -39,6 +39,7 @@ from .config import (
     CROP_H,
     CROP_W,
     DATA_DIR,
+    EXPORT_DIR,
     HEARTBEAT_TIMEOUT_S,
     HOST,
     IMAGE_DIR,
@@ -54,6 +55,7 @@ from .config import (
     WAVELENGTH_UM_PER_THZ,
 )
 from .models import (
+    ExportRequest,
     JogRequest,
     ReadbackRequest,
     MoveRequest,
@@ -81,6 +83,10 @@ class Telemetry:
 
     每次设备查询约 32 ms，多个客户端各查一遍会互相拖垮；
     这里统一轮询，SSE 只读快照。
+
+    **扫描进行中它不再自己轮询**（2026-10）：那时扫描自己就是轮询者，遥测再插一脚
+    只是两份读数互相拖，而且排在同一队列里会直接拖慢扫描。界面与曲线改用扫描刚读到
+    的那份快照 —— 位置来源还是同一个（同源），一拍设备都不多花。
     """
 
     def __init__(self, stage_: StageProto, scanner_: Scanner, hz: float, hz_scan: float) -> None:
@@ -91,6 +97,9 @@ class Telemetry:
         self._lock = threading.Lock()
         self._latest: dict = {"stage": None, "scan": scanner_.state(), "ts": 0.0}
         self._trace = TraceBuffer(TRACE_BUFFER_S)
+        # 扫描期间"最后一个记进曲线的点"—— (scan_id, index)。放在实例上而不是 _loop 的
+        # 局部变量里：它是"记过没有"的状态，不该随一次循环进入而清空。
+        self._last_point: Optional[tuple] = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="telemetry", daemon=True)
 
@@ -119,18 +128,26 @@ class Telemetry:
         while not self._stop.is_set():
             t0 = time.monotonic()
             scan = self._scanner.state()
-            try:
-                st = self._stage.poll().as_dict()
-            except Exception as exc:
-                # 这里必须吞掉一切：轮询线程死了，界面会永远停在过期数据上，
-                # 看起来还在动，实际已经瞎了。
+            running = scan["status"] == "running"
+            if running:
+                # 扫描占着设备：**遥测不轮询**，读扫描刚刷出来的那份快照。
+                # （暂停不算 running —— 那时没有扫描任务在抢，照旧自己轮询，
+                #  否则界面会在暂停期间僵住。）
                 st = self._stage.status().as_dict()
-                st["error"] = str(exc)
-                if fresh:
-                    log.warning("遥测读取失败：%s", exc, exc_info=True)
-                fresh = False
-            else:
                 fresh = True
+            else:
+                try:
+                    st = self._stage.poll().as_dict()
+                except Exception as exc:
+                    # 这里必须吞掉一切：轮询线程死了，界面会永远停在过期数据上，
+                    # 看起来还在动，实际已经瞎了。
+                    st = self._stage.status().as_dict()
+                    st["error"] = str(exc)
+                    if fresh:
+                        log.warning("遥测读取失败：%s", exc, exc_info=True)
+                    fresh = False
+                else:
+                    fresh = True
             now = time.time()
             payload = {
                 "stage": st,
@@ -145,7 +162,16 @@ class Telemetry:
                 # RuntimeError: deque mutated during iteration —— 实测约 0.01%/次读，
                 # 表现为"记录曲线记到一半就 500"。
                 # 读失败或没连上时 status() 里是上一次的残留位置，记进曲线会把方差压低。
-                if fresh and st["connected"]:
+                if running:
+                    # 曲线样本改用**扫描器刚读到的那次位置**：扫描中它是唯一的位置来源，
+                    # 而且每点只记一条 —— 重复问同一个 index 不重复记（那样等于把一条
+                    # 读数摊成好几格，看着像采样率高了）。样本时刻仍是这一拍的 ts，
+                    # 与 SSE 的 ts 同一个数，"记录起点 = 上一帧遥测的 ts"那条不变量不动。
+                    key = (scan["scan_id"], scan["index"])
+                    if scan["actual_um"] is not None and key != self._last_point:
+                        self._last_point = key
+                        self._trace.add(now, scan["actual_um"], scan["target_um"])
+                elif fresh and st["connected"]:
                     self._trace.add(now, st["position"], st["target"])
                 self._latest = payload
             self._stop.wait(max(0.0, self.period() - (time.monotonic() - t0)))
@@ -1088,7 +1114,7 @@ def api_crop_run(name: str = Query(...),
         if x0 + w > fw or y0 + h > fh:
             raise HTTPException(400, f"矩形 ({x0},{y0},{w},{h}) 超出了画面 {fw}×{fh}")
         if w == fw and h == fh:
-            # 整幅"裁"一遍只是白重编码一次（还会因为 level=1 略微变大），一点不会更快
+            # 整幅"裁"一遍只是白重编码一次（像素一个没少，取数也不会更快）
             raise HTTPException(400, f"这个矩形就是整幅画面 {fw}×{fh}，裁了不会更快，把框缩小一点")
 
     prev = plan["prev"]                    # 开工前的库记录：写新记录之前先留一份，回滚要按它改回去
@@ -1105,6 +1131,86 @@ def api_crop_run(name: str = Query(...),
     log.info("开始裁剪：组「%s」%d 条扫描 %d 张 → %s", name, len(ids), len(plan["items"]),
              (x0, y0, w, h))
     return {"ok": True, "scans": ids, "images": len(plan["items"]), "rect": [x0, y0, w, h]}
+
+
+# ------------------------------------------------------------------ 导出：一条扫描的原始帧 + 每点元数据
+# **只读盘上的东西**：源文件一个字节都不动，不碰设备、不排队进设备线程 —— 跟数据页取数同一类，
+# 所以扫描跑着也能导（用户定的）；代价是读盘会跟采图抢带宽，界面上先说一句。
+# 一条扫描可以到 2 GB / 3000 张，所以跟裁剪一样放后台线程 + 进度，不占 HTTP 连接。
+
+_EXPORT_JOB: dict = {"running": False, "scan_id": None, "done": 0, "total": 0,
+                     "error": None, "result": None}
+
+
+def _export_worker(scan_id: int, zipped: bool, stamp: Optional[str]) -> None:
+    """后台抄完这一条扫描。失败就把错误摆到面板上（源文件没动过，没什么要回滚的）。"""
+    from . import export
+
+    def progress(done: int, total: int) -> None:
+        _EXPORT_JOB.update({"done": done, "total": total})
+
+    try:
+        result = export.run(scan_id, zipped=zipped, stamp=stamp, progress=progress)
+    except Exception as exc:                 # noqa: BLE001 —— 导出失败不该带走服务
+        log.error("导出扫描 #%s 失败（源文件没动）：%s", scan_id, exc)
+        _EXPORT_JOB.update({"running": False, "error": str(exc)})
+        return
+    _EXPORT_JOB.update({"running": False, "done": result["images"],
+                        "total": result["images"], "result": result})
+
+
+@app.get("/api/exports")
+def api_export_state() -> dict:
+    """导出任务的状态 + data/export 下已经有的东西（回答"上次导哪儿了"）。"""
+    from . import export
+
+    return {"job": _EXPORT_JOB, "dir": str(EXPORT_DIR), "recent": export.recent()}
+
+
+@app.get("/api/scans/{scan_id}/export")
+def api_export_plan(scan_id: int, zip: bool = False,
+                    stamp: Optional[str] = None) -> dict:
+    """这次导出会得到什么：多少点、多少张、多大、落在哪个路径、缺什么 —— **动手前先看**。
+
+    只读库和文件头，不复制任何东西；点这个接口不会产生文件。
+    """
+    from . import export
+
+    if store.get_scan(scan_id) is None:
+        raise HTTPException(404, "扫描不存在")
+    try:
+        info = export.plan(scan_id, zipped=zip, stamp=stamp)
+    except ValueError as exc:                # 正在裁剪 / 一张图都没有 / 裁剪记录对不上
+        raise HTTPException(400, str(exc)) from exc
+    # 导出允许跟扫描同时进行（用户定的）。界面要**动手前**提醒一句"读盘会跟采图抢带宽"，
+    # 而"现在在不在采图"只有后端知道 —— 随预检一起下发，前端不自己维护这份状态。
+    return {**info, "scanner": scanner.state()}
+
+
+@app.post("/api/scans/{scan_id}/export")
+def api_export_run(scan_id: int, req: ExportRequest) -> dict:
+    """把这一条扫描的原始帧与每点元数据抄一份到 data/export/ 下（**原文件一个字节都不动**）。
+
+    扫描进行中**允许**导（用户定的）：导出只读旧文件、不碰设备。但导出去的这份可能**不是完整的
+    一次扫描** —— 后面还在采点，结果里的 status 会如实说是 running，面板上照它写提醒。
+    """
+    from . import export
+
+    if _EXPORT_JOB["running"]:
+        raise HTTPException(409, "上一次导出还没跑完，等它结束")
+    if store.get_scan(scan_id) is None:
+        raise HTTPException(404, "扫描不存在")
+    try:
+        info = export.plan(scan_id, zipped=req.zip, stamp=req.stamp)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc      # 预检拦下：不让它在后台线程里才失败
+    _EXPORT_JOB.update({"running": True, "scan_id": scan_id, "done": 0,
+                        "total": info["images"], "error": None, "result": None})
+    threading.Thread(target=_export_worker, args=(scan_id, req.zip, info["stamp"]),
+                     daemon=True, name="export").start()
+    log.info("开始导出扫描 #%s：%d 张 %s → %s", scan_id, info["images"],
+             "（zip）" if req.zip else "", info["dest"])
+    return {"ok": True, **info}
 
 
 # ------------------------------------------------------------------ 静态页面

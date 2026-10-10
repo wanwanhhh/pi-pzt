@@ -117,7 +117,7 @@ class DummyCapture:
 class ThorlabsCapture:
     """索雷博 CS165MU：每点采一帧原生全幅、存 16 位 PNG。
 
-    **不裁剪**：保存一律用原生 1440x1080，预览的小 ROI 只是预览用。
+    **不裁剪**：预览、手动保存、扫描共用同一套原生全幅 ROI（一台相机只有一套设置）。
     实际动作全在 backend/thorlabs_ccd.py 的 owner 线程里，这里只做转发。
     """
 

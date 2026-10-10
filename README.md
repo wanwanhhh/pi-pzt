@@ -41,6 +41,9 @@ Windows：
 ### 位移台：PI E-709.CRG + P-621.1CD
 
 - **Windows**：装 PI Software Suite 2.8.2.0（提供 GCS DLL 与 USB 驱动），走 `ConnectUSB`。
+  **没装（或不想用）PI 软件时也能连**：E-709 在 Windows 上同样是 FTDI 虚拟串口，设 `PI_LINK=serial`
+  就走同一条纯 Python 命令层 —— 本机两条通道都实测可用（见 `docs/pi/设备认识账.xml` A1）。
+  串口在两边都**按设备自动找**（Windows 认 VID:PID=1A72:100E），不用写 COM 号。
 - **Linux**：**不需要装任何 PI 软件**。内核 `ftdi_sio` 直接提供 FTDI 虚拟串口，PIPython 以
   `PISerial` 走纯 Python 命令层，不加载 GCS DLL。当前用户需在 `dialout` 组才能打开串口：
 
@@ -96,6 +99,7 @@ Windows：
     for f in backend/tests/test_*.py; do .venv/bin/python "$f" || break; done
 
 离线单测不依赖测试框架，也不碰硬件：设备层契约、XMT 协议编解码与假串口、扫描到位校验（按设备分：PI 做、XMT 不做）、
+PI 串口查找（Linux by-id / Windows VID:PID，见 `backend/tests/test_pi_port.py`）、相机会话与连续出帧不变量、
 库结构迁移、位置曲线环形缓冲、预览质心、扫描点像素序列（数据处理页的取数）。
 
 **上机自检**（会真实驱动位移台，跑之前先看脚本头的说明）：
@@ -130,7 +134,7 @@ Windows 把 `.venv/bin/python` 换成 `.venv\Scripts\python.exe`。相机另有�
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PI_LINK` | `auto` | `auto` 时 Linux 走串口、Windows 走 USB；可强制 `usb` / `serial` |
-| `PI_SERIAL_PORT` | 空 | 串口路径。留空则自动找 `/dev/serial/by-id/usb-PI_*` |
+| `PI_SERIAL_PORT` | 空 | 串口路径。留空则自动找：Linux 按 `/dev/serial/by-id/usb-PI_*`，Windows 按 VID:PID=1A72:100E |
 | `PI_SERIAL_BAUD` | `115200` | 串口波特率 |
 | `PI_SERIAL` | 空 | **仅 USB 通道**的序列号过滤；串口通道不使用 |
 
