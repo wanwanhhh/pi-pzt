@@ -65,6 +65,16 @@ class ExportRequest(_Model):
     stamp: Optional[str] = Field(default=None, max_length=32)
 
 
+class ImportRequest(_Model):
+    """把一份导出的包（一个目录，或一个 zip）恢复成本机库里的一条扫描。
+
+    path 照原样交给后端（前端不拼路径）：包必须是**导完了的**（有 manifest.json），
+    扫描号沿用包里那个 —— 本机已经被占了就拒，不覆盖任何东西。
+    """
+
+    path: str = Field(min_length=1, max_length=4096)
+
+
 class ScanControl(_Model):
     """暂停 / 继续 / 中止三个独立动作，一次只做一个。"""
 

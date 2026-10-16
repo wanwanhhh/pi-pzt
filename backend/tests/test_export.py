@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import backend.export as ex  # noqa: E402
+import backend.package as pkg  # noqa: E402
 from backend import store  # noqa: E402
 from backend.stage_api import SETTLE_DEVICE  # noqa: E402
 
@@ -73,14 +74,14 @@ def _scan(root: Path, images=(0, 1, 2), readback: float | None = 0.75,
         store.add_point(sid, i, float(i), 0.75 * i, 100.0, True, SETTLE_DEVICE, rel, 200_000)
     store.finish_scan(sid, "done")
     if db_crop:
-        store.put_crops([{"scan_id": sid, "group_name": name, "x0": db_crop[0], "y0": db_crop[1],
-                          "w": db_crop[2], "h": db_crop[3], "frames": 3, "saved_bytes": 0,
+        store.put_crops([{"scan_id": sid, "x0": db_crop[0], "y0": db_crop[1],
+                          "w": db_crop[2], "h": db_crop[3], "frames": 3, "saved_bytes": 1234,
                           "state": "done", "created_at": 0.0}])
     return sid
 
 
 def _table(dest: Path) -> list:
-    text = (dest / ex.CSV_NAME).read_text("utf-8-sig")
+    text = (dest / pkg.CSV_NAME).read_text("utf-8-sig")
     return list(csv.DictReader(io.StringIO(text)))
 
 
@@ -98,7 +99,7 @@ def test_export_copies_the_frames_and_writes_one_row_per_point():
             assert dest.parent == root / "export" and dest.is_dir(), dest
             assert out["images"] == 2 and out["points"] == 3, out
             assert sorted(p.name for p in dest.iterdir()) == sorted(
-                [ex.CSV_NAME, ex.MANIFEST_NAME, *before]), sorted(p.name for p in dest.iterdir())
+                [pkg.CSV_NAME, pkg.MANIFEST_NAME, *before]), sorted(p.name for p in dest.iterdir())
             for name, raw in before.items():          # 字节级一致
                 assert (dest / name).read_bytes() == raw, name
             assert {p.name: p.read_bytes() for p in (root / "images").iterdir()} == before, \
@@ -115,7 +116,7 @@ def test_export_copies_the_frames_and_writes_one_row_per_point():
             assert rows[2]["actual_um"] == "1.5" and rows[2]["exposure_us"] == "200000", rows[2]
             assert rows[0]["taken_at_local"] and rows[0]["taken_at"], rows[0]
 
-            man = json.loads((dest / ex.MANIFEST_NAME).read_text("utf-8"))
+            man = json.loads((dest / pkg.MANIFEST_NAME).read_text("utf-8"))
             assert man["scan"]["id"] == sid and man["points"]["images"] == 2, man
             assert man["crop"] == {"db": None, "file": None, "checked_on": rows[0]["image"]}, man
             assert man["frame"] == {"width": W, "height": H, "bits": 16}, man
@@ -155,7 +156,7 @@ def test_missing_file_is_reported_not_skipped():
             rows = _table(Path(ex.run(sid, stamp=plan["stamp"])["path"]))
             assert Path(plan["dest"]).is_dir(), plan["dest"]
             assert rows[1]["image"] == "" and "盘上找不到" in rows[1]["note"], rows[1]
-            man = json.loads((Path(plan["dest"]) / ex.MANIFEST_NAME).read_text("utf-8"))
+            man = json.loads((Path(plan["dest"]) / pkg.MANIFEST_NAME).read_text("utf-8"))
             assert man["points"]["missing_images"] == plan["missing"], man
 
 
@@ -186,13 +187,13 @@ def test_zip_is_one_file_and_holds_the_same_table():
             assert [p.name for p in (root / "export").iterdir()] == [dest.name], "不许留 .part"
             with zipfile.ZipFile(dest) as zf:
                 names = zf.namelist()
-                assert sorted(names) == sorted([ex.CSV_NAME, ex.MANIFEST_NAME,
+                assert sorted(names) == sorted([pkg.CSV_NAME, pkg.MANIFEST_NAME,
                                                 f"scan{sid:04d}_00000.png",
                                                 f"scan{sid:04d}_00001.png"]), names
                 assert zf.read(f"scan{sid:04d}_00000.png").startswith(b"\x89PNG"), "原字节"
-                rows = list(csv.DictReader(io.StringIO(zf.read(ex.CSV_NAME).decode("utf-8-sig"))))
+                rows = list(csv.DictReader(io.StringIO(zf.read(pkg.CSV_NAME).decode("utf-8-sig"))))
                 assert len(rows) == 3 and rows[2]["image"] == "", rows
-                man = json.loads(zf.read(ex.MANIFEST_NAME).decode("utf-8"))
+                man = json.loads(zf.read(pkg.MANIFEST_NAME).decode("utf-8"))
                 assert man["files"]["packed"].startswith("zip"), man
 
 

@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS grab (
     created_at  REAL NOT NULL
 );
 
--- 数据页「裁剪」的记录：**一条扫描一行**（同名的几条一起裁，共用同一个矩形）。
+-- 数据页「裁剪」的记录：**一条扫描一行** —— 裁一次只动这一条，不牵连别的扫描
+-- （曾经按同名整组一起裁，用户 2026-10 改成一条一条来：组那个概念没有了）。
 -- 口径是**原始坐标**：x0/y0 是这一刀在原始帧里的左上角，(w,h) 是裁下来的尺寸。
 -- 取数时只在读文件那一层做一次减法（x_file = x - x0），别处一律原始坐标。
 -- 和 PNG 自己 tEXt 里的 CropRect 各记一份，对不上就报错 —— 原点偏移错了不会报错，
@@ -71,13 +72,14 @@ CREATE TABLE IF NOT EXISTS grab (
 -- done 才是裁完了。**只有 done 才允许取数按偏移读**（cropping 期间那些文件可能是缺的）。
 CREATE TABLE IF NOT EXISTS crop (
     scan_id     INTEGER PRIMARY KEY REFERENCES scan(id) ON DELETE CASCADE,
-    group_name  TEXT    NOT NULL,
     x0          INTEGER NOT NULL,
     y0          INTEGER NOT NULL,
     w           INTEGER NOT NULL,
     h           INTEGER NOT NULL,
     frames      INTEGER NOT NULL,
-    saved_bytes INTEGER NOT NULL,
+    -- 这一刀省下多少字节（实测：原文件大小 − 裁后大小；同一条再裁就**累加**）。
+    -- NULL = **没有这个数**：导入进来的记录是别的机器上裁的，这台机器没量过 —— 不拿 0 顶。
+    saved_bytes INTEGER,
     state       TEXT    NOT NULL,
     created_at  REAL    NOT NULL
 );
@@ -99,6 +101,37 @@ MIGRATIONS = (
 
 # 终止态：进程启动时把这两个状态之外的残留扫描判为 aborted
 FINAL_STATUS = ("done", "aborted", "failed")
+
+
+def _rebuild_crop(conn: sqlite3.Connection) -> None:
+    """把老的 crop 表改成"一条扫描一行"：去掉 group_name、saved_bytes 允许空。
+
+    裁剪不再按同名整组走（用户 2026-10 定），group_name 答的那个问题已经不存在了；
+    导入进来的记录也没有"省了多少字节"这个实测值，留空比填 0 诚实。
+    SQLite 既删不掉列、也改不了 NOT NULL，只能重建 —— 老行的数一个不落地搬过去，
+    幂等（列没了就是已经重建过）。
+    """
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(crop)")}
+    if not have or "group_name" not in have:
+        return
+    conn.executescript("""
+        CREATE TABLE crop_new (
+            scan_id     INTEGER PRIMARY KEY REFERENCES scan(id) ON DELETE CASCADE,
+            x0          INTEGER NOT NULL,
+            y0          INTEGER NOT NULL,
+            w           INTEGER NOT NULL,
+            h           INTEGER NOT NULL,
+            frames      INTEGER NOT NULL,
+            saved_bytes INTEGER,
+            state       TEXT    NOT NULL,
+            created_at  REAL    NOT NULL
+        );
+        INSERT INTO crop_new (scan_id, x0, y0, w, h, frames, saved_bytes, state, created_at)
+            SELECT scan_id, x0, y0, w, h, frames, saved_bytes, state, created_at FROM crop;
+        DROP TABLE crop;
+        ALTER TABLE crop_new RENAME TO crop;
+    """)
+    log.info("crop 表已重建：去掉 group_name、saved_bytes 允许空（老记录原样搬过去）")
 
 
 @contextmanager
@@ -128,6 +161,7 @@ def init() -> None:
             conn.execute(
                 f"UPDATE {table} SET {column} = ? WHERE {column} IS NULL", (backfill,)
             )
+        _rebuild_crop(conn)
         # 上次进程被杀时留下的 running/paused 任务不可能再继续了
         conn.execute(
             "UPDATE scan SET status = 'aborted', message = '服务重启，任务中断',"
@@ -201,6 +235,44 @@ def add_point(
             (scan_id, idx, target_um, actual_um, settled_ms, int(on_target), settle_source,
              image_path, exposure_us, time.time()),
         )
+
+
+def import_scan(scan: dict[str, Any], points: list[dict[str, Any]],
+                crop: Optional[dict[str, Any]]) -> int:
+    """把一份导入包恢复成库里的一条扫描：扫描行 + 全部点（+ 裁剪记录），**一个事务**。
+
+    与"边采边写"那条路（create_scan → add_point → finish_scan）分工不同：这里写的是
+    **一次已经结束的扫描**，值全部来自包里的记录，一个都不重算：
+
+    * `id` **沿用包里那个号** —— 图名是 scan<号>_<序号>.png，换号会让文件名与扫描号对不上。
+      本机已经有这个号由调用方拦下（这里直接撞主键，撞了要不进去）。
+    * `taken_at` 是**采图那一刻**（包里记的），不是"现在"：搬过来的是当时那一次扫描。
+    * 裁剪记录里 `saved_bytes` 写 NULL：那一格答的是"**这台机器上**裁掉了多少字节"，
+      这条扫描在这台机器上没裁过 —— 没有这个数就是没有，不拿 0 顶。
+    """
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO scan (id, name, start_um, stop_um, count, settle_ms, status, message,"
+            " created_at, finished_at, readback_to_um)"
+            " VALUES (:id, :name, :start_um, :stop_um, :count, :settle_ms, :status, :message,"
+            " :created_at, :finished_at, :readback_to_um)",
+            scan,
+        )
+        conn.executemany(
+            "INSERT INTO point (scan_id, idx, target_um, actual_um, settled_ms, on_target,"
+            " settle_source, image_path, exposure_us, taken_at)"
+            " VALUES (:scan_id, :idx, :target_um, :actual_um, :settled_ms, :on_target,"
+            " :settle_source, :image_path, :exposure_us, :taken_at)",
+            points,
+        )
+        if crop is not None:
+            conn.execute(
+                "INSERT INTO crop (scan_id, x0, y0, w, h, frames, saved_bytes, state, created_at)"
+                " VALUES (:scan_id, :x0, :y0, :w, :h, :frames, :saved_bytes, :state,"
+                " :created_at)",
+                crop,
+            )
+    return int(scan["id"])
 
 
 def register_grab(filename: str) -> None:
@@ -283,51 +355,6 @@ def delete_scan(scan_id: int) -> None:
 # 记录本身只管"这一刀在哪、什么状态"；动文件那套在 thorlabs_ccd.crop_frames 里。
 # **先落库（cropping）再动文件**：进程被杀时靠这条记录判断该往哪边收尾（见 recover_crops）。
 
-def scans_named(name: str) -> list[dict[str, Any]]:
-    """同名的那几条扫描 —— 裁剪一次对整组动手，先把它们都取出来。"""
-    with _db() as conn:
-        rows = conn.execute("SELECT * FROM scan WHERE name = ? ORDER BY id", (name,)).fetchall()
-    return [dict(r) for r in rows]
-
-
-def scan_groups() -> list[dict[str, Any]]:
-    """按名字把扫描分组（数据页「扫描组」那一栏）。
-
-    组内只认**一个**矩形：几条扫描若记着不同的矩形，rect 就给 None（界面显示"不统一"）——
-    整组一起裁的全部意义就是组内坐标完全一致，出现两种框说明有人绕过界面动过库。
-    """
-    with _db() as conn:
-        scans = conn.execute(
-            "SELECT s.id, s.name, s.status,"
-            " (SELECT COUNT(*) FROM point p WHERE p.scan_id = s.id) AS points,"
-            " (SELECT COUNT(*) FROM point p WHERE p.scan_id = s.id"
-            "  AND p.image_path IS NOT NULL) AS images"
-            " FROM scan s ORDER BY s.id"
-        ).fetchall()
-        crops = {r["scan_id"]: dict(r) for r in conn.execute("SELECT * FROM crop")}
-    groups: dict[str, dict[str, Any]] = {}
-    for r in scans:
-        g = groups.setdefault(r["name"], {
-            "name": r["name"], "scans": 0, "points": 0, "images": 0,
-            "cropped": 0, "cropping": 0, "saved_bytes": 0, "rects": set(), "last_id": r["id"],
-        })
-        g["scans"] += 1
-        g["points"] += r["points"]
-        g["images"] += r["images"]
-        g["last_id"] = r["id"]
-        c = crops.get(r["id"])
-        if c:
-            g["cropped" if c["state"] == "done" else "cropping"] += 1
-            g["saved_bytes"] += c["saved_bytes"]
-            g["rects"].add((c["x0"], c["y0"], c["w"], c["h"]))
-    out = []
-    for g in groups.values():
-        rects = g.pop("rects")
-        g["rect"] = list(rects.pop()) if len(rects) == 1 else None
-        out.append(g)
-    return sorted(out, key=lambda g: g["last_id"], reverse=True)
-
-
 def get_crop(scan_id: int) -> Optional[dict[str, Any]]:
     with _db() as conn:
         row = conn.execute("SELECT * FROM crop WHERE scan_id = ?", (scan_id,)).fetchone()
@@ -341,33 +368,32 @@ def all_crops() -> list[dict[str, Any]]:
 
 
 def put_crops(records: list[dict[str, Any]]) -> None:
-    """一批裁剪记录，**一个事务**写进去（半批记录比没有记录更难查）。
+    """裁剪记录的写入：**一个事务**（半截记录比没有记录更难查）。
 
-    同一个扫描**再裁**是更新同一条记录（scan_id 就是主键）：矩形换成新的，
+    同一条**再裁**是更新同一条记录（scan_id 就是主键）：矩形换成新的，
     saved_bytes **累加**（那个数问的是"这条一共省了多少"，不是"最后一刀省了多少"）。
-    created_at 不动 —— 它记的是这一组第一次挨裁的时刻。
+    原来**没有**这个数的（导入进来的记录）就从 0 起算 —— COALESCE 那一步。
+    created_at 不动 —— 它记的是这一条第一次挨裁的时刻。
     """
     with _db() as conn:
         conn.executemany(
-            "INSERT INTO crop (scan_id, group_name, x0, y0, w, h, frames, saved_bytes,"
-            " state, created_at) VALUES (:scan_id, :group_name, :x0, :y0, :w, :h, :frames,"
-            " :saved_bytes, :state, :created_at)"
+            "INSERT INTO crop (scan_id, x0, y0, w, h, frames, saved_bytes, state, created_at)"
+            " VALUES (:scan_id, :x0, :y0, :w, :h, :frames, :saved_bytes, :state, :created_at)"
             " ON CONFLICT(scan_id) DO UPDATE SET"
-            " group_name = excluded.group_name,"
             " x0 = excluded.x0, y0 = excluded.y0, w = excluded.w, h = excluded.h,"
             " frames = excluded.frames,"
-            " saved_bytes = crop.saved_bytes + excluded.saved_bytes,"
+            " saved_bytes = COALESCE(crop.saved_bytes, 0) + excluded.saved_bytes,"
             " state = excluded.state",
             records,
         )
 
 
 def finish_crop(scan_id: int, frames: int, saved_bytes: int) -> None:
-    """裁完了：补上这条扫描实际裁了多少张、省了多少字节，并把状态改成 done。"""
+    """裁完了：补上这条实际裁了多少张、省了多少字节，并把状态改成 done。"""
     with _db() as conn:
         conn.execute(
-            "UPDATE crop SET frames = ?, saved_bytes = saved_bytes + ?, state = 'done'"
-            " WHERE scan_id = ?",
+            "UPDATE crop SET frames = ?, saved_bytes = COALESCE(saved_bytes, 0) + ?,"
+            " state = 'done' WHERE scan_id = ?",
             (frames, saved_bytes, scan_id),
         )
 

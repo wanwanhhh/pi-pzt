@@ -175,6 +175,51 @@ def test_old_rows_get_a_defined_settle_source():
         assert got and got[0][0] == SETTLE_UNKNOWN, got
 
 
+# 老 crop 表：按**同名那一组**记（group_name），"省了多少字节"是 NOT NULL。
+# 裁剪改成一条一条来（用户 2026-10 定）、导入进来的记录又没有那个数，两条都得改。
+OLD_CROP_SCHEMA = """
+CREATE TABLE crop (
+    scan_id     INTEGER PRIMARY KEY REFERENCES scan(id) ON DELETE CASCADE,
+    group_name  TEXT    NOT NULL,
+    x0          INTEGER NOT NULL,
+    y0          INTEGER NOT NULL,
+    w           INTEGER NOT NULL,
+    h           INTEGER NOT NULL,
+    frames      INTEGER NOT NULL,
+    saved_bytes INTEGER NOT NULL,
+    state       TEXT    NOT NULL,
+    created_at  REAL    NOT NULL
+);
+"""
+
+
+def test_crop_table_is_rebuilt_one_row_per_scan():
+    """老 crop 表 → 去 group_name、saved_bytes 允许空，**老行的数一个不能丢**。
+
+    SQLite 既删不掉列也改不了 NOT NULL，只能重建。矩形丢了就是取数时偏移错位，
+    而且不会报错 —— 所以这条盯的是"原样搬过去"。
+    """
+    with _TempStore() as t:
+        with closing(sqlite3.connect(t.db)) as con:
+            con.executescript(OLD_SCHEMA + OLD_CROP_SCHEMA)
+            # crop.scan_id 指着一条真扫描（重建时外键是开着的：孤儿记录是坏库，不该悄悄放过）
+            con.execute("INSERT INTO scan VALUES (7, '同名那一组', 0, 1, 2, 100, 'done', '', 1.0, 2.0)")
+            con.execute("INSERT INTO crop VALUES (7, '同名那一组', 200, 300, 500, 700,"
+                        " 11, 6525350, 'done', 1.0)")
+            con.commit()
+        store.init()
+        store.init()                                  # 幂等：第二次启动不许再动它
+
+        assert store.get_crop(7) == {"scan_id": 7, "x0": 200, "y0": 300, "w": 500, "h": 700,
+                                    "frames": 11, "saved_bytes": 6525350, "state": "done",
+                                    "created_at": 1.0}, store.get_crop(7)
+        # 重建之后那个数可以**没有**（导入进来的记录本机没量过）—— 老表的 NOT NULL 拦得住这一步
+        sid = store.create_scan("导入来的", 0.0, 1.0, 1, 100, None)
+        store.put_crops([{"scan_id": sid, "x0": 1, "y0": 2, "w": 30, "h": 40, "frames": 0,
+                          "saved_bytes": None, "state": "done", "created_at": 2.0}])
+        assert store.get_crop(sid)["saved_bytes"] is None, store.get_crop(sid)
+
+
 def main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

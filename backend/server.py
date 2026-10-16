@@ -56,6 +56,7 @@ from .config import (
 )
 from .models import (
     ExportRequest,
+    ImportRequest,
     JogRequest,
     ReadbackRequest,
     MoveRequest,
@@ -193,6 +194,7 @@ async def lifespan(_: FastAPI):
         # 这里不能只抓 StageError：DLL 加载/回执异常会是别的类型。
         log.error("设备连接失败：%s", exc, exc_info=True)
     _recover_crops()          # 上次进程被杀在裁剪半路：先把现场收干净再对外服务
+    _sweep_imports()          # 上次进程被杀在导入半路：暂存目录里全是没就位的副本，清掉
     telemetry.start()
     log.info("服务就绪：http://%s:%d", HOST, PORT)
     try:
@@ -877,13 +879,134 @@ def api_scan_delete(scan_id: int) -> dict:
     return {"ok": True}
 
 
+# ------------------------------------------------------------------ 数据页：相位图
+# 整幅图的**相位差**：把这条扫描的每一帧读一遍，得到每个像素跟基准像素差多少相位
+# （为什么一遍扫得完、口径是什么，见 backend/phasemap.py 的文件头）。
+# 一条 2000 点、未裁剪的扫描要十几秒，所以与裁剪同一个做法：后台线程 + 进度，不占 HTTP 连接。
+# 只读盘上的图、不碰设备，所以扫描跑着也能算 —— 代价同样是跟采图抢磁盘（界面上先提醒一句）。
+# **结果只在内存里**（相位 + 条纹强度两个 float32 数组）：它答的是"这一条、这一段波长"，换波段
+# 重算一遍（权重变了）；**换基准像素不用重算** —— 那只是减一个常数，在界面上做。
+
+_PHASE_JOB: dict = {"running": False, "scan_id": None, "done": 0, "total": 0,
+                    "error": None, "result": None}
+_PHASE_MAP: Optional[dict] = None     # 最近算完的那一份：meta + phase/amp 两个数组
+
+
+def _phase_meta(res: Optional[dict]) -> Optional[dict]:
+    """下发给界面的那一份：两个数组留在后端（它们走 .bin 那条二进制口）。"""
+    if res is None:
+        return None
+    return {k: v for k, v in res.items() if k not in ("phase", "amp")}
+
+
+def _phase_plan(scan_id: int, lmin: Optional[float], lmax: Optional[float]) -> dict:
+    """要读哪些帧、按哪个波段 —— 不合格的当场拒掉，别让它跑到一半才报。"""
+    from . import phasemap
+
+    if store.get_scan(scan_id) is None:
+        raise HTTPException(404, "扫描不存在")
+    crop = store.get_crop(scan_id)
+    if crop and crop["state"] != "done":
+        raise HTTPException(409, "这条扫描正在裁剪，等它跑完再算")
+    if lmin is None and lmax is None:
+        raise HTTPException(400, "相位图要有波段：〈滤波曲线〉那张卡的两个波长框都空着（全通）"
+                                 "就没有载波可比 —— 先填一段波长（条纹所在的那一段）")
+    points = store.get_points(scan_id)
+    for i, p in enumerate(points):
+        where = f"第 {i + 1} 个点（idx {p['idx']}）"
+        if p["actual_um"] is None:
+            raise HTTPException(400, f"{where}没记下读出位置 —— 整条做不了："
+                                     "缺一个点就是另一条采样序列")
+        if not p["image_path"]:
+            raise HTTPException(400, f"{where}没采到图 —— 整条做不了："
+                                     "缺一个点就是另一条采样序列")
+    items = [(p["idx"], p["actual_um"], DATA_DIR / p["image_path"]) for p in points]
+    t = [p["actual_um"] * TIME_FS_PER_UM for p in points]
+    try:
+        k_lo, k_hi, k_max, df_thz = phasemap.band_lines(lmin, lmax, len(t), max(t) - min(t))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"items": items, "k_lo": k_lo, "k_hi": k_hi, "k_max": k_max, "df_thz": df_thz,
+            "rect": (crop["x0"], crop["y0"], crop["w"], crop["h"]) if crop else None}
+
+
+def _phase_worker(scan_id: int, plan: dict, lmin: Optional[float], lmax: Optional[float]) -> None:
+    from . import phasemap
+
+    def progress(done: int, _total: int) -> None:
+        _PHASE_JOB["done"] = done
+
+    try:
+        res = phasemap.phase_map(plan["items"], crop=plan["rect"], lmin=lmin, lmax=lmax,
+                                 progress=progress)
+    except Exception as exc:                     # noqa: BLE001 —— 整条失败，把原话说给界面
+        log.warning("相位图失败：#%s %s", scan_id, exc)
+        _PHASE_JOB.update(running=False, error=str(exc))
+        return
+    res["scan_id"] = scan_id
+    global _PHASE_MAP
+    _PHASE_MAP = res
+    _PHASE_JOB.update(running=False, result=_phase_meta(res))
+
+
+@app.post("/api/scans/{scan_id}/phasemap")
+def api_phase_run(scan_id: int,
+                  lmin: Optional[float] = Query(None, description="波长最小 (µm)"),
+                  lmax: Optional[float] = Query(None, description="波长最大 (µm)")) -> dict:
+    """算这一条扫描的整幅相位图（后台线程；进度看 GET /api/phasemap）。
+
+    波段就是数据页〈滤波曲线〉那张卡的两个框（同一段波长）—— **两个都空（全通）时拒绝**：
+    全通没有载波可比。只读盘上的图、不碰设备。
+    """
+    if _PHASE_JOB["running"]:
+        raise HTTPException(409, f"上一张相位图还在算（{_PHASE_JOB['done']} / "
+                                 f"{_PHASE_JOB['total']} 张），等它跑完再点")
+    plan = _phase_plan(scan_id, lmin, lmax)
+    _PHASE_JOB.update(running=True, scan_id=scan_id, done=0, total=len(plan["items"]),
+                      error=None, result=None)
+    threading.Thread(target=_phase_worker, args=(scan_id, plan, lmin, lmax),
+                     daemon=True, name="phasemap").start()
+    return {"ok": True, "scan_id": scan_id, "total": len(plan["items"]),
+            "k_lo": plan["k_lo"], "k_hi": plan["k_hi"]}
+
+
+@app.get("/api/phasemap")
+def api_phase_state() -> dict:
+    """相位图的进度 + 最近算完的那一份（**不含两个数组**：它们走 phasemap.bin）。
+
+    与 /api/crops 同一个形状：进度、错误、结果都在 job 里，界面只认这一份。
+    """
+    job = dict(_PHASE_JOB)
+    job["result"] = _phase_meta(_PHASE_MAP)
+    return {"job": job}
+
+
+@app.get("/api/scans/{scan_id}/phasemap.bin")
+def api_phase_bin(scan_id: int) -> Response:
+    """相位（弧度）与条纹强度：两个 float32 数组连着给（各 w×h、行优先），形状在结果里。
+
+    数组按**盘上那张图**的顺序摆，`rect` 把它落回**原始坐标** —— 与取数、剖面同一套，
+    裁过的和没裁过的可以对着看。
+    """
+    import numpy as np
+
+    if _PHASE_MAP is None or _PHASE_MAP["scan_id"] != scan_id:
+        raise HTTPException(404, "这一条还没有算好的相位图")
+    a = _PHASE_MAP
+    buf = np.concatenate([a["phase"].ravel(), a["amp"].ravel()]).astype("<f4").tobytes()
+    return Response(content=buf, media_type="application/octet-stream",
+                    headers={"X-Map-W": str(a["w"]), "X-Map-H": str(a["h"]),
+                             "Cache-Control": "no-store"})
+
+
 # ------------------------------------------------------------------ 数据页：裁剪
-# 一组扫描（同名的那几条）裁成同一块矩形、就地换掉原图，**坐标口径不变**：
+# 把**这一条扫描**的每一帧裁成同一块矩形、就地换掉原图，**坐标口径不变**：
 # 库里和 PNG 里都记 (x0,y0,w,h)，只在读文件那一层减一次偏移（见 thorlabs_ccd.png_pixel_series）。
-# 整组要跑十几秒到几分钟（2000 张约 17 s），所以放后台线程 + 进度，不占 HTTP 连接。
+# **裁一次只动这一条**（用户 2026-10 定：不要多条一起）—— 从前按同名整组走，那个概念没有了。
+# 一条 2000 点要跑十几秒（约 17 s），所以放后台线程 + 进度，不占 HTTP 连接。
 # 裁剪只读盘上的图，不碰设备 —— 但**扫描进行中一律拒绝**：别跟采图抢磁盘。
 
-_CROP_JOB: dict = {"running": False, "group": "", "done": 0, "total": 0,
+_CROP_JOB: dict = {"running": False, "scan_id": None, "done": 0, "total": 0,
                    "error": None, "result": None}
 
 
@@ -893,11 +1016,25 @@ def _scan_id_of(filename: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _sweep_imports() -> None:
+    """收尾上次进程被杀在半路的导入。
+
+    与裁剪不同：那边暂存的是**挪出来的原图**（得按记录挪回去），这边暂存的全是刚抄进来、
+    还没就位的副本 —— 源包在包那边好好的，清掉什么都不损失，所以无脑清。
+    """
+    from . import importer
+
+    try:
+        importer.sweep()
+    except OSError as exc:
+        log.error("清上次导入的暂存目录失败：%s", exc, exc_info=True)
+
+
 def _recover_crops() -> None:
     """收尾上一次进程被杀在半路的裁剪。
 
-    约定见 thorlabs_ccd.finish_staged_crops：orig/ 里还有原图 = 这一批没裁完（挪回来，
-    库里的 cropping 记录删掉）；orig/ 已经没了 = 图都就位了、只差改状态（改成 done）。
+    约定见 thorlabs_ccd.finish_staged_crops：orig/ 里还有原图 = 这一批没裁完（原图挪回来，
+    库里的矩形按现场记的改回裁之前）；orig/ 已经没了 = 图都就位了、只差改状态（改成 done）。
     """
     from .thorlabs_ccd import finish_staged_crops
 
@@ -911,15 +1048,17 @@ def _recover_crops() -> None:
     back, finished = {}, False
     for item in leftovers:
         if item["rolled_back"]:
-            # 现场说明里记着"裁之前每条是什么样"：这批要是**再裁**，开工时库已经被改成新矩形了，
-            # 只有这里还留着旧的 —— 按它改回去
-            back |= {sid: None for sid in (_scan_id_of(n) for n in item["files"]) if sid is not None}
-            for k, v in ((item.get("plan") or {}).get("prev") or {}).items():
-                back[int(k)] = v
+            # 现场说明里记着"裁之前是哪一块"：这批要是**再裁**，开工时库已经被改成新矩形了，
+            # 只有这里还留着旧的 —— 按它改回去。现场读不动就按"没记录"收（宁可当场报错，
+            # 也不能拿一个猜的矩形顶上）。
+            sid = _scan_id_of(item["files"][0]) if item["files"] else None
+            if sid is not None:
+                back[sid] = (item.get("plan") or {}).get("prev")
         else:
             finished = True
+    for sid, rect in back.items():
+        _crop_restore(sid, rect)
     if back:
-        _crop_restore(back)
         log.warning("上次裁剪没跑完，已把 %d 条扫描的原图放回、库改回裁之前：%s",
                     len(back), sorted(back))
     if finished:
@@ -929,103 +1068,66 @@ def _recover_crops() -> None:
             log.warning("上次裁剪其实已经完成，补记 %d 条：%s", len(rest), rest)
 
 
-def _crop_plan(name: str) -> dict:
-    """这一组能不能裁、要动哪些文件、现在这块地是哪儿（**原始坐标**）。
+def _crop_plan(scan_id: int) -> dict:
+    """这一条能不能裁、要动哪些文件、现在这块地是哪儿（**原始坐标**）。
 
-    预检结果**如实回报、不替人做决定**：画面尺寸不一致（比如混进 64×64 的假相机测试扫描）、
-    裁剪记录不一致、没有图、正在扫、**库和文件对不上** —— 逐条列出来，能裁的那些才进 items。
-    **已经裁过的可以再裁**：base 就是现在这块地，框只能往里选（裁掉的找不回来）。
+    预检结果**如实回报、不替人做决定**：没有图、正在扫、**库和文件对不上** —— 说清为什么，
+    能裁的才进 frames。**已经裁过的可以再裁**：base 就是现在这块地，框只能往里选
+    （裁掉的找不回来）。裁一次只动这一条扫描。
     """
     from .thorlabs_ccd import png_size, read_png_meta
 
-    scans = store.scans_named(name)
-    if not scans:
-        raise HTTPException(404, f"没有叫「{name}」的扫描")
+    s = store.get_scan(scan_id)
+    if s is None:
+        raise HTTPException(404, f"扫描 #{scan_id} 不存在")
     st = scanner.state()
-    rows = []
-    for s in scans:
-        paths = [DATA_DIR / p["image_path"]
-                 for p in store.get_points(s["id"]) if p["image_path"]]
-        rec = store.get_crop(s["id"])
-        db_rect = [rec["x0"], rec["y0"], rec["w"], rec["h"]] if rec else None
-        why, box, file_rect = "", None, None
-        if not paths:
-            why = "没有图"
-        elif st["scan_id"] == s["id"] and st["status"] in ("running", "paused"):
-            why = "正在扫描"
-        else:
-            try:
-                box = png_size(paths[0])
-                file_rect = read_png_meta(paths[0])["crop"]
-            except OSError:
-                why = "第一张图读不动"
-        if not why and file_rect != db_rect:
-            # 库说有、文件说没有（或者反过来、数值不同）：这是"坐标会悄悄错位"的那一类，
-            # 停下来查 —— 我们正踩在唯一能自动发现它的地方
-            why = (f"库和文件对不上（库 {db_rect or '没记录'}，"
-                   f"文件 {file_rect or '没记录'}）")
-        rows.append({"id": s["id"], "points": len(store.get_points(s["id"])),
-                     "images": len(paths), "size": list(box) if box else None,
-                     "rect": db_rect, "ok": not why, "why": why, "paths": paths})
-    # 参考 = 组里**出现次数最多**的那一对（画面尺寸, 裁剪记录）（并列取面积大的）。
-    # 一组里混进 64×64 的假相机占位帧时，要按真正的相机画面裁；混进裁过的、没裁过的、
-    # 或者两种裁剪记录，也不能挑错 —— 挑错的后果是裁出来一批"看着成功、其实框错了"的图。
-    key = None
-    if rows:
-        count: dict = {}
-        for r in rows:
-            if r["ok"] and r["size"]:
-                k = (tuple(r["size"]), tuple(r["rect"]) if r["rect"] else None)
-                count[k] = count.get(k, 0) + 1
-        if count:
-            key = max(count, key=lambda k: (count[k], k[0][0] * k[0][1]))
-    items, total = [], 0
-    for r in rows:
-        if r["ok"] and key:
-            if tuple(r["size"]) != key[0]:
-                r["ok"], r["why"] = False, (
-                    f"画面尺寸不一致（{r['size'][0]}×{r['size'][1]}，"
-                    f"这一组按 {key[0][0]}×{key[0][1]} 裁）")
-            elif (tuple(r["rect"]) if r["rect"] else None) != key[1]:
-                was = "×".join(str(v) for v in (r["rect"][2:4] if r["rect"] else [])) or "没裁过"
-                now = "×".join(str(v) for v in (key[1][2:4] if key[1] else [])) or "没裁过"
-                r["ok"], r["why"] = False, f"裁剪记录不一致（它是 {was}，这一组按 {now} 算）"
-        if r["ok"]:
-            items += [(r["id"], p) for p in r["paths"]]
-            total += sum(p.stat().st_size for p in r["paths"])
-        r.pop("paths")
-    base = list(key[1]) if key and key[1] else None
-    bad = "、".join(f"#{r['id']} {r['why']}" for r in rows if not r["ok"])
+    paths = [DATA_DIR / p["image_path"] for p in store.get_points(scan_id) if p["image_path"]]
+    rec = store.get_crop(scan_id)
+    db_rect = [rec["x0"], rec["y0"], rec["w"], rec["h"]] if rec else None
+    why, box, file_rect = "", None, None
+    if not paths:
+        why = "没有图"
+    elif st["scan_id"] == scan_id and st["status"] in ("running", "paused"):
+        why = "正在扫描"
+    else:
+        try:
+            box = png_size(paths[0])
+            file_rect = read_png_meta(paths[0])["crop"]
+        except OSError:
+            why = "第一张图读不动"
+    if not why and file_rect != db_rect:
+        # 库说有、文件说没有（或者反过来、数值不同）：这是"坐标会悄悄错位"的那一类，
+        # 停下来查 —— 我们正踩在唯一能自动发现它的地方
+        why = f"库和文件对不上（库 {db_rect or '没记录'}，文件 {file_rect or '没记录'}）"
     return {
-        "items": items,
-        "prev": {r["id"]: r["rect"] for r in rows if r["ok"]},   # 开工前的库记录，回滚要按它改回去
-        "out": {"name": name, "scans": rows, "images": len(items), "bytes": total,
-                "frame": list(key[0]) if key else None, "base": base,
+        "frames": paths if not why else [],
+        "prev": db_rect,                # 开工前的库记录，回滚要按它改回去
+        "out": {"scan_id": scan_id, "images": len(paths) if not why else 0,
+                "bytes": sum(p.stat().st_size for p in paths) if not why else 0,
+                "frame": list(box) if box else None, "base": db_rect,
                 # 代表帧（相对 data/ 的路径）：面板上把它显示出来 + 画红框，
                 # 框住没框住一眼就能看出来，比只看四个数可靠
-                "sample": items[0][1].relative_to(DATA_DIR).as_posix() if items else None},
-        "ok": bool(items),
-        "why": f"这一组没有能裁的扫描（{bad}）" if bad else "这一组没有能裁的扫描",
+                "sample": paths[0].relative_to(DATA_DIR).as_posix() if not why else None},
+        "ok": not why,
+        "why": f"扫描 #{scan_id} 现在不能裁：{why}" if why else "",
     }
 
 
-def _crop_restore(prev: dict) -> None:
-    """把库里的裁剪记录改回**这一批开工之前**的样子（文件已经回滚了，库得跟着回）。
+def _crop_restore(scan_id: int, prev: Optional[list]) -> None:
+    """把这一条的裁剪记录改回**这一刀之前**的样子（文件已经回滚了，库得跟着回）。
 
-    裁之前没记录的（第一次裁）就把记录删掉；有记录的按 plan 里记的矩形改回去 ——
+    裁之前没记录的（第一次裁）就把记录删掉；有记录的按记下的矩形改回去 ——
     少了这一步，再裁失败之后库和文件就再也对不上，而那是不会自己报错的。
     """
-    keep = [{"scan_id": sid, "x0": r[0], "y0": r[1], "w": r[2], "h": r[3]}
-            for sid, r in prev.items() if r]
-    if keep:
-        store.set_crop_rects(keep)
-    gone = [sid for sid, r in prev.items() if not r]
-    if gone:
-        store.delete_crops(gone)
+    if prev:
+        store.set_crop_rects([{"scan_id": scan_id, "x0": prev[0], "y0": prev[1],
+                               "w": prev[2], "h": prev[3]}])
+    else:
+        store.delete_crops([scan_id])
 
 
-def _crop_worker(ids: list, items: list, rect: tuple, prev: dict) -> None:
-    """后台把整组裁完。**失败就什么都不留**：文件由 crop_frames 回滚，库改回裁之前的样子。"""
+def _crop_worker(scan_id: int, frames: list, rect: tuple, prev: Optional[list]) -> None:
+    """后台把这一条裁完。**失败就什么都不留**：文件由 crop_frames 回滚，库改回裁之前的样子。"""
     from .thorlabs_ccd import crop_frames
 
     x0, y0, w, h = rect
@@ -1034,20 +1136,18 @@ def _crop_worker(ids: list, items: list, rect: tuple, prev: dict) -> None:
         _CROP_JOB.update({"done": done, "total": total})
 
     try:
-        report = crop_frames(items, x0, y0, w, h, progress=progress, prev=prev)
+        report = crop_frames(frames, x0, y0, w, h, progress=progress, prev=prev)
     except Exception as exc:                     # noqa: BLE001 —— 裁剪失败不该带走服务
-        _crop_restore(prev)
-        log.error("裁剪失败（整组已回滚，原图没动）：%s", exc)
+        _crop_restore(scan_id, prev)
+        log.error("裁剪失败（已回滚，原图没动）：%s", exc)
         _CROP_JOB.update({"running": False, "error": str(exc)})
         return
-    for sid in ids:
-        one = report["per_scan"].get(sid, {"frames": 0, "saved_bytes": 0})
-        store.finish_crop(sid, one["frames"], one["saved_bytes"])
-    log.info("裁剪完成：%s 条扫描、%d 张，省了 %.1f MB", len(ids), report["frames"],
+    store.finish_crop(scan_id, report["frames"], report["saved_bytes"])
+    log.info("裁剪完成：扫描 #%s %d 张，省了 %.1f MB", scan_id, report["frames"],
              report["saved_bytes"] / 1e6)
     _CROP_JOB.update({
         "running": False, "done": report["frames"], "total": report["frames"],
-        "result": {"scans": len(ids), "frames": report["frames"],
+        "result": {"scan_id": scan_id, "frames": report["frames"],
                    "saved_bytes": report["saved_bytes"], "peak": report["peak"],
                    "edge_peak": report["edge_peak"], "rect": list(rect)},
     })
@@ -1055,48 +1155,48 @@ def _crop_worker(ids: list, items: list, rect: tuple, prev: dict) -> None:
 
 @app.get("/api/crops")
 def api_crop_list() -> dict:
-    """扫描组 + 每组裁没裁过；外加**每条扫描**的裁剪状态（历史表那一列照着它写）。"""
-    return {"groups": store.scan_groups(), "job": _CROP_JOB, "w": CROP_W, "h": CROP_H,
+    """**每条扫描**裁到哪一块、什么状态（历史表那一列照着它写）+ 当前这一单。"""
+    return {"job": _CROP_JOB, "w": CROP_W, "h": CROP_H,
             "crops": [{"id": c["scan_id"], "rect": [c["x0"], c["y0"], c["w"], c["h"]],
                        "frames": c["frames"], "state": c["state"]}
                       for c in store.all_crops()]}
 
 
 @app.get("/api/crops/suggest")
-def api_crop_suggest(name: str = Query(..., description="组名（同名的扫描算一组）"),
+def api_crop_suggest(scan_id: int = Query(..., ge=1),
                      w: int = Query(CROP_W, ge=16, le=8192),
                      h: int = Query(CROP_H, ge=16, le=8192)) -> dict:
-    """建议矩形 + 预检。只读文件头和 tEXt（不解码），几百张的组也是秒回。"""
+    """建议矩形 + 预检。只读文件头和 tEXt（不解码），一条 2000 点也是秒回。"""
     from .thorlabs_ccd import suggest_crop
 
-    plan = _crop_plan(name)
+    plan = _crop_plan(scan_id)
     if not plan["ok"]:
         raise HTTPException(400, plan["why"])
     base = plan["out"]["base"]
-    out = {**plan["out"], "rect": suggest_crop(plan["items"], size=(w, h), base=base)}
+    out = {**plan["out"], "rect": suggest_crop(plan["frames"], size=(w, h), base=base)}
     # 建议框把**现在这块地**整个框进去了 = 这一步裁了不会更快（假相机采的占位小图就是这样）。
     # 话说在面板上，别让人点一下才被拒。**不拦**：框小一点照样能裁（只是没收益）。
     bw, bh = (base[2], base[3]) if base else (out["frame"][0], out["frame"][1])
     if out["rect"]["w"] >= bw and out["rect"]["h"] >= bh:
-        out["note"] = (f"这一组现在是 {bw}×{bh}，建议框就是这一整幅 —— "
+        out["note"] = (f"这一条现在是 {bw}×{bh}，建议框就是这一整幅 —— "
                        + ("再裁就把框改小一点。" if base else "裁了不会更快（多半是假相机采的占位小图）。"))
     return out
 
 
 @app.post("/api/crops/run")
-def api_crop_run(name: str = Query(...),
+def api_crop_run(scan_id: int = Query(..., ge=1),
                  x0: int = Query(..., ge=0), y0: int = Query(..., ge=0),
                  w: int = Query(..., ge=16), h: int = Query(..., ge=16)) -> dict:
-    """把这一组每一帧裁成 (x0,y0,w,h)（**原始坐标**），就地换掉原图 —— **不可逆**。
+    """把这一条扫描的每一帧裁成 (x0,y0,w,h)（**原始坐标**），就地换掉原图 —— **不可逆**。
 
     先落库（state=cropping）再动文件：进程被杀在半路时靠它判断该往哪边收尾。
-    整组一起裁、一起校验，任何一张不过就整组回滚 —— 原图在全部校验通过之前一个字节都不动。
+    整条一起裁、一起校验，任何一张不过就整条回滚 —— 原图在全部校验通过之前一个字节都不动。
     """
     if _CROP_JOB["running"]:
         raise HTTPException(409, "上一次裁剪还没跑完，等它结束")
     if scanner.state()["status"] == "running":
-        raise HTTPException(409, "扫描进行中：裁剪要读一整组的图，等扫描跑完再来")
-    plan = _crop_plan(name)
+        raise HTTPException(409, "扫描进行中：裁剪要读这一条的图，等扫描跑完再来")
+    plan = _crop_plan(scan_id)
     if not plan["ok"]:
         raise HTTPException(400, plan["why"])
     fw, fh = plan["out"]["frame"]
@@ -1107,9 +1207,9 @@ def api_crop_run(name: str = Query(...),
         if x0 < bx or y0 < by or x0 + w > bx + bw or y0 + h > by + bh:
             raise HTTPException(400, (
                 f"矩形 ({x0},{y0},{w},{h}) 超出了现在可裁的 x {bx}~{bx + bw - 1}、"
-                f"y {by}~{by + bh - 1} —— 这一组已经裁过一次，只能往里裁（裁掉的找不回来）"))
+                f"y {by}~{by + bh - 1} —— 这一条已经裁过一次，只能往里裁（裁掉的找不回来）"))
         if w * h >= bw * bh:
-            raise HTTPException(400, f"这一组现在是 {bw}×{bh}，新框得比它小才有意义")
+            raise HTTPException(400, f"这一条现在是 {bw}×{bh}，新框得比它小才有意义")
     else:
         if x0 + w > fw or y0 + h > fh:
             raise HTTPException(400, f"矩形 ({x0},{y0},{w},{h}) 超出了画面 {fw}×{fh}")
@@ -1118,19 +1218,17 @@ def api_crop_run(name: str = Query(...),
             raise HTTPException(400, f"这个矩形就是整幅画面 {fw}×{fh}，裁了不会更快，把框缩小一点")
 
     prev = plan["prev"]                    # 开工前的库记录：写新记录之前先留一份，回滚要按它改回去
-    ids = sorted({sid for sid, _ in plan["items"]})
     store.put_crops([
-        {"scan_id": sid, "group_name": name, "x0": x0, "y0": y0, "w": w, "h": h,
+        {"scan_id": scan_id, "x0": x0, "y0": y0, "w": w, "h": h,
          "frames": 0, "saved_bytes": 0, "state": "cropping", "created_at": time.time()}
-        for sid in ids
     ])
-    _CROP_JOB.update({"running": True, "group": name, "done": 0,
-                      "total": len(plan["items"]), "error": None, "result": None})
-    threading.Thread(target=_crop_worker, args=(ids, plan["items"], (x0, y0, w, h), prev),
+    _CROP_JOB.update({"running": True, "scan_id": scan_id, "done": 0,
+                      "total": len(plan["frames"]), "error": None, "result": None})
+    threading.Thread(target=_crop_worker, args=(scan_id, plan["frames"], (x0, y0, w, h), prev),
                      daemon=True, name="crop").start()
-    log.info("开始裁剪：组「%s」%d 条扫描 %d 张 → %s", name, len(ids), len(plan["items"]),
-             (x0, y0, w, h))
-    return {"ok": True, "scans": ids, "images": len(plan["items"]), "rect": [x0, y0, w, h]}
+    log.info("开始裁剪：扫描 #%s，%d 张 → %s", scan_id, len(plan["frames"]), (x0, y0, w, h))
+    return {"ok": True, "scan_id": scan_id, "images": len(plan["frames"]),
+            "rect": [x0, y0, w, h]}
 
 
 # ------------------------------------------------------------------ 导出：一条扫描的原始帧 + 每点元数据
@@ -1210,6 +1308,85 @@ def api_export_run(scan_id: int, req: ExportRequest) -> dict:
                      daemon=True, name="export").start()
     log.info("开始导出扫描 #%s：%d 张 %s → %s", scan_id, info["images"],
              "（zip）" if req.zip else "", info["dest"])
+    return {"ok": True, **info}
+
+
+# ------------------------------------------------------------------ 导入：把一份导出的包恢复成一条扫描
+# 与导出对称：**源包一个字节都不动**，本机多一条扫描 + 一份图。不碰设备、不排队进设备线程，
+# 所以扫描跑着也能导；代价同样是跟采图抢磁盘（界面上先说一句）。
+# 一条能到 2 GB / 3000 张，所以跟导出、裁剪一样放后台线程 + 进度，不占 HTTP 连接。
+#
+# 包在**本机之外**（另一台机器的硬盘、U 盘、网盘），所以路径由人填 —— 后端不猜、也不去扫。
+# 预检（plan）只读包里的两张表：点了它，本机一个字节都不会变。
+
+_IMPORT_JOB: dict = {"running": False, "done": 0, "total": 0, "error": None, "result": None}
+
+
+def _import_worker(src: str) -> None:
+    """后台把这一包搬进来。失败就把错误摆到面板上（源包与盘上的东西都没动）。"""
+    from . import importer
+
+    def progress(done: int, total: int) -> None:
+        _IMPORT_JOB.update({"done": done, "total": total})
+
+    try:
+        result = importer.run(src, progress=progress)
+    except Exception as exc:                 # noqa: BLE001 —— 导入失败不该带走服务
+        log.error("导入 %s 失败（源包与盘上的东西都没动）：%s", src, exc)
+        _IMPORT_JOB.update({"running": False, "error": str(exc)})
+        return
+    _IMPORT_JOB.update({"running": False, "done": result["images"],
+                        "total": result["images"], "result": result})
+
+
+@app.get("/api/imports")
+def api_import_state() -> dict:
+    """导入任务的状态。
+
+    没有"最近导了哪些"这一栏（导出有）：包在**别人那儿**，后端只知道这一次点的是哪个路径。
+    """
+    return {"job": _IMPORT_JOB, "dest": str(IMAGE_DIR)}
+
+
+@app.post("/api/imports/plan")
+def api_import_plan(req: ImportRequest) -> dict:
+    """看一眼这个包：哪一条、多少点、多少张、多大、盘上放不放得下 —— **动手前先看**。
+
+    只读包里的清单与那张表，不读图、不写任何东西；点这个接口不会改变本机的状态。
+    """
+    from . import importer
+
+    if _IMPORT_JOB["running"]:
+        raise HTTPException(409, "上一次导入还没跑完，等它结束")
+    try:
+        info = importer.plan(req.path)
+    except ValueError as exc:                # 包不在 / 没导完 / 号被占 / 图名撞了 / 放不下
+        raise HTTPException(400, str(exc)) from exc
+    # 导入允许跟扫描同时进行（跟导出同一个道理）。界面要**动手前**提醒一句"会跟采图抢磁盘"，
+    # 而"现在在不在采图"只有后端知道 —— 随预检一起下发，前端不自己维护这份状态。
+    return {**info, "scanner": scanner.state()}
+
+
+@app.post("/api/imports/run")
+def api_import_run(req: ImportRequest) -> dict:
+    """把这一包恢复成本机库里的一条扫描（**源包一个字节都不动**）。
+
+    扫描进行中**允许**导进来：这件事只写 data/，跟设备一点关系没有。
+    """
+    from . import importer
+
+    if _IMPORT_JOB["running"]:
+        raise HTTPException(409, "上一次导入还没跑完，等它结束")
+    try:
+        info = importer.plan(req.path)       # 预检拦下：不让它在后台线程里才失败
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _IMPORT_JOB.update({"running": True, "done": 0,
+                        "total": max(2, info["images"] * 2), "error": None, "result": None})
+    threading.Thread(target=_import_worker, args=(req.path,), daemon=True,
+                     name="import").start()
+    log.info("开始导入 %s：扫描 #%s，%d 点 / %d 张", req.path, info["scan_id"],
+             info["points"], info["images"])
     return {"ok": True, **info}
 
 

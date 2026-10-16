@@ -1,10 +1,10 @@
 """数据页「裁剪」：离线自检，**不碰相机、不碰硬件、也不碰真的 data/images**。
 
-一组扫描（同名的那几条）的每一帧裁成同一块矩形，就地换掉原图。三条硬要求：
+**选中的那一条扫描**的每一帧裁成同一块矩形，就地换掉原图（裁一次只动这一条）。三条硬要求：
 
   1. **坐标口径不变**：裁前裁后，同一个原始坐标取到的必须是同一个值；
      点在裁剪框外是坐标错了，当场报错（跟"点落在画面外"同一条）。
-  2. **校验通过之前原图一个字节都不动**：任何一步出错，整组原样回滚 ——
+  2. **校验通过之前原图一个字节都不动**：任何一步出错，整条原样回滚 ——
      宁可白干一趟，不能留下"一半裁了一半没裁"（那种状态读出来的坐标是错的，还不报错）。
   3. **质心只搬不重算**：它是整幅的强度加权重心，裁掉背景就不是那个数了。
 
@@ -55,7 +55,7 @@ def test_crop_keeps_the_same_value_at_the_same_original_coordinate():
         items = [(i, 1.0 + i, p) for i, p in enumerate(files)]
         before = png_pixel_series(items, 17, 12)
         with _image_dir(tmp):
-            report = tc.crop_frames([(1, p) for p in files], *RECT)
+            report = tc.crop_frames(files, *RECT)
         after = png_pixel_series(items, 17, 12, crop=RECT)
 
         assert before["value"] == after["value"] != [None], (before["value"], after["value"])
@@ -73,7 +73,7 @@ def test_crop_keeps_the_file_name_and_carries_the_metadata():
         tmp = Path(d)
         p = _frame(tmp, "scan0002_00000.png", centroid={"cx": 20.0, "cy": 15.0})
         with _image_dir(tmp):
-            tc.crop_frames([(2, p)], *RECT)
+            tc.crop_frames([p], *RECT)
         meta = tc.read_png_meta(p)
 
         assert p.exists(), "裁剪是就地替换，文件名必须不变"
@@ -92,7 +92,7 @@ def test_point_outside_the_crop_is_refused():
         p = _frame(tmp, "scan0003_00000.png")
         items = [(0, 1.0, p)]
         with _image_dir(tmp):
-            tc.crop_frames([(3, p)], *RECT)
+            tc.crop_frames([p], *RECT)
         for bad in ((9, 12), (30, 12), (17, 4), (17, 20)):
             try:
                 png_pixel_series(items, *bad, crop=RECT)
@@ -118,8 +118,8 @@ def test_record_that_does_not_match_the_file_is_refused():
             raise AssertionError("文件没裁却按裁剪记录读，应该被拒绝")
 
 
-def test_a_bad_frame_rolls_the_whole_group_back():
-    """组里有一张读不动：整组回滚，谁都别动。"""
+def test_a_bad_frame_rolls_the_whole_scan_back():
+    """这一条里有一张读不动：整条回滚，谁都别动。"""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         good = [_frame(tmp, f"scan0005_{i:05d}.png") for i in range(2)]
@@ -128,11 +128,11 @@ def test_a_bad_frame_rolls_the_whole_group_back():
         before = [p.read_bytes() for p in good]
         try:
             with _image_dir(tmp):
-                tc.crop_frames([(5, p) for p in good] + [(5, bad)], *RECT)
+                tc.crop_frames(good + [bad], *RECT)
         except Exception:
             pass
         else:
-            raise AssertionError("坏图应该让整组失败")
+            raise AssertionError("坏图应该让整条失败")
 
         assert [p.read_bytes() for p in good] == before, "原图必须一个字节都没变"
         assert tc.png_size(good[0]) == (W, H)
@@ -157,7 +157,7 @@ def test_a_failure_while_swapping_files_still_restores_every_original():
         tc.os.replace = boom
         try:
             with _image_dir(tmp):
-                tc.crop_frames([(6, p) for p in files], *RECT)
+                tc.crop_frames(files, *RECT)
         except OSError:
             pass
         else:
@@ -176,10 +176,10 @@ def test_recrop_keeps_the_value_and_accumulates_the_offset():
         p = _frame(tmp, "scan0013_00000.png")
         items = [(0, 1.0, p)]
         with _image_dir(tmp):
-            first = tc.crop_frames([(13, p)], *RECT, prev={13: None})
+            first = tc.crop_frames([p], *RECT)
             assert tc.png_size(p) == (RECT[2], RECT[3])
             before = png_pixel_series(items, 15, 8, crop=list(RECT))
-            second = tc.crop_frames([(13, p)], 12, 7, 8, 6, prev={13: list(RECT)})
+            second = tc.crop_frames([p], 12, 7, 8, 6, prev=list(RECT))
         after = png_pixel_series(items, 15, 8, crop=[12, 7, 8, 6])
 
         assert tc.png_size(p) == (8, 6)
@@ -196,11 +196,11 @@ def test_recrop_outside_what_is_left_is_refused():
         tmp = Path(d)
         p = _frame(tmp, "scan0014_00000.png")
         with _image_dir(tmp):
-            tc.crop_frames([(14, p)], *RECT, prev={14: None})
+            tc.crop_frames([p], *RECT)
             size = p.stat().st_size
             for bad in ((9, 5, 20, 15), (10, 4, 20, 15), (10, 5, 21, 15), (10, 5, 20, 16)):
                 try:
-                    tc.crop_frames([(14, p)], *bad, prev={14: list(RECT)})
+                    tc.crop_frames([p], *bad, prev=list(RECT))
                 except ValueError as exc:
                     assert "只能往里裁" in str(exc), exc
                     continue
@@ -214,9 +214,9 @@ def test_recrop_needs_the_database_record_to_agree():
         tmp = Path(d)
         p = _frame(tmp, "scan0015_00000.png")
         with _image_dir(tmp):
-            tc.crop_frames([(15, p)], *RECT, prev={15: None})
+            tc.crop_frames([p], *RECT)
             try:
-                tc.crop_frames([(15, p)], 11, 6, 5, 5, prev={15: None})   # 文件裁过、库说没有
+                tc.crop_frames([p], 11, 6, 5, 5)   # 文件裁过、库说没有
             except ValueError as exc:
                 assert "对不上" in str(exc), exc
             else:
@@ -226,7 +226,7 @@ def test_recrop_needs_the_database_record_to_agree():
         q = _frame(tmp, "scan0016_00000.png")
         with _image_dir(tmp):
             try:
-                tc.crop_frames([(16, q)], 11, 6, 5, 5, prev={16: list(RECT)})   # 库说裁过、文件没裁
+                tc.crop_frames([q], 11, 6, 5, 5, prev=list(RECT))   # 库说裁过、文件没裁
             except ValueError as exc:
                 assert "对不上" in str(exc), exc
             else:
@@ -235,13 +235,13 @@ def test_recrop_needs_the_database_record_to_agree():
 
 
 def test_suggest_crop_stays_inside_what_is_left():
-    """已经裁过的一组：建议框只能落在**现在这块地**里，并如实报出 base 与 cropped。"""
+    """已经裁过的：建议框只能落在**现在这块地**里，并如实报出 base 与 cropped。"""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         pts = [(100.0, 200.0), (160.0, 210.0)]
         files = [_frame(tmp, f"scan0017_{i:05d}.png", w=400, h=300,
                         centroid={"cx": cx, "cy": cy}) for i, (cx, cy) in enumerate(pts)]
-        got = tc.suggest_crop([(17, p) for p in files], size=(120, 90), edge=50,
+        got = tc.suggest_crop(files, size=(120, 90), edge=50,
                               base=(20, 30, 200, 150))
     assert got["cropped"] is True and got["base"] == [20, 30, 200, 150], got
     assert 20 <= got["x0"] and got["x0"] + got["w"] <= 220, got
@@ -250,13 +250,13 @@ def test_suggest_crop_stays_inside_what_is_left():
 
 
 def test_suggest_crop_covers_the_whole_spot_range():
-    """建议框要把这一组扫描的质心范围整个框住，并报出离边最近还有多少像素。"""
+    """建议框要把这条扫描的质心范围整个框住，并报出离边最近还有多少像素。"""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         pts = [(100.0, 200.0), (160.0, 210.0), (130.0, 205.0)]
         files = [_frame(tmp, f"scan0008_{i:05d}.png", w=400, h=300,
                         centroid={"cx": cx, "cy": cy}) for i, (cx, cy) in enumerate(pts)]
-        got = tc.suggest_crop([(8, p) for p in files], size=(120, 90), edge=50)
+        got = tc.suggest_crop(files, size=(120, 90), edge=50)
 
     assert got["source"] == "centroid" and got["sampled"] == 3, got
     assert got["frame_w"] == 400 and got["frame_h"] == 300
@@ -273,7 +273,7 @@ def test_suggest_crop_without_centroid_falls_back_to_the_center():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         p = _frame(tmp, "scan0009_00000.png", w=400, h=300)
-        got = tc.suggest_crop([(9, p)], size=(120, 90))
+        got = tc.suggest_crop([p], size=(120, 90))
     assert got["source"] == "center" and got["cx_range"] is None and got["margin"] is None, got
     assert (got["w"], got["h"]) == (120, 90), got
     assert got["x0"] == 140 and got["y0"] == 105, got
@@ -315,7 +315,7 @@ def test_finish_staged_crops_keeps_a_finished_batch():
 
 
 def test_finish_staged_crops_reports_the_plan():
-    """现场说明（这一批要裁成什么、**裁之前每条是什么样**）要原样带出来。
+    """现场说明（这一批要裁成什么、**裁之前是哪一块**）要原样带出来。
 
     再裁的批次里，库在开工时已经被改成新矩形了 —— 回滚之后只有这份说明能告诉调用方
     "原来是多少"，没有它，库和文件就再也对不上。
@@ -327,13 +327,13 @@ def test_finish_staged_crops_reports_the_plan():
         (batch / "new").mkdir()
         _frame(batch / "orig", "scan0018_00000.png")
         (batch / "plan.json").write_text(
-            '{"rect": [1, 2, 3, 4], "prev": {"18": [10, 5, 20, 15]}}', "utf-8")
+            '{"rect": [1, 2, 3, 4], "prev": [10, 5, 20, 15]}', "utf-8")
         with _image_dir(tmp):
             out = tc.finish_staged_crops()
 
         assert out == [{"batch": ".crop-789", "rolled_back": True,
                         "files": ["scan0018_00000.png"],
-                        "plan": {"rect": [1, 2, 3, 4], "prev": {"18": [10, 5, 20, 15]}}}], out
+                        "plan": {"rect": [1, 2, 3, 4], "prev": [10, 5, 20, 15]}}], out
         assert tc.png_size(tmp / "scan0018_00000.png") == (W, H)
         assert not list(tmp.glob(".crop-*"))
 

@@ -1129,12 +1129,13 @@ def png_pixel_series(items, x: int, y: int, workers: int = 8,
 
 
 # ------------------------------------------------------------------ 裁剪
-# 把**一组扫描**（同名的那几条）里每一帧裁成同一块矩形，就地换掉原图（文件名不变）。
+# 把**选中的那一条扫描**里每一帧裁成同一块矩形，就地换掉原图（文件名不变）。
+# 裁一次只动这一条（用户 2026-10 定：不要多条一起）—— 从前按同名整组走，那个概念没有了。
 # 规则与理由：
 #   - **坐标口径不变**：x0/y0 是这一刀在原始帧里的左上角，对外一律原始坐标；
 #     只在 png_pixel_series 里减一次偏移。裁过的和没裁过的扫描可以混着比对。
 #   - **校验通过之前原图一个字节都不动**：先裁进 .crop-<批>/new/ 并逐张校验，
-#     整组都对了才 rename 就位。宁可白干一趟，不能留"一半裁了一半没裁"——
+#     全部对了才 rename 就位。宁可白干一趟，不能留"一半裁了一半没裁"——
 #     那种状态读出来的坐标是错的，而且不报错。
 #   - **质心只搬不重算**：它是整幅的强度加权重心（不扣背景、不设阈值），裁掉背景就不是那个数了。
 
@@ -1160,7 +1161,7 @@ def png_ihdr(path: Path) -> tuple:
 
 
 def png_size(path: Path) -> tuple:
-    """PNG 头里的宽高（只读 IHDR，不解码）—— 判一组扫描的画面尺寸一不一样用。"""
+    """PNG 头里的宽高（只读 IHDR，不解码）。"""
     w, h, _ = png_ihdr(path)
     return (w, h)
 
@@ -1187,22 +1188,23 @@ def _save_cropped(dst: Path, part, texts: list) -> None:
     Image.fromarray(part).save(dst, "PNG", pnginfo=info)
 
 
-def suggest_crop(items, size=(CROP_W, CROP_H), edge=CROP_EDGE_PX,
+def suggest_crop(frames, size=(CROP_W, CROP_H), edge=CROP_EDGE_PX,
                  samples=CROP_SAMPLES, base=None) -> dict:
-    """给一组帧算建议矩形（**原始坐标**）。
+    """给这一条扫描的帧算建议矩形（**原始坐标**）。
 
-    把这些帧的质心范围整个框住、四周至少留 edge 像素、至少 size 那么大，再夹回**可裁的那块地**里。
+    frames 是这条扫描各点的 PNG 路径。把这些帧的质心范围整个框住、四周至少留 edge 像素、
+    至少 size 那么大，再夹回**可裁的那块地**里。
     质心取自每张 PNG 自己的 tEXt；老图没有这个块就退回可裁区域的中心（source 字段如实说明）。
-    抽样 samples 帧就够 —— 要的是"光斑在这组扫描里跑到过哪"，不是每一张。
+    抽样 samples 帧就够 —— 要的是"光斑在这条扫描里跑到过哪"，不是每一张。
 
-    base = 现在这一组**已经裁到**的矩形（原始坐标，没裁过就是 None = 整幅都可裁）。
+    base = 现在**已经裁到**的矩形（原始坐标，没裁过就是 None = 整幅都可裁）。
     再裁只能在它里面挑 —— 裁掉的部分找不回来，所以框只能越选越小。
     """
     from PIL import Image
 
-    files = [p for _, p in items if p is not None]
+    files = list(frames)
     if not files:
-        raise ValueError("这一组没有可用的图")
+        raise ValueError("这一条没有可用的图")
     if len(files) <= samples:
         picked = files
     else:
@@ -1231,25 +1233,25 @@ def suggest_crop(items, size=(CROP_W, CROP_H), edge=CROP_EDGE_PX,
         "cropped": bool(base), "source": source, "sampled": len(picked),
         "cx_range": [round(min(xs), 1), round(max(xs), 1)] if cs else None,
         "cy_range": [round(min(ys), 1), round(max(ys), 1)] if cs else None,
-        # 光斑漂移范围离框最近还有多少像素：贴边了就说明这一组不该共用一个框
+        # 光斑漂移范围离框最近还有多少像素：贴边了就说明框选小了、有帧的亮心会被切掉
         "margin": int(min(min(xs) - x0, x0 + w - max(xs),
                           min(ys) - y0, y0 + h - max(ys))) if cs else None,
     }
 
 
-def crop_frames(items, x0: int, y0: int, w: int, h: int, progress=None,
-                prev: dict | None = None) -> dict:
-    """把一组帧裁成原始坐标里的 (x0,y0,w,h)，**就地替换、文件名不变**。
+def crop_frames(frames, x0: int, y0: int, w: int, h: int, progress=None,
+                prev=None) -> dict:
+    """把这一条扫描的帧裁成原始坐标里的 (x0,y0,w,h)，**就地替换、文件名不变**。
 
-    items 是 [(扫描号, PNG 路径 | None), ...]：一组扫描的所有点一起给，整组同进同退。
-    prev = {扫描号: 现在库里记着的矩形 | None}：**已经裁过的可以再裁**，但只能在现在这块地里
+    frames 是这条扫描各点的 PNG 路径（一次只裁这一条）。
+    prev = **库里现在记着**的矩形 | None：**已经裁过的可以再裁**，但只能在现在这块地里
     挑（x0,y0,w,h 仍然是原始坐标，文件里的偏移是累加的，口径一直不变）。
 
     三步，顺序是刻意的 —— 校验通过之前原图一个字节都不动：
 
       1. 逐张读原图 → 裁 → 写进 data/images/.crop-<批>/new/，当场校验落盘的那一张
          （尺寸、位深、用原始坐标取 5 个点与原图逐点相等）
-      2. 整组都过了才动原图：原图 rename 进 .crop-<批>/orig/，新图 rename 到位
+      2. 全部过了才动原图：原图 rename 进 .crop-<批>/orig/，新图 rename 到位
          （**半裁**的窗口只剩这一串 rename，而且这一小段里图是"缺的"而不是"错的"）
       3. 删掉 orig/ —— 到这里才算裁完（调用方这时才把库里状态改成 done）
 
@@ -1261,33 +1263,32 @@ def crop_frames(items, x0: int, y0: int, w: int, h: int, progress=None,
     import numpy as np
     from PIL import Image
 
-    todo = [(sid, p) for sid, p in items if p is not None]
+    todo = list(frames)
     if not todo:
-        raise ValueError("这一组没有可用的图")
+        raise ValueError("这一条没有可用的图")
     batch = IMAGE_DIR / f".crop-{int(time.time())}"
     (batch / "new").mkdir(parents=True, exist_ok=True)
     (batch / "orig").mkdir(parents=True, exist_ok=True)
     # 现场说明：万一进程死在这一批里，启动时要靠它把库里的矩形改回**裁之前**的样子
     # （改之前是什么样，只有这里知道 —— 库已经被改成新的了）
     (batch / "plan.json").write_text(
-        json.dumps({"rect": [x0, y0, w, h], "prev": prev or {}}, ensure_ascii=False), "utf-8")
+        json.dumps({"rect": [x0, y0, w, h], "prev": list(prev) if prev else None},
+                   ensure_ascii=False), "utf-8")
     probes = [(x0, y0), (x0 + w - 1, y0), (x0, y0 + h - 1),
               (x0 + w - 1, y0 + h - 1), (x0 + w // 2, y0 + h // 2)]
     saved, peak, edge_peak = 0, 0, 0
-    per_scan: dict = {}          # 每条扫描各裁了多少张、省了多少字节（界面按条显示）
     try:
-        for n, (sid, src) in enumerate(todo, 1):
+        for n, src in enumerate(todo, 1):
             with Image.open(src) as im:
                 text = dict(im.text or {})
                 arr = np.asarray(im)
             fh, fw = arr.shape
             # 这张图现在是从原始坐标的哪一块裁出来的（没裁过就是整幅）
             old = text.get(CROP_KEY.decode())
-            known = (prev or {}).get(sid)
-            if (old is None) != (known is None):
+            if (old is None) != (prev is None):
                 raise ValueError(
                     f"{src.name} 的裁剪记录和库里对不上（文件{'有' if old else '没有'}、"
-                    f"库{'有' if known else '没有'}）—— 先查清再动")
+                    f"库{'有' if prev else '没有'}）—— 先查清再动")
             if old is None:
                 sx0, sy0 = 0, 0
             else:
@@ -1308,20 +1309,16 @@ def crop_frames(items, x0: int, y0: int, w: int, h: int, progress=None,
             for px, py in probes:
                 if int(got[py - y0, px - x0]) != int(arr[py - sy0, px - sx0]):
                     raise ValueError(f"逐点校验不过：原始坐标 ({px},{py})（{src.name}）")
-            was, now = src.stat().st_size, dst.stat().st_size
-            saved += was - now
-            one = per_scan.setdefault(sid, {"frames": 0, "saved_bytes": 0})
-            one["frames"] += 1
-            one["saved_bytes"] += was - now
+            saved += src.stat().st_size - dst.stat().st_size
             peak = max(peak, int(part.max()))
             edge_peak = max(edge_peak, int(part[0].max()), int(part[-1].max()),
                             int(part[:, 0].max()), int(part[:, -1].max()))
             if progress:
                 progress(n, len(todo))
 
-        for _, src in todo:                                  # 2) 原图挪走
+        for src in todo:                                     # 2) 原图挪走
             os.replace(src, batch / "orig" / src.name)
-        for _, src in todo:                                  #    新图到位
+        for src in todo:                                     #    新图到位
             os.replace(batch / "new" / src.name, src)
         shutil.rmtree(batch / "orig")                        # 3) 到这儿才算裁完
         (batch / "plan.json").unlink()
@@ -1329,7 +1326,7 @@ def crop_frames(items, x0: int, y0: int, w: int, h: int, progress=None,
         batch.rmdir()
     except Exception:
         stuck = 0
-        for _, src in todo:
+        for src in todo:
             stashed, fresh = batch / "orig" / src.name, batch / "new" / src.name
             try:
                 if stashed.exists():                         # 动过这一张：新图删掉，原图挪回来
@@ -1343,8 +1340,7 @@ def crop_frames(items, x0: int, y0: int, w: int, h: int, progress=None,
         else:
             shutil.rmtree(batch, ignore_errors=True)
         raise
-    return {"frames": len(todo), "saved_bytes": saved, "peak": peak,
-            "edge_peak": edge_peak, "per_scan": per_scan}
+    return {"frames": len(todo), "saved_bytes": saved, "peak": peak, "edge_peak": edge_peak}
 
 
 def finish_staged_crops() -> list:
@@ -1353,8 +1349,8 @@ def finish_staged_crops() -> list:
     约定：**orig/ 里还有原图 = 这一批没裁完**（第 3 步没走到）→ 全部挪回来，等于没裁过；
     orig/ 已经没了 = 图都就位了、只差把库里那几条记录改成 done → 什么都不动，交给调用方改。
 
-    files 是**挪回来的文件名**：调用方靠它认出是哪些扫描（scan0053_00000.png → 53）。
-    plan 是这一批开工前写的现场（这次要裁成什么样、**裁之前每条是什么样**）：
+    files 是**挪回来的文件名**：调用方靠它认出这是哪一条扫描（scan0053_00000.png → 53）。
+    plan 是这一批开工前写的现场（这次要裁成什么样、**裁之前是哪一块**）：
     回滚过的批次，库里的矩形要按 plan["prev"] 改回去；再裁的批次，库里那时已经是新矩形了，
     只有这里还留着旧的 —— 没有它就再也回不到"和文件对得上"的状态。
     """

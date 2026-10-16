@@ -18,8 +18,6 @@
 """
 from __future__ import annotations
 
-import csv
-import io
 import json
 import logging
 import os
@@ -30,37 +28,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import store
+from . import package, store
 from .config import DATA_DIR, EXPORT_DIR, raw_readback_factor
 
 log = logging.getLogger(__name__)
-
-CSV_NAME = "points.csv"
-MANIFEST_NAME = "manifest.json"
-
-# 每点一行。列名用 ASCII：这张表是要拿出去给别的软件读的（Excel / Python / MATLAB），
-# 中文列名一路要过编码的关。每一列什么意思写在清单的 notes 里，也写在界面的导出面板上。
-CSV_COLUMNS = (
-    "idx",              # 扫描点序号（0 起，与库里一致）
-    "target_um",        # 命令值：想让台子去哪（µm）
-    "actual_um",        # 采图那一刻的读出位置（µm）——**不是**命令值，别混用
-    "readback_raw",     # 同一串位置的**设备原值**（= actual_um ÷ readback_to_um）；没记下系数就是空的
-    "settle_ms",        # 从到位到采图等了多久
-    "on_target",        # 读数与命令值的比较（1/0）；设备不拿它做判据
-    "settle_source",    # 这个"到位"是谁给的（device / software / unknown）
-    "exposure_us",      # 这一点采图用的曝光（相机读回值）；未记录就空着
-    "taken_at",         # 采图时刻（Unix 秒，当时那台机器的钟）
-    "taken_at_local",   # 同一时刻的本地时间（带时区偏移）
-    "image",            # 这一点的图在导出物里的文件名；空 = 没有
-    "image_bytes",
-    "width", "height", "bits",   # 图自己头上写的尺寸与位深（16 位原值 / 8 位占位图要分得清）
-    "note",             # 空 = 正常；否则写清为什么这一格是空的
-)
-
-
-def _stamp() -> str:
-    """导出的批次标记：一批一个名字，同名的两批不会撞在一起。"""
-    return time.strftime("%Y%m%d-%H%M%S")
 
 
 def _safe_name(name: str, scan_id: int) -> str:
@@ -126,7 +97,7 @@ def _crop_records(scan_id: int, items: list) -> tuple:
     """这条扫描的裁剪记录：库里那份、文件里那份、以及照着查的那张图。
 
     两份必须一致 —— 取数时偏移只在读文件那一层减一次，记录对不上就等于"原点错了还不报错"。
-    查**代表帧一张**就够：裁剪是一组一起动的（与裁剪预检同一个做法），逐张查只是多读几个 GB。
+    查**代表帧一张**就够：一条扫描是整条一起裁的（与裁剪预检同一个做法），逐张查只是多读几个 GB。
     """
     from .thorlabs_ccd import read_png_meta
 
@@ -161,7 +132,7 @@ def plan(scan_id: int, zipped: bool = False, stamp: Optional[str] = None) -> dic
             f"库里的裁剪记录和文件对不上（库 {db_rect or '没记录'}，"
             f"文件 {file_rect or '没记录'}，查的是 {sample}）—— 先查清再导："
             "原点偏移错了不会报错，只会让导出去的坐标整体错位")
-    stamp = stamp or _stamp()
+    stamp = stamp or package.stamp()
     factor = raw_readback_factor(scan.get("readback_to_um"))
     return {
         "scan_id": scan_id,
@@ -220,67 +191,19 @@ def _rows(points: list, factor: Optional[float], missing: list) -> list:
     return rows
 
 
-def _csv_bytes(rows: list) -> bytes:
-    """CSV 的字节：**带 BOM 的 UTF-8**、CRLF、表头就是 CSV_COLUMNS。
-
-    BOM 是给 Excel 的：不带它，Windows 上的 Excel 会把中文读成乱码 —— 这张表多半就是
-    双击打开的，为这一步多三个字节值。Python / MATLAB 那边会自己跳过 BOM。
-    """
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, lineterminator="\r\n")
-    w.writeheader()
-    for r in rows:
-        w.writerow(r)
-    return b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
-
-
 def _manifest(info: dict) -> dict:
-    """清单：这一包是什么、从哪来、缺什么、口径是什么 —— 十年后翻出来也读得懂。
+    """清单的内容：把导出这边的 info 拆开喂给 package.manifest。
 
-    每张 PNG 自己身上也有 tEXt（曝光、质心、裁剪矩形），这里再写一遍是因为**表和图要能对上**：
-    只拿到 CSV 的人不用去解 PNG 就知道每张图的尺寸、以及这一组裁没裁过。
+    **键名、那一串解释、包内文件名都住在 package** —— 导入要按同一套键名读回来，
+    两处各写一份就等着"导进来少一栏，不报错"。
     """
-    scan = info["scan"]
     head = _frame_head(info["items"][0][1]) if info["items"] else None
-    notes = [
-        "图是**原样复制**的：没裁过的就是相机原生全幅 16 位灰度；裁过的，盘上本来就是裁过的图"
-        "（文件名不变、尺寸变小），裁剪矩形见 crop 一栏，每张 PNG 自己的 tEXt 里也有一份。",
-        "actual_um 是**采图那一刻的读出位置**，不是命令值 target_um —— 两列都在表里，别混用。",
-        "readback_raw = actual_um ÷ readback_to_um（设备报的原值）。这一列空着 = **没有这个数**"
-        "（没记下是哪台设备采的，或这台设备报的本来就是 µm），不是 0。",
-        "on_target 只是读数与命令值的比较，设备不拿它做任何判据（见 docs 里的设备认识账）。",
-        "taken_at 是 Unix 秒（当时那台机器的钟），taken_at_local 是同一时刻的本地时间。",
-    ]
-    return {
-        "kind": "pi-pzt：一次扫描的原始帧与每点元数据",
-        "exported_at": datetime.fromtimestamp(info["now"]).astimezone().isoformat(
-            sep=" ", timespec="seconds"),
-        "exported_from": str(DATA_DIR),
-        "scan": {
-            "id": scan["id"], "name": scan["name"], "status": scan["status"],
-            "message": scan["message"],
-            "start_um": scan["start_um"], "stop_um": scan["stop_um"],
-            "count": scan["count"], "settle_ms": scan["settle_ms"],
-            "created_at": scan["created_at"], "finished_at": scan["finished_at"],
-            "readback_to_um": scan["readback_to_um"],
-        },
-        "points": {
-            "rows": len(info["rows"]),
-            "images": len(info["items"]),
-            "bytes": info["bytes"],
-            "missing_images": info["missing"],
-        },
-        # 库与文件两边的裁剪记录（对不上就不让导，所以到这儿一定是相等的）
-        "crop": {"db": info["crop_db"], "file": info["crop_file"],
-                 "checked_on": info["sample"]},
-        "frame": ({"width": head[0], "height": head[1], "bits": head[2]} if head else None),
-        "files": {
-            "points": CSV_NAME,
-            "images": f"{len(info['items'])} 张 PNG，文件名与采集时一致",
-            "packed": "zip（ZIP_STORED，只装不压）" if info["zipped"] else "目录（散图 + 两张表）",
-        },
-        "notes": notes,
-    }
+    return package.manifest(
+        info["scan"],
+        rows=len(info["rows"]), images=len(info["items"]), total_bytes=info["bytes"],
+        missing=info["missing"], crop=info["crop_db"], crop_file=info["crop_file"],
+        checked_on=info["sample"], frame=head, zipped=info["zipped"],
+        exported_from=str(DATA_DIR), now=info["now"])
 
 
 def _copy_frames(items: list, rows: list, sink: Callable, progress) -> None:
@@ -316,8 +239,8 @@ def _run_dir(dest: Path, info: dict, progress) -> None:
                               f"（{dst.stat().st_size} ≠ {src.stat().st_size}）")
 
         _copy_frames(info["items"], info["rows"], sink, progress)
-        (dest / CSV_NAME).write_bytes(_csv_bytes(info["rows"]))
-        (dest / MANIFEST_NAME).write_text(
+        (dest / package.CSV_NAME).write_bytes(package.csv_bytes(info["rows"]))
+        (dest / package.MANIFEST_NAME).write_text(
             json.dumps(_manifest(info), ensure_ascii=False, indent=2), "utf-8")
     except Exception:
         # 删的是自己刚造的这一份（目标本来就是从空位里挑的）—— 源文件一个字节没动
@@ -334,8 +257,8 @@ def _run_zip(dest: Path, info: dict, progress) -> None:
                 zf.write(src, arcname=name)
 
             _copy_frames(info["items"], info["rows"], sink, progress)
-            zf.writestr(CSV_NAME, _csv_bytes(info["rows"]))
-            zf.writestr(MANIFEST_NAME,
+            zf.writestr(package.CSV_NAME, package.csv_bytes(info["rows"]))
+            zf.writestr(package.MANIFEST_NAME,
                         json.dumps(_manifest(info), ensure_ascii=False, indent=2))
         _verify_zip(part, info)
         os.replace(part, dest)
@@ -351,8 +274,8 @@ def _verify_zip(part: Path, info: dict) -> None:
     读源文件出错会当场抛 —— 这里要抓的是"包少了条目 / 大小不对"这一类。
     """
     want = {src.name: src.stat().st_size for _, src in info["items"]}
-    want[CSV_NAME] = None
-    want[MANIFEST_NAME] = None
+    want[package.CSV_NAME] = None
+    want[package.MANIFEST_NAME] = None
     with zipfile.ZipFile(part) as zf:
         got = {i.filename: i.file_size for i in zf.infolist()}
     if len(got) != len(want):
@@ -377,7 +300,7 @@ def run(scan_id: int, zipped: bool = False, stamp: Optional[str] = None,
         raise ValueError(
             f"库里的裁剪记录和文件对不上（库 {db_rect or '没记录'}，"
             f"文件 {file_rect or '没记录'}，查的是 {sample}）—— 先查清再导")
-    dest = _free(_dest(scan, stamp or _stamp(), zipped))
+    dest = _free(_dest(scan, stamp or package.stamp(), zipped))
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     info = {
         "scan": scan, "items": items, "missing": missing, "bytes": size,
@@ -411,7 +334,7 @@ def recent(limit: int = 10) -> list:
         one = {"name": p.name, "path": str(p), "zipped": p.is_file(),
                "mtime": p.stat().st_mtime, "bytes": None, "images": None, "done": True}
         if p.is_dir():
-            man = p / MANIFEST_NAME
+            man = p / package.MANIFEST_NAME
             one["done"] = man.exists()      # 清单是最后一步写的：有它才算导完
             if one["done"]:
                 try:

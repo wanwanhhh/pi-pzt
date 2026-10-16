@@ -160,6 +160,9 @@ main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
   border: 1px solid var(--line);
   border-radius: var(--radius);
 }
+/* 同 .view：.card 的 display:flex 会盖掉 [hidden] 的默认 display:none ——
+   不显式写这一条，收起来的那张卡照样占着一半高度（数据页两张图互斥就靠它） */
+.card[hidden] { display: none; }
 .card.fit  { flex: 0 0 auto; }                       /* 只占内容高度 */
 .card.grow { flex: 1 1 0; }                          /* 吃剩余高度（图表/表格/图：不够时自己滚） */
 /* 填满剩余高度，但**不许压到比内容还小**（flex-shrink:0 + basis:auto）：
@@ -185,6 +188,8 @@ main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
 /* 控件分组：把"标签 + 它的输入/按钮"捆成一个盒子 —— 不捆的话，
    .spread 的 space-between 会把标签和它的输入框拆到两处去。 */
 .field { margin-bottom: 10px; }
+/* .stack 用 gap 管间距，里面的 .field 就别再叠一层 margin-bottom（10+10=20） */
+.body.stack > .field { margin-bottom: 0; }
 .field:last-child { margin-bottom: 0; }
 .field > label:first-child { margin-top: 0; }
 /* 卡片长高时控件摊开：多出来的高度**分到各组之间**，看起来是"留白"，
@@ -212,27 +217,17 @@ main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
 /* 频谱图两条手势都能用：横轴（频率）与纵轴（功率/dB）各一个范围框 */
 #spec-chart .u-over { cursor: grab; }
 #spec-chart .u-over.pan { cursor: grabbing; }
-/* 频谱卡的高度由那根横向分栏线（--data-spec）说了算，像素曲线吃掉其余 */
-.view-data .col-data-curve > .card.spec { flex: 0 0 var(--data-spec, 380px); }
+/* 数据页右栏的页签（顶栏那套的小号版）：装在 coltitle 那一行，选看哪张图。
+   有它之后右栏就只有一个 .card.grow 露在外面 —— 不再有"两张卡各分一半高度"那根线。 */
+.coltitle .tabs { margin-left: 0; padding: 2px; gap: 2px; border-radius: 7px; }
+.coltitle .tab { padding: 2px 12px; font-size: 11px; border-radius: 5px; }
 /* dB 是负数、还带 4 位小数（-64.8366），86px 会把最后一位截掉 */
-.card.spec .tools input.mini { width: 96px; }
+#card-spec .tools input.mini { width: 96px; }
+/* 滤波页那行小字（留下哪几根谱线）跟着工具行居中：别带上 .hint 的上外边距 */
+#filt-band { margin: 0; }
 
-/* 数据页：扫描组列表 + 裁剪面板 */
+/* 数据页：裁剪面板 */
 .hint.warn { color: var(--bad); }
-.croplist { max-height: 200px; overflow: auto; margin-bottom: 8px; }
-.croprow {
-  display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
-  font: inherit; color: inherit; cursor: pointer;
-  background: var(--card); border: 1px solid var(--line); border-radius: 6px;
-  padding: 5px 8px; margin-bottom: 4px;
-}
-.croprow:hover { background: #f8fafc; border-color: #cbd5e1; }
-.croprow b { flex: 0 0 auto; }
-.croprow span { flex: 1 1 auto; color: var(--muted); font-size: 12px; }
-.croprow em { flex: 0 0 auto; font-style: normal; font-size: 12px; color: var(--muted); }
-.croprow em.on { color: var(--ok); }
-.croprow em.no { color: var(--warn); }
-.croprow.dim { opacity: .55; }
 
 /* 裁剪面板：红框里是**将要留下**的那一块，框外压暗；四个数一律是原始坐标。
    导出面板跟它共用这套遮罩与盒子（.cropbox / .cropside），只是里面没有图要看。 */
@@ -294,6 +289,8 @@ button.warn:hover:not(:disabled) { background: #b45309; }
 button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
 button.danger:hover:not(:disabled) { background: #b91c1c; }
 button.ghost { padding: 2px 9px; font-size: 12px; color: var(--muted); }
+/* 「说明」按钮：展开时按钮自己也变个样 —— 下面多出那一块字是哪儿来的，一眼看得出来 */
+button.ghost[aria-expanded="true"] { background: #e2e8f0; color: var(--text); }
 
 .row { display: flex; gap: 6px; align-items: center; }
 .row > * { min-width: 0; }
@@ -332,6 +329,14 @@ button.ghost { padding: 2px 9px; font-size: 12px; color: var(--muted); }
 /* 窄栏（预览卡）用这个：按 90px 起排，两列刚好放得下 */
 .stats-tight { grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px 12px; }
 .stats-tight dd { font-size: 15px; }
+/* 宽卡上的统计条（数据页那两页）：**排成一行小字**。「扫描点 2500 · 有值 2500 · …」读起来是
+   一串数；铺满 6 格时每个数字之间隔 200px，读起来是一屏散点（而且白占 40px 高）。
+   用法：class="stats inline"。一行放不下的窄卡别用（会折成两行，跟铺满一样高）。 */
+.stats.inline {
+  display: flex; flex-wrap: wrap; gap: 2px 22px; margin: 10px 0 0; align-items: baseline;
+}
+.stats.inline > div { flex-direction: row; gap: 6px; align-items: baseline; }
+.stats.inline dd { font-size: 14px; }
 
 /* ---------- 进度 ---------- */
 /* 进度条不能也叫 .bar：那个类名是顶栏的，两个规则会互相改。 */
@@ -374,6 +379,30 @@ td.bad { color: var(--bad); }
 /* 大图弹窗里那两张剖面：固定高度，不跟着弹窗长 */
 .chart.prof { flex: 0 0 auto; height: 150px; }
 .u-legend { font-size: 12px; }
+
+/* ---------- 数据页：相位图 ---------- */
+/* 画布的**内部分辨率永远是盘上那张图的像素数**（拾取坐标不做换算，见 mapPick），
+   CSS 只把它缩进框里 —— 相位图是"每个像素一个颜色"，缩放怎么插值都不影响取值。
+   暗底 + 居中：幅面比框长时按比例缩，四周留一点边，不裁不拉。 */
+.mapbox {
+  flex: 1 1 0; min-height: 0; padding: 4px; border-radius: 6px; background: var(--dark);
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+.mapbox canvas {
+  display: block; max-width: 100%; max-height: 100%;
+  image-rendering: pixelated;   /* 1:1 附近别糊成一团 —— 相位图上看的是色块边界 */
+  cursor: crosshair;
+}
+/* 色标（图例）：一条 256×1 的 canvas 拉宽 —— 颜色由 app.js 的配色表说了算，这里只管形状 */
+.mapscale { padding: 2px 6px 0; flex: 0 0 auto; }
+.mapscale canvas {
+  display: block; width: 100%; height: 10px;
+  border: 1px solid var(--line); border-radius: 3px;
+}
+.mapscale-x {
+  display: flex; justify-content: space-between;
+  font-size: 11px; color: var(--muted); margin-top: 2px;
+}
 
 /* ---------- 相机预览 ---------- */
 /* 画面区是**暗底信箱**：图片按比例缩到框里，框本身吃满卡片剩余高度。

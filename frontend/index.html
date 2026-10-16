@@ -238,7 +238,10 @@
       <section class="card grow" id="card-history">
         <div class="head">
           <h2>历史扫描</h2>
-          <div class="right"><button id="btn-refresh" class="ghost">刷新</button></div>
+          <div class="right">
+            <button id="btn-import" class="ghost">导入数据…</button>
+            <button id="btn-refresh" class="ghost">刷新</button>
+          </div>
         </div>
         <div class="body">
           <table id="history">
@@ -379,34 +382,38 @@
     <div class="col col-data-ctl">
       <p class="coltitle">取数 · 哪条扫描、哪个像素</p>
 
-      <section class="card fill">
+      <!-- 一张卡：选扫描、定像素都是「这一次取数的输入」，本来就是一件事。
+           从前拆成两张带 .fill 的卡，栏高 962px 时各被撑到 477 / 444（内容只占 ~430），
+           看着就是两片空格子 —— 合成一张、按内容高（.fit）。 -->
+      <section class="card fit">
         <div class="head">
-          <h2>扫描</h2>
+          <h2>取数</h2>
           <div class="right"><button id="btn-data-refresh" class="ghost">刷新</button></div>
         </div>
-        <div class="body">
-          <label for="data-scan">选一条</label>
-          <select id="data-scan"></select>
-          <p class="hint" id="data-scan-info">—</p>
-
-          <label for="data-source">这条是哪台设备采的</label>
-          <select id="data-source"
-                  title="位置读回口径是**设备属性**（µm = 读回值 × 系数）：XMT 的读回是 4/3 µm，PI 报的就是 µm。建扫描时按当时那台设备自动记下；加这一列之前的老数据没记，只能在这里指认一次。指认只写「这条是哪台设备」这一个字段 —— 各点的读数、图、曲线一个字节都不动。"></select>
-          <p class="hint" id="data-source-note">—</p>
-        </div>
-      </section>
-
-      <section class="card fill">
-        <div class="head"><h2>像素</h2></div>
-        <div class="body">
-          <div class="form2">
-            <div><label for="data-x">X（列）</label><input id="data-x" type="number" min="0" step="1" value="720"></div>
-            <div><label for="data-y">Y（行）</label><input id="data-y" type="number" min="0" step="1" value="540"></div>
+        <div class="body stack">
+          <div class="field">
+            <label for="data-scan">选一条扫描</label>
+            <select id="data-scan"></select>
+            <p class="hint" id="data-scan-info">—</p>
           </div>
-          <div class="row top"><button id="btn-data-draw" class="primary grow1">画曲线</button></div>
-          <p class="hint">坐标是<b>保存的 PNG 自己的</b>坐标（原生幅面、传感器朝向）——
-            与质心、图库大图上的剖面同一套，不受预览朝向影响。
-            <b>裁剪过的扫描也是这一套坐标</b>：不用换算，也不用管裁没裁过。</p>
+
+          <div class="field">
+            <label for="data-source">这条是哪台设备采的</label>
+            <select id="data-source"
+                    title="位置读回口径是**设备属性**（µm = 读回值 × 系数）：XMT 的读回是 4/3 µm，PI 报的就是 µm。建扫描时按当时那台设备自动记下；加这一列之前的老数据没记，只能在这里指认一次。指认只写「这条是哪台设备」这一个字段 —— 各点的读数、图、曲线一个字节都不动。"></select>
+            <p class="hint" id="data-source-note">—</p>
+          </div>
+
+          <div class="field">
+            <div class="form2">
+              <div><label for="data-x">X（列）</label><input id="data-x" type="number" min="0" step="1" value="720"></div>
+              <div><label for="data-y">Y（行）</label><input id="data-y" type="number" min="0" step="1" value="540"></div>
+            </div>
+            <div class="row top"><button id="btn-data-draw" class="primary grow1">画曲线</button></div>
+            <p class="hint">坐标是<b>保存的 PNG 自己的</b>坐标（原生幅面、传感器朝向）——
+              与质心、图库大图上的剖面同一套，不受预览朝向影响。
+              <b>裁剪过的扫描也是这一套坐标</b>：不用换算，也不用管裁没裁过。</p>
+          </div>
         </div>
       </section>
 
@@ -417,11 +424,21 @@
          role="separator" aria-orientation="vertical" aria-label="拖动调整取数栏宽度（双击复位，方向键微调）" tabindex="0"></div>
 
     <div class="col col-data-curve">
-      <p class="coltitle">曲线 · 这个像素随扫描位置怎么变</p>
+      <!-- 右栏是**一张图的位置**：像素曲线与频谱用上面那行页签换（同一时刻只显示一张）。
+           上下摆时谱只剩 155px 高，而"看谱"通常是看出曲线异常之后的下一步，不是同时盯两边。 -->
+      <p class="coltitle">
+        <span class="tabs" role="tablist" aria-label="右栏看哪张图">
+          <button id="data-tab-curve" class="tab active" role="tab" aria-selected="true">像素曲线</button>
+          <button id="data-tab-spec" class="tab" role="tab" aria-selected="false">频谱</button>
+          <button id="data-tab-filt" class="tab" role="tab" aria-selected="false">滤波曲线</button>
+          <button id="data-tab-map" class="tab" role="tab" aria-selected="false">相位图</button>
+        </span>
+        <span id="data-tab-note">这个像素随扫描位置怎么变</span>
+      </p>
 
-      <section class="card grow">
+      <section class="card grow" id="card-curve">
         <div class="head">
-          <h2>像素曲线<span class="sub" id="data-title">未取数</span>
+          <h2><span class="sub" id="data-title">未取数</span>
             <span class="sub" id="data-xpin" hidden>横轴范围已钉住</span>
             <span class="sub" id="data-order-note" hidden>已按横轴排序（不是采图顺序）</span>
             <span class="sub" id="data-crop" hidden>已裁剪</span>
@@ -432,6 +449,8 @@
                     title="位置读回口径换一种读法：**折算** = 按设备声明的系数折成 µm（XMT 是 ×0.75）；**原值** = 设备当时报的数（µm ÷ 系数，XMT 上就是厂商上位机显示的那套数）。同一串位置的两种读法，后端四列一起下发 —— 切换不重新取数；范围和频谱跟着换算过去。系数没记下（老数据）或本来就是 1（PI）时禁用，按钮上会写明为什么。">口径：折算 µm</button>
             <button id="btn-data-axis" class="ghost"
                     title="横轴换一种读法：位置 = 台子走到哪（采图那一刻的读数）；时间 = 光走那段往返光程要多久（光程差 = 2×位移，再除以 c，跟波长无关）。同一串数换刻度，不重新取数。">横轴：位置 (µm)</button>
+            <button id="btn-data-note" class="ghost" aria-expanded="false"
+                    title="这一页的口径（横轴读的是哪个数、时间怎么来的、纵轴是什么、数据从哪来）—— 点开看，看完收起">说明</button>
           </div>
         </div>
         <div class="tools">
@@ -449,7 +468,7 @@
           </select>
         </div>
         <div class="chart" id="data-chart"></div>
-        <dl class="stats">
+        <dl class="stats inline">
           <div><dt>扫描点</dt><dd id="data-n">—</dd></div>
           <div><dt>有值</dt><dd id="data-ok">—</dd></div>
           <div><dt>没图的点</dt><dd id="data-missing">—</dd></div>
@@ -458,7 +477,7 @@
           <div><dt>幅面 · 位深 · 满量程</dt><dd id="data-size">—</dd></div>
         </dl>
         <p class="hint" id="data-empty">还没有取数。左边选一条扫描、填上像素坐标，点「画曲线」。</p>
-        <p class="hint">横轴默认是<b>采图那一刻记下来的读出位置</b>（µm —— 不是命令值、也不是点序号）；
+        <p class="hint" id="data-note" hidden>横轴默认是<b>采图那一刻记下来的读出位置</b>（µm —— 不是命令值、也不是点序号）；
           点右上角那个按钮可换成<b>时间</b>（fs）：光在干涉仪里往返一趟，光程差 = 2×位移，
           再除以 c（1 µm 位移 = 6.6713 fs，<b>跟波长无关</b>）。
           横轴上<b>滚轮缩放、按住拖动平移</b>（改完就写进左边范围框、算钉住，「自动范围」一键复位）。
@@ -467,16 +486,11 @@
           没图的点给不上值，曲线在那儿断开。</p>
       </section>
 
-      <!-- 分栏线：拖动改频谱卡的高度（双击复位，方向键微调）；曲线吃掉其余。
-           与页面级那几根线走同一套（见 app.js 的 wireGutters）。 -->
-      <div class="gutter gutter-h" data-var="--data-spec" data-axis="y" data-of="next"
-           role="separator" aria-orientation="horizontal" aria-label="拖动调整频谱卡高度（双击复位，方向键微调）" tabindex="0"></div>
-
-      <!-- 频谱：对上面那条曲线做傅里叶变换。口径全写在下面那两句里 ——
-           动采样口径（真实点间距 / 整条 / 去均值 / 不加窗）之前先读它们。 -->
-      <section class="card spec">
+      <!-- 频谱：对曲线做傅里叶变换。它与曲线**同一时刻只显示一张**（页签在上面那行），
+           所以两张都是 .grow：露出来的那张吃满整栏。 -->
+      <section class="card grow" id="card-spec" hidden>
         <div class="head">
-          <h2>频谱<span class="sub" id="spec-title">未取数</span>
+          <h2><span class="sub" id="spec-title">未取数</span>
             <span class="sub" id="spec-xpin" hidden>频率范围已钉住</span>
             <span class="sub" id="spec-ypin" hidden>纵轴范围已钉住</span>
           </h2>
@@ -485,6 +499,8 @@
                     title="频谱横轴换一种读法：频率（THz）或波长（µm，λ = c/ν）。**同一串数换刻度** —— 每根谱线的功率不变、只换横坐标（不是密度换算、不乘雅可比因子）；波长刻度上疏密不均（λ 与 1/ν 成正比），所以分辨率仍按频率写。换算系数来自后端，前端不写死。">横轴：频率 (THz)</button>
             <button id="btn-spec-db" class="ghost"
                     title="纵轴换一种读法：功率 = 该频率上正弦分量的均方功率（(A²+B²)/2，纯正弦幅度 A 进来峰高就是 A²/2）；dB = 相对这条谱里最强的那根（0 dB = 最强）。同一串数换刻度，不重算、不重新取数。">纵轴：功率 (ADU²)</button>
+            <button id="btn-spec-note" class="ghost" aria-expanded="false"
+                    title="谱是怎么算出来的、右边那条相位是什么（真实点间距、整条参与、去均值、不加窗、按采图顺序、缺一个点整条不算、相位只在有信号的地方画）—— 点开看，看完收起">说明</button>
           </div>
         </div>
         <div class="tools">
@@ -494,6 +510,8 @@
           <input id="spec-xmax" class="mini" type="number" step="any">
           <button id="btn-spec-fit" class="ghost"
                   title="按这条谱把频率轴铺满；滚轮/拖动改过的范围也用它复位">自动范围</button>
+          <button id="btn-spec-peak" class="ghost"
+                  title="把频率轴收到最**强**那根附近（宽度 = 它自己的 20%，太窄时至少 20 根谱线宽）。**只是替你把两个数填进范围框并钉住** —— 与「自动范围」同一层，框仍然是唯一的准，之后照旧可以滚轮/拖动改。多数谱的有用分量挤在低频那一小段，铺满整条轴（一直铺到 Nyquist）时它们是贴边的一根线。">聚焦最强峰</button>
           <span class="tsep"></span>
           <label class="mini" for="spec-ymin" id="spec-ymin-k">功率最小 (ADU²)</label>
           <input id="spec-ymin" class="mini" type="number" step="any">
@@ -501,9 +519,13 @@
           <input id="spec-ymax" class="mini" type="number" step="any">
           <button id="btn-spec-yfit" class="ghost"
                   title="按这条谱把纵轴铺满；滚轮/拖动改过的范围也用它复位">自动范围</button>
+          <span class="tsep"></span>
+          <label class="mini" for="spec-phmin">相位门限 (dB)</label>
+          <input id="spec-phmin" class="mini" type="number" step="any" value="-20"
+                 title="右边那条相位只在**有信号**的地方有意义：只画功率不低于「最强那根 − 这个数」的谱线，其余留空、曲线断开。噪声底上两个几乎为零的数相除，出来的是随机相位 —— 画出来是噪声，不是相位。留空 = 不设门限（整条照画）。">
         </div>
         <div class="chart" id="spec-chart"></div>
-        <dl class="stats stats-tight">
+        <dl class="stats inline">
           <div><dt>变换点数</dt><dd id="spec-n">—</dd></div>
           <div><dt>真实跨度 (fs)</dt><dd id="spec-span">—</dd></div>
           <div><dt id="spec-df-k">频率分辨率 (THz)</dt><dd id="spec-df">—</dd></div>
@@ -512,7 +534,7 @@
           <div><dt>峰值 (ADU²)</dt><dd id="spec-peakval">—</dd></div>
         </dl>
         <p class="hint" id="spec-empty">还没有取数。上面画出曲线之后，这里就是它的频谱。</p>
-        <p class="hint">横轴可以换<b>频率</b>（THz）或<b>波长</b>（µm，λ = c/ν）—— 同一串数换刻度，
+        <p class="hint" id="spec-note" hidden>横轴可以换<b>频率</b>（THz）或<b>波长</b>（µm，λ = c/ν）—— 同一串数换刻度，
           每根谱线的功率不变、只换横坐标（波长刻度上疏密不均，所以分辨率那一格仍按频率写）。
           纵轴是<b>功率谱</b>：每个点按<b>它自己那一刻的时间</b>
           （真实点间距 —— 不插值、不假设等间隔）拟合出这个频率上的正弦分量，功率 = (A²+B²)/2，
@@ -520,7 +542,183 @@
           已去均值（直流那根柱子会压掉别的峰，不画）、不加窗，<b>整条扫描的全部点</b>（可视范围只影响看，不参与变换），
           一律按<b>采图顺序</b>（与上面那个「连线顺序」无关）。频率步长 = 1/T（T 是真实首末跨度），
           上限卡在<b>名义 Nyquist</b> = 1/(2×平均间距)：越界给的是混叠，不是信息。
-          <b>缺一个点（没采到图 / 没记下读数）整条就不算</b> —— 谱里没有"断开"这回事，补一个数出来就是另一条序列。</p>
+          <b>缺一个点（没采到图 / 没记下读数）整条就不算</b> —— 谱里没有"断开"这回事，补一个数出来就是另一条序列。
+          <b>右边那条是相位</b>：每根谱线解出来的分量相对<b>这条序列里最早那一拍（t0）</b>的相位
+          （A·cos + B·sin = R·cos(2πf(t−t0) − φ)，所以 φ = atan2(B, A)），单位是<b>弧度</b>，写在 (−π, π] 里 ——
+          图上那一跳是绕回来，不是数据跳变。<b>相位只在有信号的地方有意义</b>：
+          「相位门限」那个框以下的谱线不画（留空、曲线断开）—— 那两个数都几乎是零，相除出来的相位是随机的
+          （画出来是噪声，不是相位）；框里留空就是不设门限。相位与频率刻度是同一套：
+          换口径、换频率/波长轴时它跟着一起换，不重新取数、也不重算谱。
+          右边这条轴<b>只有自动范围</b>（没有范围框、也不吃滚轮/拖动）—— 它按门限内那些谱线自己铺满
+          （整条；缩放、平移都不带动它，所以两个窗口的相位能直接对看）。</p>
+      </section>
+
+      <!-- 滤波：在频率域上只留下选中的那段波长，再加回时域。**同一批点、不插值、不重采样** ——
+           每个点用还是它自己那一刻的时间。口径（非均匀最小二乘 / 上限卡 Nyquist / 硬截断 /
+           直流不加回）写在下面那段说明里，动之前先读它。 -->
+      <section class="card grow" id="card-filt" hidden>
+        <div class="head">
+          <h2><span class="sub" id="filt-title">未取数</span>
+            <span class="sub" id="filt-xpin" hidden>横轴范围已钉住</span>
+            <span class="sub" id="filt-ypin" hidden>纵轴范围已钉住</span>
+          </h2>
+          <div class="right">
+            <button id="btn-filt-axis" class="ghost"
+                    title="横轴换一种读法：位置 = 台子走到哪（采图那一刻的读数）；时间 = 光走那段往返光程要多久。与像素曲线**同一个读法**（同一次取数、同一批点），切换不重新取数、也不重算滤波。">横轴：位置 (µm)</button>
+            <button id="btn-filt-note" class="ghost" aria-expanded="false"
+                    title="这条曲线是怎么来的、右边那条相位是怎么算的（留下哪几根谱线、均值怎么处理、边界与上限在哪里、相位怎么展开）—— 点开看，看完收起">说明</button>
+          </div>
+        </div>
+        <div class="tools">
+          <label class="mini" for="filt-lmin">波长最小 (µm)</label>
+          <input id="filt-lmin" class="mini" type="number" step="any">
+          <label class="mini" for="filt-lmax">波长最大 (µm)</label>
+          <input id="filt-lmax" class="mini" type="number" step="any">
+          <button id="btn-filt-all" class="ghost"
+                  title="清空两个框 = 不滤（0 ~ Nyquist 整段都留着，等于原曲线）。">全通</button>
+          <span class="tsep"></span>
+          <button id="btn-filt-flat" class="ghost"
+                  title="显示 / 隐藏「傅里叶变换极限」那条曲线（紫色细线）：同一段谱线、同样的幅度，只把每一根的相位拉平到**离包络的时间重心最近的那一拍**（真实采样点，不插值）—— 就是「这条带一点色散都没有时该长的样子」。两条曲线在信号最强处同相（极限那条的峰更高：各根同时到顶，没有互相抵消），分开的地方就是色散 / 啁啾。点一下立即开关：只改显示，不重新取数、不重算、也不动已经拖好的范围。">傅里叶极限：显示</button>
+          <span class="tsep"></span>
+          <span class="hint" id="filt-band">—</span>
+        </div>
+        <div class="tools">
+          <label class="mini" for="filt-xmin" id="filt-xmin-k">X 最小 (µm)</label>
+          <input id="filt-xmin" class="mini" type="number" step="any">
+          <label class="mini" for="filt-xmax" id="filt-xmax-k">X 最大 (µm)</label>
+          <input id="filt-xmax" class="mini" type="number" step="any">
+          <button id="btn-filt-fit" class="ghost"
+                  title="按这条曲线把横轴铺满；滚轮/拖动改过的范围也用它复位">自动范围</button>
+          <span class="tsep"></span>
+          <label class="mini" for="filt-ymin">幅度最小 (ADU)</label>
+          <input id="filt-ymin" class="mini" type="number" step="any">
+          <label class="mini" for="filt-ymax">幅度最大 (ADU)</label>
+          <input id="filt-ymax" class="mini" type="number" step="any">
+          <button id="btn-filt-yfit" class="ghost"
+                  title="按画在纵轴上的那三条（滤波后 + 傅里叶极限 + 包络，**隐藏的那条也算**）铺满 —— 只按滤波后算的话，极限那条的尖顶会画到窗外；滚轮/拖动改过的范围也用它复位">自动范围</button>
+          <span class="tsep"></span>
+          <label class="mini" for="filt-phmin">相位门限 (dB)</label>
+          <input id="filt-phmin" class="mini" type="number" step="any" value="-20"
+                 title="右边那条相位只在**包络还够大**的地方有意义：只画包络不低于「这一段最大包络 − 这个数」的点，其余留空、曲线断开。相位其实**每个点都算得出**，掐掉的是**算得出但不可复现**的那些 —— 包络掉下去的地方是几根谱线互相抵消，那两个分量都接近零，加一个灰阶的噪声相位就能翻（实测谷底抖 0.84 rad：画出来是噪声，不是相位）。留空 = 不设门限（整条照画）。">
+        </div>
+        <div class="chart" id="filt-chart"></div>
+        <dl class="stats inline">
+          <div><dt>留下谱线</dt><dd id="filt-n">—</dd></div>
+          <div><dt>波长范围 (µm)</dt><dd id="filt-range">—</dd></div>
+          <div><dt>真实跨度 (fs)</dt><dd id="filt-span">—</dd></div>
+          <div><dt>峰-谷 (ADU)</dt><dd id="filt-pp">—</dd></div>
+          <div><dt>滤掉的 RMS (ADU)</dt><dd id="filt-rms">—</dd></div>
+          <div><dt>像素均值 (ADU)</dt><dd id="filt-mean" title="这条曲线是纯带通结果（绕 0 摆），直流**没有加回图上** —— 它就是像素曲线的均值这个数；要看它跟像素曲线的量级关系，把这个数加上去就是了。">—</dd></div>
+          <div><dt>强度半高宽</dt><dd id="filt-fwhm" title="包络降到峰值的 **1/√2** 处的宽度 —— 强度 ∝ 包络²，所以这就是强度半高宽（两种说法是同一对交点）。曲线本身不带直流，所以直接比就行。从峰值向两侧找第一个低于该值的点、两头线性插值；任一侧一直没降下去就写「未降到」，不编一个数。按**整条**算（可视范围只管看），与相位门限无关（门限只管相位画不画）。">—</dd></div>
+          <div><dt>条纹频率 (THz)</dt><dd id="filt-fringe">—</dd></div>
+          <div><dt>相位残差 峰-谷 (rad)</dt><dd id="filt-phpp">—</dd></div>
+          <div><dt>逐点最大步长 (rad)</dt><dd id="filt-phstep">—</dd></div>
+        </dl>
+        <p class="hint" id="filt-empty">还没有取数。上面画出曲线之后，这里就是它的带通重建。</p>
+        <p class="hint" id="filt-note" hidden><b>滤波 = 只留下选中的那几根谱线，再加回时域</b>：
+          每个点用的还是<b>它自己那一刻的时间</b>（与算谱同一份非均匀最小二乘），所以<b>不插值、不重采样</b> ——
+          每个点还是原来那个点，只是纵轴的值换成了"只由选中的频段构成"的那个数。
+          两个框<b>留空 = 全通</b>（0 ~ Nyquist 整段都留着）；只填一边，另一边就是不限。
+          上限卡在<b>名义 Nyquist</b>（与频谱那张图同一个上限）—— 填的波长比它对应的还短时，
+          只有落在谱里的那几根能被留下，界面上会把实际留下的谱线数与波长区间写出来。
+          边界是<b>硬截断</b>（保留的就是谱上选中那几根，不加过渡带），所以时域会有振铃 ——
+          那是截断本身的形状，不是数据。<b>直流（均值）没有加回来</b> —— 这条线就是纯带通结果，绕 0 摆；
+          像素的均值写在统计条里，要看它跟像素曲线的量级关系，把这个数加上去就是了。
+          <b>灰细线是包络</b>（|解析信号|，与幅度同一个单位）—— 它掉下去的地方就是"这一段没什么条纹"。
+          <b>紫细线是傅里叶变换极限</b>：同一段谱线、同样的幅度，只把每一根的相位拉平到同一个基准上
+          —— <b>基准点 = 离包络的时间重心最近的那一拍</b>（重心按包络加权算，比取峰值稳；
+          落点取**真实存在的那个采样点**，不插值），那一刻的载波相位就是 ψ0；
+          换句话说就是<b>这条带一点色散都没有时该长的样子</b>。
+          两条曲线在信号最强处<b>同相</b>（极限那条的峰是 Σ|c_k|，各根同时到顶，所以更高一点），
+          所以<b>一根谱线的波段上这两条线逐点重合</b> —— 单根谈不上互相抵消。
+          只在两翼分开 —— <b>分开的地方就是色散 / 啁啾</b>。它跟相位门限无关（门限只管相位画不画），
+          也不吃可视范围框；换波段、换横轴读法都跟着一起走。右边那个〈傅里叶极限〉按钮只管画不画它：
+          点一下立即开关，<b>不重新取数、也不重算</b>。
+          统计条里的<b>强度半高宽</b>：强度 ∝ 包络²，所以强度降到一半 = 包络降到峰值的 <b>1/√2</b> 处
+          （曲线本身不带直流，直接比就行；从峰值向两侧找第一个低于它的点、两头插值）；
+          两侧有一侧一直没降下去就写「未降到」。整条算，与相位门限无关。
+          <b>右边那条是相位</b>：把留下的每一根写成复数 <b>A−iB 乘 e^(iθ)</b>、加起来取辐角
+          （就是这条带通信号的<b>解析信号（Hilbert）相位</b> —— 分量本来就解出来了，所以不做变换、不卷积），
+          模就是上面那条包络。相位要做三件事：<b>① 沿采图顺序展开</b>（整段本来就是几十圈的大斜坡，
+          不展开是一排锯齿）—— 展开的前提是相邻两点相位差小于 π，统计条里的「逐点最大步长」就是这个数，
+          它接近 π 时展开不可信（<b>全通时就是这样</b>：最高那根贴着 Nyquist，别看相位）；
+          <b>② 减掉带内功率重心频率那条线性相位、以第一个采样点为 0</b>（用带重心，不拟合直线）——
+          不减掉的话 ±π/2 的细节在 193 圈的斜线上是零像素；<b>③ 门限</b>：包络低于「相位门限」的点不画
+          （留空、断开）—— 相位其实<b>每个点都算得出</b>，掐掉的是"算得出但不可复现"的那些：包络越小，
+          那两个分量越接近零，同样的噪声就能让相位翻得越厉害（实测给整条曲线加 ±1 灰阶：包络最强的点
+          抖 0.002 rad，谷底抖到 0.84 rad）。想整条都看，把门限框<b>留空</b>就行。
+          它跟着读法走：换口径、换位置/时间轴时，相位和刻度一起换。
+          单位是<b>弧度</b>（atan2 出来的原样，不换算）。右边这条轴<b>只有自动范围</b>（没有范围框、
+          也不吃滚轮/拖动），按画出来的相位自己铺满。</p>
+      </section>
+
+      <!-- 相位图：把〈滤波曲线〉那张卡选中的那段波长，一次用在**整幅图的每个像素**上 ——
+           每个像素跟基准像素差多少相位，整片一眼看。它是**一遍读盘**换来的（未裁剪 2000 张
+           十几秒），所以按钮起算、后台跑、进度跟着走；**换基准像素只是减一个常数**，瞬时重画。
+           坐标与取数、剖面同一套（原始坐标）—— 裁过也只改读文件那一层。 -->
+      <section class="card grow" id="card-map" hidden>
+        <div class="head">
+          <h2><span class="sub" id="map-title">未算</span>
+            <span class="sub" id="map-stale" hidden>波段改过，点重算</span>
+          </h2>
+          <div class="right">
+            <button id="btn-map-view" class="ghost"
+                    title="看哪一张：**相位差**（每个像素跟基准差多少弧度 —— 同一色 = 同一相位，绕圈）或 **条纹强度**（哪里有干涉条纹、哪里没信号）。同一份结果换着看，不重算、不重读盘。">看：相位差</button>
+            <button id="btn-map-note" class="ghost" aria-expanded="false"
+                    title="这张图的口径（波段从哪来、相位怎么定、基准是什么、单位与绕圈、门限、代价）—— 点开看，看完收起">说明</button>
+          </div>
+        </div>
+        <div class="tools">
+          <button id="btn-map-run" class="primary">算相位图</button>
+          <span class="hint" id="map-band">—</span>
+          <span class="tsep"></span>
+          <button id="btn-map-ref" class="ghost"
+                  title="把基准像素换成〈取数〉里填的那一个（你正在看曲线的那一点）。基准只决定「零在哪」，整片形状不变；它得落在**有信号**的地方，不然整幅图会整体转一个随机的角。">基准＝取数像素</button>
+          <label class="mini" for="map-phmin">强度门限 (dB)</label>
+          <input id="map-phmin" class="mini" type="number" step="any" value="-20"
+                 title="相对**最强那个像素**的 dB：以下的像素涂成深灰（不是把相位当成 0）。那里条纹太弱，相位是「算得出却不可复现」的那些 —— 噪声底上两个几乎为零的数相除。留空 = 不设门限。">
+          <span class="hint" id="map-progress">—</span>
+        </div>
+        <div class="mapbox"><canvas id="map-canvas" width="8" height="8"></canvas></div>
+        <!-- 色标（图例）：与相图**同一份配色表**（app.js 的 MAP_LUT）现画的一条，CSS 只负责拉宽。
+             刻度文字由 mapBarPaint 写（切相位/强度时跟着换）。 -->
+        <div class="mapscale">
+          <canvas id="map-bar" width="256" height="1"></canvas>
+          <div class="mapscale-x">
+            <span id="map-bar-lo">−π</span><span id="map-bar-mid">0</span><span id="map-bar-hi">+π</span>
+          </div>
+        </div>
+        <dl class="stats inline">
+          <div><dt>基准像素</dt><dd id="map-ref">—</dd></div>
+          <div><dt>幅面</dt><dd id="map-size">—</dd></div>
+          <div><dt>留下谱线</dt><dd id="map-lines">—</dd></div>
+          <div><dt>公共载波</dt><dd id="map-carrier" title="全图共用的那一个参考频率 —— 取的是留下那一段的正中间那一根。像素之间的差与它同源，所以差值与它无关（它只决定"跟谁比"）。">—</dd></div>
+          <div><dt>Δφ 范围 (rad)</dt><dd id="map-range">—</dd></div>
+          <div><dt>门限以下</dt><dd id="map-blank">—</dd></div>
+        </dl>
+        <p class="hint" id="map-hover">鼠标停在图上：读出那一点跟基准差多少。</p>
+        <p class="hint" id="map-empty">还没有算。左边选一条扫描，在〈滤波曲线〉那张卡里填好波长范围（就是条纹那一段），再点「算相位图」。</p>
+        <p class="hint" id="map-note" hidden><b>这张图答的是「每个像素跟基准像素差多少相位」</b>：
+          把〈滤波曲线〉那张卡选中的<b>同一段波长</b>用在整幅图的每个像素上 —— 每个点还是用它
+          <b>自己那一刻的时间</b>（与那条曲线同一份非均匀最小二乘：不插值、不重采样），得到每个像素的
+          带通信号，再让它与<b>全图共用的一条载波</b>（留下那一段正中间那一根）相关、取幅角（弧度）；
+          图上画的是<b>它减掉基准像素</b>的那一个。像素之间的差与载波取哪一根无关（全图同一根），
+          所以基准只管「零在哪」—— 换基准**不重算**，点图上任意一处就是换基准。
+          <b>为什么不能拿〈滤波曲线〉那条相位平均</b>：那条把首点锚成 0、还减掉了每像素自己的线性相位
+          （为了看残差）—— 被锚掉的那个常数<b>正是这里要量的东西</b>，两条相减会几乎恒等于 0。
+          配色是<b>顺序色图</b>（MATLAB jet 那种：深蓝 → 青 → 绿 → 黄 → 深红），哪一色是多少照
+          图下方那条<b>色标</b>读。相位是<b>绕圈</b>的（写在 (−π, π]）：两端 −π 与 +π 分居蓝、红
+          两头，所以图上<b>红贴着蓝</b>的那条缝是绕圈、不是数据跳变（差超过半个条纹处颜色会重复）；
+          <b>本版不做空间解包裹</b>。
+          <b>深灰 = 门限以下</b>：那里条纹太弱，相位算得出却不可复现，所以涂掉 —— 不是把它当成 0
+          （框里留空 = 不设门限，整片都画）。切「条纹强度」看的是同一个复数的大小 |R|：
+          哪块有干涉条纹、哪块没有，一眼就看出来。
+          <b>一遍读盘</b>：算一次要把这条扫描的每一帧读一遍（未裁剪 2000 张约十几秒，裁到 400×300 约 1 s）；
+          换波段、换扫描要重算，换基准、切相位/强度、改门限都不用。数据全部来自盘上<b>已经落盘的帧</b>：
+          不重采、不碰设备，扫描跑着也能算（会跟采图抢磁盘，界面上先提醒一句）。
+          <b>缺一个点（没图 / 没记读数）整条不算</b> —— 与频谱那张图同一条规矩：补一个数出来就是另一条序列。
+          坐标是<b>保存的 PNG 自己的坐标</b>（与质心、剖面、取数同一套）：裁过的扫描也是这一套，
+          偏移只在读文件那一层减一次，所以图上点出来的坐标直接能填进〈取数〉。</p>
       </section>
     </div>
 
@@ -529,7 +727,7 @@
 </main>
 
 <div id="toast"></div>
-  <!-- 裁剪面板：点「扫描组」里的一组打开。矩形一律是**原始坐标**，
+  <!-- 裁剪面板：在历史表那一行点「裁剪」打开（裁的只有这一条扫描）。矩形一律是**原始坐标**，
        代表帧只是用来看框住没有（红框 = 将要留下的那一块） -->
   <div id="croppanel" hidden>
     <div class="cropbox">
@@ -540,7 +738,7 @@
       <div class="cropbody">
         <div class="croppreview">
           <div class="cropframe">
-            <img id="crop-img" alt="这一组的代表帧">
+            <img id="crop-img" alt="这一条的代表帧">
             <div id="crop-rect"></div>
           </div>
           <p class="hint">这是<b>8 位映射</b>（原值 ÷4，与图库同一口径）—— 16 位原值直接给浏览器看是整片黑的。
@@ -555,12 +753,11 @@
           </div>
           <div class="row top">
             <button id="btn-crop-fit" class="ghost">用建议框</button>
-            <button id="btn-crop-run" class="primary grow1">裁剪这一组</button>
+            <button id="btn-crop-run" class="primary grow1">裁剪这一条</button>
           </div>
           <p class="hint" id="crop-info">—</p>
           <p class="hint warn" id="crop-warn" hidden></p>
           <p class="hint" id="crop-progress" hidden></p>
-          <div id="crop-scans" class="croplist"></div>
         </div>
       </div>
     </div>
@@ -568,7 +765,7 @@
 
   <!-- 导出面板：把**这一条扫描**的原始帧与每点元数据抄一份到 data/export/ 下。
        源文件一个字节都不动，也不碰设备 —— 所以扫描跑着也能导，只是会先提醒一句会跟采图抢磁盘。
-       入口在历史扫描表那一行上：导的是**那一条**，不是同名整组（整组请逐条导）。 -->
+       入口在历史扫描表那一行上：导的是**那一条**（跟裁剪一样，一次一条）。 -->
   <div id="exportpanel" hidden>
     <div class="cropbox expbox">
       <div class="head">
@@ -587,6 +784,34 @@
         </div>
         <p class="hint" id="exp-progress" hidden></p>
         <p class="hint" id="exp-recent">—</p>
+      </div>
+    </div>
+  </div>
+
+<!-- 导入面板：把一份**导出的包**（一个目录，或一个 zip）恢复成本机库里的一条扫描。
+       源包一个字节都不动；扫描号沿用包里那个，本机已经有这个号就拒（不覆盖任何东西）。
+       包在别人那儿（另一台机器 / U 盘），所以路径由人填 —— 先「检查」再动手。 -->
+  <div id="importpanel" hidden>
+    <div class="cropbox expbox">
+      <div class="head">
+        <h2>导入数据<span class="sub" id="imp-name">—</span></h2>
+        <div class="right"><button id="btn-imp-close" class="ghost">关闭</button></div>
+      </div>
+      <div class="cropside">
+        <label for="imp-path">包的位置（导出时那个目录，或者那个 .zip）</label>
+        <div class="row top">
+          <input id="imp-path" type="text" spellcheck="false"
+                 placeholder="D:\scan79_79_20261010-184429　或　/home/…/scan79_79_20261010-184429">
+          <button id="btn-imp-check" class="ghost">检查</button>
+        </div>
+        <p class="hint" id="imp-info">填上包的位置，先点「检查」—— 那一步只读包里的清单和那张表，
+          本机一个字节都不会变。</p>
+        <p class="hint warn" id="imp-warn" hidden></p>
+        <p class="hint" id="imp-dest">—</p>
+        <div class="row top">
+          <button id="btn-imp-run" class="primary" disabled>开始导入</button>
+        </div>
+        <p class="hint" id="imp-progress" hidden></p>
       </div>
     </div>
   </div>

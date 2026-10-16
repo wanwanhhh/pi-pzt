@@ -10,7 +10,9 @@
  *       I 历史列表转义；J caps 文案；K 位置曲线的窗口两端、统计口径、坐标范围钉住；
  *       L 界面不许编数、状态可见性；M 两页视图的切换与重新量宽；
  *       N–V 预览质心与图库、轮廓图、点位表、数据页（像素曲线 / 横轴范围与手势 / 裁剪 / 频谱 /
- *       位置口径：折算 µm ↔ 设备读回原值 / 频谱横轴：频率 ↔ 波长）。
+ *       位置口径：折算 µm ↔ 设备读回原值 / 频谱横轴：频率 ↔ 波长）；
+ *       W–Z 数据页的频谱轴、滤波与解析信号（包络 / 相位残差 / 傅里叶极限）；
+ *       AA 数据页相位图（波段来源、一遍读盘的起算与进度、绕圈配色、门限、换基准不重取数）。
  *       （相机预览那块只有"加载 app.js 不炸"这一层被覆盖，预览时序未测。）
  * 不覆盖：CSS 与布局、uPlot 的实际绘制、真实 SSE 时序与 EventSource 重连、拖拽与键盘交互。
  *         uPlot 对 setData([[],[]]) 的处理是静态阅读 vendor bundle 得出的结论，未在浏览器实跑。
@@ -31,6 +33,25 @@ const src = fs.readFileSync(APP, 'utf8');
 /* ---------- 只接受 index.html 里真实存在的 id ---------- */
 const html = fs.readFileSync('frontend/index.html', 'utf8');
 const VALID_IDS = new Set(Array.from(html.matchAll(/id="([^"]+)"/g), (m) => m[1]));
+/* 标签上写了 hidden 的元素，出生就是收着的（跟浏览器一样）。不认这一条，那些"默认收起"
+   的东西在测试里全是打开的 —— 断言会看着像通过，真机上却是另一回事。 */
+const HIDDEN_IDS = new Set();
+Array.from(html.matchAll(/<[^>]*>/g)).forEach((m) => {
+  const tag = m[0], idm = /\bid="([^"]+)"/.exec(tag);
+  if (!idm) return;
+  const bare = tag.replace(/"[^"]*"/g, '""').replace(/'[^']*'/g, "''");   // 属性值先摘掉，只留属性名
+  if (/(^|[\s])hidden([\s>]|$)/.test(bare)) HIDDEN_IDS.add(idm[1]);
+});
+
+/* 标签上写了 value="…" 的输入框，出生就带着那个值（真浏览器就是这样）——
+   默认值只写在 index.html 一处，这里照抄过来，测试里读得到那个初值。 */
+const VALUE_ATTRS = new Map();
+Array.from(html.matchAll(/<[^>]*>/g)).forEach((m) => {
+  const tag = m[0], idm = /\bid="([^"]+)"/.exec(tag);
+  if (!idm) return;
+  const v = /\bvalue="([^"]*)"/.exec(tag);
+  if (v) VALUE_ATTRS.set(idm[1], v[1]);
+});
 
 /* ---------- 假 DOM ---------- */
 function mkEl(isFragment) {
@@ -58,8 +79,36 @@ function mkEl(isFragment) {
     dispatch(t, ev) { (e._listeners[t] || []).slice().forEach((fn) => fn(ev)); },
     // 手势要量像素：给个固定的假矩形（宽 400 → 一个像素多少值算得清）
     getBoundingClientRect() { return { left: 0, top: 0, width: 400, height: 200 }; },
-    getAttribute() { return null; },
-    classList: { add() {}, remove() {}, contains() { return false; } }, closest() { return null; },
+    _attrs: {},
+    getAttribute(k) { return (k in e._attrs) ? e._attrs[k] : null; },
+    setAttribute(k, v) { e._attrs[k] = String(v); },
+    _cls: new Set(),
+    classList: {
+      add(c) { e._cls.add(c); },
+      remove(c) { e._cls.delete(c); },
+      contains(c) { return e._cls.has(c) || String(e.className || '').split(' ').indexOf(c) >= 0; },
+      toggle(c, on) {
+        const want = on === undefined ? !e.classList.contains(c) : !!on;
+        if (want) e._cls.add(c); else e._cls.delete(c);
+        return want;
+      },
+    },
+    closest() { return null; },
+    // canvas：只作数相位图那张（`getContext('2d')` 是全项目唯一的调用点）—— 把最后画进去的那一帧
+    // 留在元素上，测试就按像素断言颜色（真浏览器里画布内容读不出来，这里反而更好读）。
+    // 基准那条十字线（beginPath/moveTo/lineTo/stroke）只记调用、不做栅格化：它不在断言范围里。
+    getContext(kind) {
+      if (kind !== '2d') return null;
+      if (!e._ctx) {
+        e._ctx = {
+          createImageData(w, h) { return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }; },
+          putImageData(img) { e._img = img; },
+          save() {}, restore() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {},
+          strokeStyle: '', lineWidth: 1,
+        };
+      }
+      return e._ctx;
+    },
     // 真浏览器里 chartHeight() 用它量 uPlot 图例的高度；这里从来没建过真图，如实返回 null
     querySelector() { return null; },
   };
@@ -80,6 +129,8 @@ const doc = {
     if (!VALID_IDS.has(id)) return null;   // 浏览器里就是这个行为
     if (!elems.has(id)) {
       const el = (id === 'points' || id === 'history') ? mkTable() : mkEl();
+      if (HIDDEN_IDS.has(id)) el.hidden = true;
+      if (VALUE_ATTRS.has(id)) el.value = VALUE_ATTRS.get(id);
       if (id === 'history') el.addEventListener = (t, h) => { if (t === 'click') histHandler = h; };
       elems.set(id, el);
     }
@@ -110,6 +161,8 @@ function fetchImpl(url, opts) {
     ok: r.ok !== false,
     status: r.status || 200,
     json: () => Promise.resolve(r.body === undefined ? {} : r.body),
+    // 二进制口（相位图那两列 float32 走这条）：形状同 json，一样由 route 给；没给就是空 buffer
+    arrayBuffer: () => Promise.resolve(r.buf || new ArrayBuffer(0)),
   };
   const delay = r.delayMs || 0;
   return delay ? new Promise((res) => setTimeout(() => res(resp), delay)) : Promise.resolve(resp);
@@ -127,13 +180,48 @@ function uPlot(opts, data) {
   this.scales = {};    // setScale 套用过的范围（真 uPlot 里是 u.scales[key].min/max）
   this.over = mkEl();  // 真 uPlot 建的 .u-over：滚轮/拖动挂在它上面（destroy 后它就没了）
 }
-uPlot.prototype.setData = function (d) { this.data = d; };
+/* 真 uPlot 重铺范围时，会把**每根没写死 min/max 的轴**按数据重算一遍 —— 走的是那条轴自己的
+   range 函数，传进去的 min/max 是**视窗里那几个数**（相位轴那条"只认整条曲线、不认视窗"就靠它）。
+   桩里照办，并且故意传一对跟数据无关的视窗数（−7 / 7）：理不理它，一眼就看得出。 */
+uPlot.prototype._rerange = function () {
+  const sc = this.opts.scales || {};
+  for (const k in sc) {
+    if (!sc[k] || typeof sc[k].range !== 'function') continue;
+    const r = sc[k].range(this, -7, 7, k);
+    this.scales[k] = { min: r[0], max: r[1] };
+  }
+};
+/* 真 uPlot 一收新数据就把各条轴按新数据重新铺满（钉住的 x/y 也会被顶掉，实测：
+   setScale('x', 0.9~1.1) 之后 setData，scales.x 变回整段数据）—— 所以桩里也照这个来：
+   清掉记下的范围，逼迫调用方在 setData 之后把范围框再套一次。 */
+uPlot.prototype.setData = function (d) { this.data = d; this.scales = {}; this._rerange(); };
 uPlot.prototype.setSize = function (s) { this.size = s; };   // 记下来：切页必须重新量宽
-uPlot.prototype.setScale = function (k, limits) { this.scales[k] = { min: limits.min, max: limits.max }; };
+/* 真 uPlot 的 setSeries(i, opts)：只动这一条 series 的选项（不碰数据）—— 「傅里叶极限」那个开关
+   就靠它。它有个连带动作要照搬：改 show 时会把**这条 series 那根 scale** 重铺成自动
+   （源码里的 ii(n.scale, null, null)），于是钉住的框会被顶掉 —— 这正是 app.js 在开关之后
+   还要再套一次范围框的原因（不套的话真机上"点一下开关，纵轴刻度就跳了"）。 */
+uPlot.prototype.setSeries = function (i, o) {
+  const s = this.opts.series[i];
+  if (!s) return;
+  for (const k in o) s[k] = o[k];
+  if (o.show !== undefined) { delete this.scales[s.scale || 'y']; this._rerange(); }
+};
+/* 写死 min/max 的轴不会被重算（正是 rangeBox 把窗口钉住的原理），所以 _rerange 只碰有 range 的轴 */
+uPlot.prototype.setScale = function (k, limits) {
+  this.scales[k] = { min: limits.min, max: limits.max };
+  this._rerange();
+};
 // 真 uPlot 的 destroy 会把画布和图例一起拆掉：app.js 换横轴读法时靠它把旧图例（写着 µm 的那行）丢掉
 uPlot.prototype.destroy = function () { this.destroyed = true; };
 /* 像素 → 值：真 uPlot 按绘图区做线性映射，桩里按 over 的宽度（400px）插值 ——
    「缩放锚点不动」那条用例靠它算鼠标底下是哪个值。 */
+/* 真 uPlot 的 rangeNum：给一段数据补边距、取整到"好数"。桩里只要能分清"按数据算的"与"递进来的视窗"
+   就够，所以只要同一段数据必得同一个结果（app.js 的 axisFullRange 用它，桩也得给）。 */
+uPlot.rangeNum = function (lo, hi, pad) {
+  if (!(hi >= lo)) return [0, 1];
+  const p = (hi - lo) * (pad === undefined ? 0.1 : pad);
+  return p > 0 ? [lo - p, hi + p] : [lo - (Math.abs(lo) * 0.1 || 1), hi + (Math.abs(hi) * 0.1 || 1)];
+};
 uPlot.prototype.posToVal = function (px, key) {
   const s = this.scales[key] || { min: 0, max: 1 };
   return s.min + (px / 400) * (s.max - s.min);
@@ -1364,16 +1452,16 @@ const count = (m) => calls.filter((c) => c === m).length;
      read('__stats().observers') === obs0, read('__stats().observers') + ' vs ' + obs0);
 
 
-  // 数据页「扫描组 / 裁剪」：一组 = 同名的扫描；裁剪改的是文件，**坐标口径不变**。
-  // 前端这一层要盯的是：预检如实列出来、四个数原样发给后端、点完了给进度和结果、
-  // 正在看的那条裁完要重画。真正的文件操作在后端（backend/tests/test_crop.py 盯着）。
+  // 历史扫描的「裁剪」：**一次只裁选中的那一条**（不再是同名整组）；裁剪改的是文件，
+  // **坐标口径不变**。前端这一层要盯的是：预检如实摆出来（建议框 / 质心范围 / 余量）、
+  // 四个数原样发给后端、点完了给进度和结果、正在看的那条裁完要重画。
+  // 真正的文件操作与回滚在后端（backend/tests/test_crop.py 盯着）。
   console.log('\n[T] 历史扫描：裁剪');
-  const cropGroupsBody = {
+  const cropApiBody = {
     w: 400, h: 300,
-    job: { running: false, group: '', done: 0, total: 0, error: null, result: null },
+    job: { running: false, scan_id: null, done: 0, total: 0, error: null, result: null },
     // 每条扫描裁没裁过（历史表那一列照着写）
     crops: [{ id: 41, rect: [520, 390, 400, 300], frames: 3, state: 'done' }],
-    groups: [],
   };
   const histBody = [
     { id: 41, name: 'xmt 联调', start_um: 0, stop_um: 5, count: 3, done: 3,
@@ -1384,33 +1472,34 @@ const count = (m) => calls.filter((c) => c === m).length;
       status: 'failed', created_at: 1700000200 },
   ];
   const cropSuggestBody = {
-    name: 'xmt 联调', images: 9, bytes: 9437184, frame: [1440, 1080],
+    scan_id: 41, images: 9, bytes: 9437184, frame: [1440, 1080], base: null,
     sample: 'images/scan0041_00000.png',
-    scans: [
-      { id: 41, points: 3, images: 3, size: [1440, 1080], ok: true, why: '' },
-      { id: 42, points: 3, images: 3, size: [1440, 1080], ok: true, why: '' },
-      { id: 43, points: 3, images: 3, size: [64, 64], ok: false,
-        why: '画面尺寸不一致（64×64，这一组按 1440×1080 裁）' },
-    ],
     rect: { x0: 520, y0: 390, w: 400, h: 300, frame_w: 1440, frame_h: 1080,
             source: 'centroid', sampled: 9, cx_range: [642.7, 677.5], cy_range: [567.0, 582.0],
             margin: 150 },
-    note: '这一组的画面只有 1440×1080，整幅都框进去了 —— 裁了不会更快（多半是假相机采的占位小图）',
+    note: '这一条的画面只有 1440×1080，整幅都框进去了 —— 裁了不会更快（多半是假相机采的占位小图）',
   };
+  let cropSuggestPick = cropSuggestBody;
+  let cropFail = null;   // 预检被后端拒了（400）：面板不该开，原因照原样弹出来
   const cropRoute = (m, url) => {
-    if (url.indexOf('/api/crops/suggest') === 0) return { body: cropSuggestBody };
-    if (url.indexOf('/api/crops/run') === 0) return { body: { ok: true, scans: [41, 42], images: 6 } };
+    if (url.indexOf('/api/crops/suggest') === 0) {
+      return cropFail ? { ok: false, status: 400, body: { detail: cropFail } }
+                      : { body: cropSuggestPick };
+    }
+    if (url.indexOf('/api/crops/run') === 0) {
+      return { body: { ok: true, scan_id: 41, images: 6, rect: [520, 390, 400, 300] } };
+    }
     if (url.indexOf('/api/scans/52/pixel') === 0) return { body: pixelBody(52) };
-    if (url.indexOf('/api/crops') === 0) return { body: cropGroupsBody };
+    if (url.indexOf('/api/crops') === 0) return { body: cropApiBody };
     if (url.indexOf('/api/scans') === 0) return { body: histBody };
     return { body: {} };
   };
   route = cropRoute;
   await run('loadHistory()'); await tick(); await tick();
   const histHtml = htmlOf('history');
-  ok('历史表里给出「裁剪」入口（一组 = 同名的扫描，名字带在按钮上）',
+  ok('历史表里给出「裁剪」入口：点哪一条就裁哪一条（号带在按钮上）',
      rowsOf('history') === 3 && histHtml.indexOf('data-crop="36"') > 0 &&
-     histHtml.indexOf('data-name="冒烟"') > 0, histHtml.slice(-160));
+     histHtml.indexOf('data-crop="41"') > 0, histHtml.slice(-160));
   ok('裁过的也留着「裁剪」按钮（还能往里再裁一刀）',
      histHtml.indexOf('data-crop="41"') > 0, histHtml.slice(-200));
   ok('裁到多小**单独一列**（裁过的写尺寸、没裁过的写 —）',
@@ -1419,16 +1508,18 @@ const count = (m) => calls.filter((c) => c === m).length;
   ok('一个图都没有的扫描不给裁剪按钮',
      (histHtml.match(/data-crop=/g) || []).length === 2, histHtml.match(/data-crop="\d+"/g));
 
-  click({ crop: '36', name: '冒烟' }); await tick(); await tick();
+  calls.length = 0;
+  click({ crop: '41' }); await tick(); await tick();
+  ok('点哪一条就把**哪一条的号**带上去拉预检（不拉扯别的扫描）',
+     calls[0] === 'GET /api/crops/suggest?scan_id=41&w=400&h=300', JSON.stringify(calls));
   ok('后端说"整幅都框进去了、裁了不会更快"，面板就照写（有没有收益由后端判，前端只显示）',
      read("$('crop-info').textContent").indexOf('裁了不会更快') > 0,
      read("$('crop-info').textContent"));
-  ok('点一组 → 拉预检，四个数按建议框填好',
+  ok('点一条 → 四个数按建议框填好，面板开着、标题写着这一条的号',
      read("$('crop-x0').value") === 520 && read("$('crop-y0').value") === 390 &&
      read("$('crop-w').value") === 400 && read("$('crop-h').value") === 300 &&
-     read("$('croppanel').hidden") === false,
-     read("$('crop-x0').value + ',' + $('crop-y0').value + ',' + $('crop-w').value + " +
-          "'" + "' + $('crop-h').value"));
+     read("$('crop-name').textContent") === '#41' && read("$('croppanel').hidden") === false,
+     read("$('crop-name').textContent") + ' / ' + read("$('crop-x0').value"));
   ok('代表帧走 8 位映射的缩略图（16 位原值给浏览器看是整片黑的，等于没预览）',
      read("$('crop-img').src").indexOf('/api/grabs/thumb?path=images%2Fscan0041_00000.png') === 0,
      read("$('crop-img').src"));
@@ -1437,16 +1528,23 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('crop-rect').style.width") === (400 / 1440 * 100) + '%' &&
      read("$('crop-rect').hidden") === false,
      read("$('crop-rect').style.left") + ' / ' + read("$('crop-rect').style.width"));
-  ok('预检逐条列出来：不能裁的写清为什么',
-     read("$('crop-scans').children.length") === 3 &&
-     read("$('crop-scans').children[2].children[1].textContent").indexOf('画面尺寸不一致') > 0,
-     read("$('crop-scans').children[2].children[1].textContent"));
-  ok('说明里写清质心范围与离边余量（框选得对不对，看这个）',
+  ok('说明里写清几张、多大、质心范围与离边余量（框选得对不对，看这个）',
+     read("$('crop-info').textContent").indexOf('9 张 · 9.0 MB · 现在画面 1440×1080') === 0 &&
      read("$('crop-info').textContent").indexOf('离框边最近还有 150 px') > 0,
      read("$('crop-info').textContent"));
 
-  // 当前选中的那条（#52）在假数据里叫什么名字 —— 裁完要不要重画就看它
-  const curName = read("(dataScanPick() || {}).name") || '';
+  // 不能裁的那条（没有图 / 正在扫 / 库和文件对不上）：后端 400，面板不开，原因照原样弹出来
+  cropFail = '扫描 #36 现在不能裁：没有图';
+  click({ crop: '36' }); await tick(); await tick();
+  ok('不能裁的：面板不开，后端的话照原样弹出（这里：没有图）',
+     read("$('croppanel').hidden") === true &&
+     read("$('toast').textContent").indexOf('没有图') > 0,
+     read("$('toast').textContent"));
+  cropFail = null;
+  click({ crop: '41' }); await tick(); await tick();
+
+  // 当前在数据页选中的是哪一条 —— 裁完要不要重画就看它=不是被裁的那条
+  const curId = read("(dataScanPick() || {}).id") || 0;
   // 框住没有：质心范围是后端给的，改一个数就立刻比一次（这一条是给"框选小了把亮心切掉"兜底的）
   run("$('crop-x0').value = 100; $('crop-w').value = 400; cropDrawRect();");
   ok('框比质心范围小 → 当场红字提醒，并写出两边各是多少',
@@ -1464,11 +1562,11 @@ const count = (m) => calls.filter((c) => c === m).length;
      calls.length === 0, JSON.stringify(calls));
 
   // 跑着的时候：按钮锁住、面板关掉、进度行跟着走（进度由后端报，前端只照着写）
-  cropGroupsBody.job = { running: true, group: curName, done: 3, total: 6, error: null, result: null };
+  cropApiBody.job = { running: true, scan_id: 41, done: 3, total: 6, error: null, result: null };
   run("$('crop-x0').value = 520; $('crop-w').value = 400; dataLast = null;");   // 先不牵扯重画
   await run('runCrop()'); await tick(); await tick();
-  ok('点「裁剪」把四个数原样发给后端（**原始坐标**，不做任何换算）',
-     calls[0] === 'POST /api/crops/run?name=xmt%20%E8%81%94%E8%B0%83&x0=520&y0=390&w=400&h=300',
+  ok('点「裁剪」把这一条的号与四个数原样发给后端（**原始坐标**，不做任何换算）',
+     calls[0] === 'POST /api/crops/run?scan_id=41&x0=520&y0=390&w=400&h=300',
      JSON.stringify(calls));
   ok('跑起来就锁住按钮、关掉面板、进度行跟着后端的数走',
      read("$('btn-crop-run').disabled") === true && read("$('croppanel').hidden") === true &&
@@ -1476,28 +1574,29 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('crop-progress').textContent") === '正在裁剪 3 / 6 张 …',
      read("$('crop-progress').textContent"));
 
-  cropGroupsBody.job = { running: false, group: curName, done: 6, total: 6, error: null,
-                         result: { scans: 2, frames: 6, saved_bytes: 8388608, peak: 900,
-                                   edge_peak: 120, rect: [520, 390, 400, 300] } };
+  cropApiBody.job = { running: false, scan_id: 41, done: 6, total: 6, error: null,
+                      result: { scan_id: 41, frames: 6, saved_bytes: 8388608, peak: 900,
+                                edge_peak: 120, rect: [520, 390, 400, 300] } };
   calls.length = 0;
   await run('cropPoll()'); await tick(); await tick();
-  ok('裁完报到结果：几条几张省了多少，并**把裁剪状态和历史表重新拉一遍**（那一列要跟着变）',
-     read("$('crop-progress').textContent").indexOf('裁完了：2 条扫描、6 张，省 8.0 MB') === 0 &&
+  ok('裁完报到结果：哪一条、几张、省了多少，并**把裁剪状态和历史表重新拉一遍**（那一列要跟着变）',
+     read("$('crop-progress').textContent").indexOf('裁完了：#41、6 张，省 8.0 MB') === 0 &&
      calls.indexOf('GET /api/crops') >= 0 && calls.indexOf('GET /api/scans') >= 0 &&
      read("$('btn-crop-run').disabled") === false,
      read("$('crop-progress').textContent"));
-  ok('裁完不自动重画别的扫描（正在看的那条不在这一组里就不动它）',
+  ok('裁完不自动重画别的扫描（正在看的那条不是被裁的那条就不动它）',
      calls.filter(function (c) { return c.indexOf('GET /api/scans/52/pixel') === 0; }).length === 0,
      JSON.stringify(calls));
   ok('边界报警：边框上有接近峰值的像素就说出来（切到光斑就靠这条发现）',
      read("$('crop-progress').textContent").indexOf('边框最大 120') > 0,
      read("$('crop-progress').textContent"));
 
-  cropGroupsBody.job = { running: false, group: 'xmt 联调', done: 3, total: 6,
-                         error: '模拟：第三张读不动', result: null };
+  cropApiBody.job = { running: false, scan_id: 41, done: 3, total: 6,
+                      error: '模拟：第三张读不动', result: null };
   await run('cropPoll()'); await tick();
-  ok('失败就说"整组已回滚"（后端确实一张都没改）',
-     read("$('crop-progress').textContent").indexOf('整组已回滚') > 0 &&
+  ok('失败就说"已回滚"（后端确实一张都没改）',
+     read("$('crop-progress').textContent").indexOf('已回滚') > 0 &&
+     read("$('crop-progress').textContent").indexOf('模拟：第三张读不动') > 0 &&
      read("$('btn-crop-run').disabled") === false,
      read("$('crop-progress').textContent"));
 
@@ -1516,29 +1615,27 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('data-crop').textContent").indexOf('坐标仍是原始坐标') > 0,
      read("$('data-crop').textContent"));
 
-  // 正在看的那条**就在被裁的那一组里** → 裁完自动重画一次（读的是裁剪后的图，值必须一模一样）
-  cropGroupsBody.job = { running: false, group: curName, done: 6, total: 6, error: null,
-                         result: { scans: 2, frames: 6, saved_bytes: 8388608, peak: 900,
-                                   edge_peak: 120, rect: [520, 390, 400, 300] } };
+  // 正在看的那条**就是被裁的那条** → 裁完自动重画一次（读的是裁剪后的图，值必须一模一样）
+  cropApiBody.job = { running: false, scan_id: curId, done: 6, total: 6, error: null,
+                      result: { scan_id: curId, frames: 6, saved_bytes: 8388608, peak: 900,
+                                edge_peak: 120, rect: [520, 390, 400, 300] } };
   calls.length = 0;
   await run('cropPoll()'); await tick(); await tick();
-  ok('正在看的那条就在这一组里 → 自动重画一次（读的是裁剪后的图，值必须一模一样）',
+  ok('正在看的那条就是被裁的那条 → 自动重画一次（读的是裁剪后的图，值必须一模一样）',
      calls.filter(function (c) { return c.indexOf('GET /api/scans/52/pixel') === 0; }).length === 1,
      JSON.stringify(calls));
 
   // 再裁（越裁越小）：图上那张就是"现在这块地"，四个数仍是**原始坐标**
   const recropBody = {
-    name: '冒烟', images: 6, bytes: 1048576, frame: [500, 700],
+    scan_id: 36, images: 6, bytes: 1048576, frame: [500, 700],
     base: [200, 300, 500, 700], sample: 'images/scan0036_00000.png',
-    scans: [{ id: 36, points: 8, images: 6, size: [500, 700], rect: [200, 300, 500, 700],
-              ok: true, why: '' }],
     rect: { x0: 300, y0: 400, w: 200, h: 200, frame_w: 500, frame_h: 700,
             base: [200, 300, 500, 700], cropped: true, source: 'centroid', sampled: 6,
             cx_range: [340.0, 360.0], cy_range: [430.0, 450.0], margin: 40 },
   };
   route = (m, url) => (url.indexOf('/api/crops/suggest') === 0
     ? { body: recropBody } : cropRoute(m, url));
-  await run("openCropPanel('冒烟')"); await tick(); await tick();
+  await run('openCropPanel(36)'); await tick(); await tick();
   ok('再裁：红框按 (原始坐标 − base 原点) ÷ 现在画面 换算（四个数本身没换算过）',
      read("$('crop-rect').style.left") === ((300 - 200) / 500 * 100) + '%' &&
      read("$('crop-rect').style.top") === ((400 - 300) / 700 * 100) + '%' &&
@@ -1565,7 +1662,7 @@ const count = (m) => calls.filter((c) => c === m).length;
       "$('crop-w').value = 300; $('crop-h').value = 400;");
   await run('runCrop()'); await tick();
   ok('再裁：往里挑一块 → 照原样发给后端（还是原始坐标）',
-     calls[0] === 'POST /api/crops/run?name=%E5%86%92%E7%83%9F&x0=250&y0=350&w=300&h=400',
+     calls[0] === 'POST /api/crops/run?scan_id=36&x0=250&y0=350&w=300&h=400',
      JSON.stringify(calls));
 
   // 提醒要分清"这一刀会切掉"和"上一刀早就切在框外"（后者救不回来，不该拿来吓人）
@@ -1691,7 +1788,115 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('exp-info').textContent"));
   expFail = null;
 
-  // ==================== 数据页：频谱（功率谱） ====================
+// ==================== 导入：把一份导出的包恢复成一条扫描 ====================
+  // 包在别人那儿（另一台机器 / U 盘），路径由人填；**先「检查」再动手** ——
+  // 检查那一步只读包里的两张表，本机一个字节都不变。
+  console.log('\n[T] 导入：检查 → 动手（路径原样送后端，前端不拼路径）');
+
+  const impJob = { running: false, done: 0, total: 0, error: null, result: null };
+  const impPlanBody = {
+    src: 'D:\\scan79_79_20261010-184429', zipped: false, scan_id: 79, name: '',
+    status: 'done', message: '完成 2500 点', start_um: 0, stop_um: 100, count: 2500,
+    settle_ms: 10, created_at: 1791626760.6, finished_at: 1791627265.1, readback_to_um: 1.0,
+    points: 2500, images: 2500, bytes: 1858269018, missing: [], unknown_size: [],
+    crop: [200, 100, 1000, 700], frame: { width: 1000, height: 700, bits: 16 },
+    exported_at: '2026-10-10 18:44:34+08:00', exported_from: 'C:\\Users\\x\\pi-pzt\\data',
+    dest_dir: 'D:\\pi-pzt\\data\\images', free_bytes: 66571993088,
+    scanner: { status: 'running', scan_id: 52 },
+  };
+  let impFail = null;      // 想让检查失败（400）就把它设成 detail 文本
+  route = (m, url) => {
+    if (url.indexOf('/api/imports/plan') === 0) {
+      return impFail ? { ok: false, status: 400, body: { detail: impFail } }
+                     : { body: impPlanBody };
+    }
+    if (url.indexOf('/api/imports/run') === 0) {
+      return { body: Object.assign({ ok: true }, impPlanBody) };    // 动手：把预检那份再给一遍
+    }
+    if (url.indexOf('/api/imports') === 0) {
+      return { body: { job: impJob, dest: 'D:\\pi-pzt\\data\\images' } };
+    }
+    if (url.indexOf('/api/scans') === 0) return { body: histBody };
+    return { body: {} };
+  };
+
+  run('openImportPanel()');
+  ok('点「导入数据…」开面板：先说清「检查」这一步只读包、本机一个字都不变',
+     read("$('importpanel').hidden") === false &&
+     read("$('imp-info').textContent").indexOf('本机一个字节都不会变') > 0,
+     read("$('imp-info').textContent"));
+  ok('没检查过不许动手', read("$('btn-imp-run').disabled") === true);
+
+  posts.length = 0;
+  run("$('imp-path').value = 'D:\\\\scan79_79_20261010-184429'; checkImport()");
+  await tick(); await tick();
+  ok('「检查」把路径**原样**送给后端（包在别人那儿，前端不拼、也不猜）',
+     posts[0] && posts[0].url === '/api/imports/plan' &&
+     JSON.parse(posts[0].body).path === 'D:\\scan79_79_20261010-184429',
+     JSON.stringify(posts));
+  ok('检查回来写清是哪一条、多少点多少张',
+     read("$('imp-name').textContent") === '#79 · (没有名字)' &&
+     read("$('imp-info').textContent").indexOf('2500 个扫描点 · 2500 张原图') === 0,
+     read("$('imp-info').textContent"));
+  ok('几件事先提醒：裁过导不进全幅、有扫描在跑会抢磁盘、源包与本机都不动',
+     read("$('imp-warn').hidden") === false &&
+     read("$('imp-warn').textContent").indexOf('原生全幅导不进来') > 0 &&
+     read("$('imp-warn').textContent").indexOf('会跟采图抢磁盘') > 0 &&
+     read("$('imp-warn').textContent").indexOf('源包一个字节都不动') > 0,
+     read("$('imp-warn').textContent"));
+  ok('导到哪儿、盘上还剩多少，一并写出来',
+     read("$('imp-dest').textContent").indexOf('images') > 0 &&
+     read("$('imp-dest').textContent").indexOf('62.0 GB') > 0,
+     read("$('imp-dest').textContent"));
+
+  posts.length = 0;
+  // 后端在返回之前就把任务置成 running（线程随后才起来）：轮到界面来问的时候必是 running，
+  // 所以这里也照这个顺序摆 —— 不然会测出"刚点完按钮就被解锁"这种现实里没有的假象
+  impJob.running = true; impJob.done = 0; impJob.total = 5000;
+  await run('runImport()'); await tick(); await tick();
+  ok('「开始导入」把同一个路径送回去，并锁住按钮、报进度',
+     posts[0] && posts[0].url === '/api/imports/run' &&
+     JSON.parse(posts[0].body).path === 'D:\\scan79_79_20261010-184429' &&
+     read("$('btn-imp-run').disabled") === true &&
+     read("$('imp-progress').textContent").indexOf('正在导入') === 0,
+     JSON.stringify(posts) + ' | ' + read("$('imp-progress').textContent"));
+
+  impJob.running = true; impJob.done = 1200; impJob.total = 5000;
+  await run('impPoll()'); await tick(); await tick();
+  ok('进度只照后端报的数写（前半抄写、后半核对，一直报到底）',
+     read("$('imp-progress').textContent").indexOf('1200 / 5000') > 0,
+     read("$('imp-progress').textContent"));
+
+  impJob.running = false; impJob.done = 5000;
+  impJob.result = { scan_id: 79, name: '', points: 2500, images: 2500, bytes: 1858269018,
+                    missing: [], status: 'done', src: 'D:\\scan79_79_20261010-184429' };
+  calls.length = 0;
+  await run('impPoll()'); await tick(); await tick();
+  ok('导完报到结果：哪一条、多少点多少张，并写明这一条没有名字',
+     read("$('imp-progress').textContent").indexOf('扫描 #79，2500 点 / 2500 张') > 0 &&
+     read("$('btn-imp-run').disabled") === false,
+     read("$('imp-progress').textContent"));
+  ok('导完顺手刷新历史表（新那一条立刻就能看见）',
+     calls.indexOf('GET /api/scans') >= 0, JSON.stringify(calls));
+
+  impJob.result = null;
+  impJob.error = '盘上已经有 2500 张同名的图（scan0079_00000.png …）—— 导入不覆盖任何东西';
+  await run('impPoll()'); await tick();
+  ok('失败说清**源包与盘上的东西都没动**（错的不是它们）',
+     read("$('imp-progress').textContent").indexOf('导入失败（源包与盘上的东西都没动）：') === 0,
+     read("$('imp-progress').textContent"));
+
+  impFail = '本机已经有扫描 #79 了 —— 导入不覆盖任何东西：先把本机那条删掉';
+  await run("$('imp-path').value = 'D:\\\\scan79_79_20261010-184429'; checkImport()");
+  await tick(); await tick();
+  ok('检查被拒（号被占 / 没导完 / 图名撞了 / 放不下）：面板说清"现在导不了"，按钮锁住',
+     read("$('imp-info').textContent").indexOf('现在导不了') > 0 &&
+     read("$('btn-imp-run').disabled") === true &&
+     read("$('imp-dest').textContent") === '—',
+     read("$('imp-info').textContent"));
+  impFail = null;
+
+    // ==================== 数据页：频谱（功率谱） ====================
   // 这块的规矩：**真实点间距**（非均匀最小二乘，不插值）、**整条扫描的全部点**、**缺一个点整条不算**、
   // 按**采图顺序**、纵轴是功率（可切 dB）。全部离线可测：造一条已知频率的正弦，看峰落在哪一格。
   console.log('\n[U] 数据页频谱：功率谱（真实点间距 / 整条 / 缺一个点就不算）');
@@ -1826,6 +2031,28 @@ const count = (m) => calls.filter((c) => c === m).length;
   ok('频率轴「自动范围」松钉、按这条谱重新铺满',
      read("$('spec-xpin').hidden") === true && read("$('spec-xmin').value") === '0.000' &&
      read("$('spec-xmax').value") === '5.159');
+  run("$('btn-spec-peak').onclick()"); await tick();
+  const pkLo = parseFloat(read("$('spec-xmin').value")), pkHi = parseFloat(read("$('spec-xmax').value"));
+  ok('「聚焦最强峰」：把频率轴收到最强分量附近（只是替人填框并钉住，框仍是唯一的准）',
+     read("$('spec-xpin').hidden") === false && pkLo >= 0 && pkLo <= read('specLast.peakF') &&
+     pkHi >= read('specLast.peakF') && pkHi < read('specLast.fmax_thz') &&
+     read('specChart.scales.x.min') === pkLo && read('specChart.scales.x.max') === pkHi,
+     pkLo + ' ~ ' + pkHi + '（峰 ' + read('specLast.peakF') + '）');
+  run("$('btn-spec-fit').onclick()"); await tick();
+  ok('聚焦之后「自动范围」照旧能松开它（聚焦没有自己的一套钉法）',
+     read("$('spec-xpin').hidden") === true && read("$('spec-xmax').value") === '5.159');
+
+  ok('口径说明默认收着（不占图的高度），要点开才展开',
+     read("$('data-note').hidden") === true && read("$('spec-note').hidden") === true);
+  run("$('btn-data-note').onclick()");
+  ok('点「说明」：这一段展开，另一张卡的说明不受影响',
+     read("$('data-note').hidden") === false && read("$('spec-note').hidden") === true &&
+     read("$('btn-data-note').getAttribute('aria-expanded')") === 'true');
+  run("$('btn-data-note').onclick()");
+  ok('再点一下收起（按钮自己也变回去）',
+     read("$('data-note').hidden") === true &&
+     read("$('btn-data-note').getAttribute('aria-expanded')") === 'false');
+
   run("$('spec-ymin').value = '-20'; $('spec-ymax').value = '-1'; $('spec-ymin').oninput()"); await tick();
   ok('两个轴各钉各的：填了纵轴范围不该把频率轴一起钉住',
      read("$('spec-ypin').hidden") === false && read("$('spec-xpin').hidden") === true &&
@@ -1833,6 +2060,23 @@ const count = (m) => calls.filter((c) => c === m).length;
   run("$('btn-spec-yfit').onclick()"); await tick();
   ok('纵轴「自动范围」复位（回到 0 dB 天花板）',
      read("$('spec-ypin').hidden") === true && parseFloat(read("$('spec-ymax').value")) === 0);
+
+  // 右栏是**一张图的位置**：页签换图，不重算、不取数、也不重建
+  const chartKeep = read('specChart'), callsBefore = calls.length;
+  run("$('data-tab-spec').onclick()");
+  ok('页签切到频谱：曲线卡收起、频谱卡露出来（右栏只放一张图）',
+     read("$('card-curve').hidden") === true && read("$('card-spec').hidden") === false &&
+     read("$('data-tab-spec').classList.contains('active')") === true &&
+     read("$('data-tab-curve').classList.contains('active')") === false,
+     read("$('data-tab-note').textContent"));
+  ok('切页不重算、不重新取数、也不重建那张图',
+     read('specChart') === chartKeep && read('specLast.__tag') === 1 && calls.length === callsBefore,
+     JSON.stringify(calls));
+  run("$('data-tab-curve').onclick()");
+  ok('再切回曲线：两张卡翻回来，还是原来那张图',
+     read("$('card-curve').hidden") === false && read("$('card-spec').hidden") === true &&
+     read('specChart') === chartKeep && read("$('data-tab-note').textContent").indexOf('扫描位置') > 0,
+     read("$('data-tab-note').textContent"));
 
   // 缺一个点：谱整条不算，但**曲线照旧能看**（那是两件事）
   const gapBody = seriesOf(64, 6, 100, 500, 0);
@@ -2105,6 +2349,665 @@ const count = (m) => calls.filter((c) => c === m).length;
      read('specAxis') === 'freq' &&
      read('specChart.opts.series[0].label') === '频率 (THz)' &&
      read('JSON.stringify(specChart.data[0])') === read('JSON.stringify(specLast.f)'));
+
+
+  // ==================== 数据页：滤波（按波长选带，重建时间曲线） ====================
+  // 只留下选中的那几根谱线，按**每个点自己那一刻的时间**加回去：不插值、不重采样，
+  // 每个点还是原来那个点。上限卡在 Nyquist、边界硬截断、均值加回 —— 与谱同一套口径。
+  console.log('\n[X] 数据页滤波：只留下选中的波长段，加回时域');
+
+  // 256 点、步距 100 fs（T = 25.5 ps → 格宽 0.039216 THz、kMax = 127），信号是第 20 格的正弦
+  // （0.7843 THz ↔ 382.24 µm）。那么**按波长框**出 370~395 µm 应当正好只留第 20 根。
+  const bandBody = seriesOf(256, 20, 100, 500, 0);
+  bandBody.scan_id = 54;
+  bandBody.wavelength_um_per_thz = C_UM_THZ;
+  const bandRows = [{ id: 54, name: '滤波', count: 256, done: 256, start_um: 0, stop_um: 25,
+                      status: 'done', created_at: 1700000000, readback_to_um: null }];
+  route = (m, url) => (url.indexOf('/api/readback-sources') === 0 ? { body: srcList }
+    : url.indexOf('/pixel') > 0 ? { body: bandBody }
+    : url.indexOf('/api/scans') === 0 ? { body: bandRows } : { body: {} });
+  resetData();
+  await run('loadDataSources()'); await tick();
+  await run('loadDataScans()'); await tick();
+  run("$('data-scan').value = '54'; $('data-scan').onchange()"); await tick();
+  calls.length = 0;
+  await run("$('btn-data-draw').onclick()"); await tick(); await tick();
+
+  ok('两个波长框留空 = **全通**：0 ~ Nyquist 整段都留着（曲线就是原曲线）',
+     read("$('filt-n').textContent") === '127' &&
+     read("$('filt-band').textContent").indexOf('全通') === 0,
+     read("$('filt-band').textContent"));
+  const allY = JSON.parse(read('JSON.stringify(filtChart.data[1])'));
+  const rawY = JSON.parse(read('JSON.stringify(dataLast.value)'));
+  let allMax = 0, allSum = 0;
+  for (let i = 0; i < allY.length; i++) {
+    allMax = Math.max(allMax, Math.abs(allY[i] + 500 - rawY[i]));  // 直流不加回图上，比之前先补上它
+    allSum += allY[i];
+  }
+  ok('滤波曲线**不含直流**：整条的平均值是 0（像素均值 500 只在统计条里）',
+     Math.abs(allSum / allY.length) < 1e-9, (allSum / allY.length).toExponential(2));
+  ok('全通重建（补上直流）≈ 原曲线（差的是 Nyquist 以上那部分，谱本来就不算它）', allMax < 1e-6,
+     '逐点最大差 ' + allMax);
+
+  const calls0 = calls.length;
+  run("$('filt-lmin').value = '370'; $('filt-lmax').value = '395'; $('filt-lmin').oninput()");
+  ok('按波长框出 370~395 µm：正好只留下第 20 根（λ = 系数 ÷ ν，短波那头是高频）',
+     read("$('filt-n').textContent") === '1' &&
+     read("$('filt-band').textContent").indexOf('留下 1 根 / 共 127 根') >= 0,
+     read("$('filt-band').textContent"));
+  ok('重建不重新取数、也不重新算谱（分量本来就在手里）', calls.length === calls0);
+  const bandY = JSON.parse(read('JSON.stringify(filtChart.data[1])'));
+  let bandMin = Infinity, bandMax = -Infinity, bandErr = 0;
+  for (let i = 0; i < bandY.length; i++) {
+    bandMin = Math.min(bandMin, bandY[i]);
+    bandMax = Math.max(bandMax, bandY[i]);
+    bandErr = Math.max(bandErr, Math.abs(bandY[i] + 500 - rawY[i]));
+  }
+  // 峰-谷略小于 2A 是采样的事：20 个周期摊在 256 个点上，波峰未必正好采到（差 0.1 以内）
+  ok('留下的那根加回时域（补上直流）就是原曲线本身（信号只含这一根）—— 峰-谷 ≈ 2A、逐点误差 ≈ 0',
+     Math.abs((bandMax - bandMin) - 200) < 0.5 && bandErr < 1e-6,
+     '峰-谷 ' + (bandMax - bandMin) + '，逐点最大差 ' + bandErr);
+  ok('横轴与原曲线同一列（同一次取数、同一批点），统计条照实写',
+     read('JSON.stringify(filtChart.data[0])') === read('JSON.stringify(dataChart.data[0])') &&
+     read("$('filt-range').textContent").indexOf('~') > 0 &&
+     read("$('filt-mean').textContent") === '500.0',
+     read("$('filt-range').textContent") + ' | 均值 ' + read("$('filt-mean').textContent"));
+
+  run("$('filt-lmax').value = ''; $('filt-lmax').oninput()");
+  ok('只填一边：另一边就是不限（这里只剩"波长比 370 µm 长"的那 20 根）',
+     read("$('filt-n').textContent") === '20', read("$('filt-band').textContent"));
+
+  run("$('filt-lmin').value = '1'; $('filt-lmax').value = '2'; $('filt-lmin').oninput()");
+  const flatY = JSON.parse(read('JSON.stringify(filtChart.data[1])'));
+  let flat = true;
+  for (let i = 0; i < flatY.length; i++) if (Math.abs(flatY[i]) > 1e-9) flat = false;
+  ok('框到谱外面（波长比 Nyquist 对应的还短）：一根都没留下 —— 如实画成一条 0 平线，不悄悄放宽',
+     read("$('filt-n').textContent") === '0' &&
+     read("$('filt-band').textContent").indexOf('一根谱线都没有') > 0 && flat,
+     read("$('filt-band').textContent"));
+
+  run("$('btn-filt-all').onclick()");
+  ok('「全通」= 清空两个框（不是把范围放到无穷大）',
+     read("$('filt-lmin').value") === '' && read("$('filt-lmax').value") === '' &&
+     read("$('filt-n').textContent") === '127', read("$('filt-band').textContent"));
+
+  run("$('data-tab-filt').onclick()");
+  ok('页签切到滤波曲线：只有这张卡露出来（右栏仍是一张图的位置）',
+     read("$('card-filt').hidden") === false && read("$('card-spec').hidden") === true &&
+     read("$('card-curve').hidden") === true && read("$('filt-chart').hidden") === false,
+     read("$('data-tab-note').textContent"));
+
+  // ==================== 数据页：频谱上的相位（右边那条轴） ====================
+  // 相位 = 每根谱线解出来的分量相对 t0 的相位：A·cos + B·sin = R·cos(2πf(t−t0) − φ) → φ = atan2(B, A)。
+  // **只在有信号的地方有意义** —— 门限以下的谱线留空（两个几乎为零的数相除，出来的是随机相位）。
+  console.log('\n[Y] 频谱上的相位：右边那条轴（φ = atan2(B, A)，门限以外留空）');
+
+  ok('图上是三列：功率 + 相位；右边那根轴走 y2、不画网格，y2 这个 scale 也跟轴一起建出来',
+     read('specChart.opts.series[2].label') === '相位 (rad)' &&
+     read('specChart.opts.series[2].scale') === 'y2' &&
+     read('specChart.opts.axes.length') === 3 &&
+     read('specChart.opts.axes[2].side') === 1 &&
+     read('specChart.opts.axes[2].scale') === 'y2' &&
+     read('specChart.opts.axes[2].grid.show') === false &&
+     read("typeof specChart.opts.scales.y2") === 'object',
+     [read('specChart.opts.series[2].label'), read('specChart.opts.axes[2].scale'),
+      read('specChart.opts.axes.length')].join(' / '));
+
+  ok('门限框的初值是 −20 dB（默认值只在这个框里写一次）', read("$('spec-phmin').value") === '-20',
+     read("$('spec-phmin').value"));
+
+  // 这条信号正好是 sin(2πk·t/T)：A = 0、B = amp → 在这个约定下 φ = +π/2。
+  // **相位是弧度**（atan2 出来的原样，不乘 180/π —— 换算系数本来就不该有）
+  const phCol = () => JSON.parse(read('JSON.stringify(specChart.data[2])'));
+  const phLive = (col) => col.map((v, i) => [i, v]).filter((r) => r[1] !== null);
+  const live1 = phLive(phCol());
+  ok('门限以内只有最强那一根在画：φ = atan2(B, A) = +π/2（正弦在这个约定下的相位）',
+     live1.length === 1 && live1[0][0] === 19 && Math.abs(live1[0][1] - Math.PI / 2) < 1e-12 &&
+     Math.abs(read('specLast.A[20]')) < 1e-9 && Math.abs(read('specLast.B[20]') - 100) < 1e-9,
+     JSON.stringify(live1) + ' | A=' + read('specLast.A[20]') + ' B=' + read('specLast.B[20]'));
+
+  // 相位轴**没有范围框、也不吃滚轮/拖动**（见 AGENTS.md），所以它的范围只按"门限以内那一列"算：
+  // uPlot 重铺范围时会拿**视窗里那几个数**去问每根没写死 min/max 的轴 —— 桩故意递一对跟数据无关的
+  // 视窗数（−7 / 7）进去，理不理它一眼就看得出。真机上这个 bug 长这样：谱的相位散在整条横轴上，
+  //  视窗一挪，门限内那几根一根不剩 → 相位轴变 [null, null]，整条相位就没了。
+  const y2Span = () => read('JSON.stringify([specChart.scales.y2.min, specChart.scales.y2.max])');
+  const y2Want = read('(function(){var c=specChart.data[2],lo=Infinity,hi=-Infinity;' +
+    'for(var i=0;i<c.length;i++){var v=c[i];if(v===null||v===undefined||!isFinite(v))continue;' +
+    'if(v<lo)lo=v;if(v>hi)hi=v;}return JSON.stringify(uPlot.rangeNum(lo,hi,0.1,true));})()');
+  const y2a = y2Span();
+  ok('相位轴按整条相位（门限以内那几根）铺满 —— 不认别人递进来的视窗', y2a === y2Want,
+     y2a + ' vs 整条列的 ' + y2Want);
+  run("specX.set(2, 3)");      // 一次手势 = 别条轴的 setScale：uPlot 顺手重铺其余各轴
+  ok('滚轮/拖动重铺别的轴时，相位轴一动都不动', y2Span() === y2a, y2a + ' → ' + y2Span());
+  run("specX.pinned = false; specX.apply()");
+
+  const tag0 = read('specLast.__tag = 1, specLast.__tag');
+  const calls1 = calls.length;
+  run("$('spec-phmin').value = ''; $('spec-phmin').oninput()");
+  const liveAll = phLive(phCol());
+  ok('门限留空 = 不设门限：整条都画（127 根，连噪声底上那些随机相位也照画）—— 框是唯一的准',
+     liveAll.length === 127, liveAll.length + ' 根');
+  ok('相位一律写在 (−π, π] 里（绕回来就是绕回来，不展开、不外推）',
+     liveAll.every((r) => r[1] > -Math.PI - 1e-12 && r[1] <= Math.PI + 1e-12),
+     Math.min.apply(null, liveAll.map((r) => r[1])) + ' ~ ' +
+     Math.max.apply(null, liveAll.map((r) => r[1])));
+  ok('改门限只重画那一列：不重新取数、也不重算谱（相位是一对现成分量的 atan2）',
+     calls.length === calls1 && read('specLast.__tag') === tag0, JSON.stringify(calls));
+
+  // 收新数据之后钉住的窗口必须还在（uPlot 会把 x/y 按新数据重铺，所以两个框要再套一次）
+  run("specX.set(1, 2); specY.set(0, 100)");
+  run("$('spec-phmin').value = '-30'; $('spec-phmin').oninput()");
+  ok('改门限之后钉住的窗口还在（setData 会把轴按新数据重铺，两个范围框要再套一次）',
+     read('specChart.scales.x.min') === 1 && read('specChart.scales.x.max') === 2 &&
+     read('specChart.scales.y.min') === 0 && read('specChart.scales.y.max') === 100 &&
+     read("$('spec-xmin').value") === '1.000' && read("$('spec-xmax').value") === '2.000',
+     JSON.stringify([read('specChart.scales.x'), read('specChart.scales.y')]));
+  run("specX.pinned = false; specX.apply(); specY.pinned = false; specY.apply();" +
+      "$('spec-phmin').value = '-20'; $('spec-phmin').oninput()");
+
+  run("$('spec-phmin').value = '5'; $('spec-phmin').oninput()");
+  ok('门限比峰值还高 = 一根都不在门限内：整列留空（不补 0、不画一条假的相位线）',
+     phLive(phCol()).length === 0, JSON.stringify(phLive(phCol())));
+  run("$('spec-phmin').value = '-20'; $('spec-phmin').oninput()");
+
+  ok('相位点少就画标记（孤点挨着空档，只有线是看不见的）；点多了只连线',
+     read('phasePointsBelow(2)({ data: [[], [], [1, null, 3]] })') === true &&
+     read('phasePointsBelow(2)({ data: [[], [], [1, null, 3, 4]] })') === false &&
+     read('phasePointsBelow(400)({ data: [[], [], new Array(401).fill(1)] })') === false,
+     read('phasePointsBelow(2)({ data: [[], [], [1, null, 3, 4]] })'));
+
+  // 换横轴读法：相位与功率一起按同一个置换搬（每个点带着自己的两根纵值走）
+  run("$('btn-spec-axis').onclick()");
+  const liveW = phLive(phCol());
+  ok('切波长轴：相位列跟着功率列一起倒过来（同一个置换），值跟着自己的横坐标搬',
+     read('specAxis') === 'wave' && liveW.length === 1 && liveW[0][0] === 107 &&
+     Math.abs(liveW[0][1] - Math.PI / 2) < 1e-12 &&
+     Math.abs(read('specChart.data[0][107]') - read('specC() / specLast.f[19]')) < 1e-9,
+     JSON.stringify(liveW) + ' | x=' + read('specChart.data[0][107]'));
+  run("$('btn-spec-axis').onclick()");
+
+  // ==================== 数据页：滤波后的相位与包络（解析信号） ====================
+  // 一次累加给出三样东西：实部 = 时间曲线、|z| = 包络、arg z = 相位（z = Σ(A−iB)e^(iθ)，不做变换）。
+  // 相位要**展开**、要**减掉带内功率重心那条线性相位**（首点 = 0）、要按**包络**设门限。
+  console.log('\n[Z] 滤波后的相位与包络：一次累加出三列（展开 / 减线性 / 门限）');
+
+  ok('图上五列：滤波后 + 傅里叶极限 + 包络 + 相位；右边那根轴走 y2、不画网格，y2 这个 scale 也跟轴一起建出来',
+     read('filtChart.opts.series[1].label') === '滤波后 (ADU)' &&
+     read('filtChart.opts.series[2].label') === '傅里叶极限 (ADU)' &&
+     read('filtChart.opts.series[3].label') === '包络 (ADU)' &&
+     read('filtChart.opts.series[4].label') === '相位残差 (rad)' &&
+     read('filtChart.opts.series[4].scale') === 'y2' &&
+     read('filtChart.opts.axes.length') === 3 &&
+     read('filtChart.opts.axes[2].side') === 1 &&
+     read('filtChart.opts.axes[2].grid.show') === false &&
+     read("typeof filtChart.opts.scales.y2") === 'object' &&
+     read('filtChart.data.length') === 5 &&
+     read("$('filt-phmin').value") === '-20',
+     [read('filtChart.opts.series.length'), read('filtChart.data.length')].join(' / '));
+
+  // 这条带里只有第 20 根（A = 0、B = 100）：包络恒定、相位残差恒 0、条纹频率 = 那一根自己的频率
+  run("$('filt-lmin').value = '370'; $('filt-lmax').value = '395'; $('filt-lmin').oninput()");
+  const flatCol = () => JSON.parse(read('JSON.stringify(filtChart.data[2])'));
+  const upCol = () => JSON.parse(read('JSON.stringify(filtChart.data[3])'));
+  const phCol2 = () => JSON.parse(read('JSON.stringify(filtChart.data[4])'));
+  let upOk = true;
+  upCol().forEach(function (v) { if (Math.abs(v - 100) > 1e-6) upOk = false; });
+  ok('包络 = |解析信号| = 100（一根正弦的解析包络就是它的幅度）—— 与曲线同一个量级，也不含直流',
+     upOk, upCol()[0]);
+
+  let phMax = 0, phN = 0;
+  phCol2().forEach(function (v) { if (v !== null) { phN++; if (Math.abs(v) > phMax) phMax = Math.abs(v); } });
+  ok('相位残差恒为 0：减掉的正是那一根自己的带重心频率（首点归零、不拟合直线）',
+     phN === 256 && phMax < 1e-6, phN + ' 点，最大 ' + phMax);
+  ok('相位残差 峰-谷 = 0.000 rad（统计条只算画出来的那些点）',
+     read("$('filt-phpp').textContent") === '0.000', read("$('filt-phpp').textContent"));
+  // 一根正弦的包络是常量：两侧都不降到峰值的 1/√2 以下 → 照实写「未降到」，不编一个数
+  ok('包络恒定（这一段只有一根正弦）：两侧都不降到阈值以下 → 强度半高宽写「未降到」',
+     read("$('filt-fwhm').textContent") === '未降到', read("$('filt-fwhm').textContent"));
+
+  // 傅里叶变换极限：同一段谱线、同样的幅度，只把每一根的相位拉平到「包络的时间重心那一刻」。
+  // 一根谱线时它**必须逐点等于实测那条** —— 单根没有"互相干涉"这回事，拉平相位改变不了它
+  // （代入算式：ψ0 = θ_ref − φ，flat = R·cos(θ − φ) = 实测那一条）。
+  const yColF = () => JSON.parse(read('JSON.stringify(filtChart.data[1])'));
+  let flatMax = 0;
+  const yFC = yColF(), flatFC = flatCol();
+  for (let i = 0; i < yFC.length; i++) flatMax = Math.max(flatMax, Math.abs(flatFC[i] - yFC[i]));
+  ok('一根谱线时「傅里叶极限」与实测曲线逐点相同（单根谈不上互相抵消，拉平相位无从改变它）',
+     flatMax < 1e-6, '最大差 ' + flatMax);
+
+  ok('默认就画着这条曲线（开关初值 = 显示），按钮文案与它一致',
+     read('filtChart.opts.series[2].show') === true &&
+     read("$('btn-filt-flat').textContent") === '傅里叶极限：显示',
+     read("$('btn-filt-flat').textContent"));
+
+  ok('条纹频率 = 那一根自己的频率（20 格 = 0.784 THz）—— 拿它跟谱上最强那根对一下，方法就自证了',
+     read("$('filt-fringe').textContent") === (20 * 1000 / 25500).toFixed(3),
+     read("$('filt-fringe').textContent"));
+  // 相位一律弧度：100 fs × 0.784 THz = 0.0784 圈 = 0.4926 rad（从前这里写的是 28.2°）
+  ok('逐点最大步长 = 每个采样点的相位增量（100 fs × 0.784 THz = 0.493 rad）—— 展开的前提就是这个数小于 π',
+     read("$('filt-phstep').textContent") === (2 * Math.PI * 20 / 255).toFixed(3),
+     read("$('filt-phstep').textContent"));
+
+  // 与频谱那张同一个机制（两边共用 makeChart 里那根 y2 轴，所以这条只在这里测一次机制、两边各测一次接线）
+  const fy2 = () => read('JSON.stringify([filtChart.scales.y2.min, filtChart.scales.y2.max])');
+  const fy2Want = read('(function(){var c=filtChart.data[4],lo=Infinity,hi=-Infinity;' +
+    'for(var i=0;i<c.length;i++){var v=c[i];if(v===null||v===undefined||!isFinite(v))continue;' +
+    'if(v<lo)lo=v;if(v>hi)hi=v;}return JSON.stringify(uPlot.rangeNum(lo,hi,0.1,true));})()');
+  const fy2a = fy2();
+  ok('相位轴按整条相位（画出来的那些点）铺满 —— 不认别人递进来的视窗', fy2a === fy2Want,
+     fy2a + ' vs 整条列的 ' + fy2Want);
+  run("filtX.set(10, 20)");
+  ok('滚轮/拖动重铺别的轴时，相位轴一动都不动', fy2() === fy2a, fy2a + ' → ' + fy2());
+  run("filtX.pinned = false; filtX.apply()");
+
+  // 「傅里叶极限」的开关：**只改显示** —— 不重算、不重新取数、不重建图、也不动钉好的范围。
+  run("filtX.set(10, 20); filtY.set(-50, 50)");
+  const callsF = calls.length, flatJson = read('JSON.stringify(filtChart.data[2])');
+  run("$('btn-filt-flat').onclick()");
+  ok('点一下开关：这条 series 不画了（只改 show）—— 数据列一个字节没动，也没重新取数',
+     read('filtChart.opts.series[2].show') === false &&
+     read("$('btn-filt-flat').textContent") === '傅里叶极限：隐藏' &&
+     read('JSON.stringify(filtChart.data[2])') === flatJson &&
+     read('filtChart.data.length') === 5 && calls.length === callsF,
+     read("$('btn-filt-flat').textContent") + ' / ' + flatJson.length + ' 字节');
+  ok('开关之后钉住的范围还在（真 uPlot 的 setSeries 会把这条 series 那根 scale 重铺成自动，所以要再套一次框）',
+     read('filtChart.scales.x.min') === 10 && read('filtChart.scales.x.max') === 20 &&
+     read('filtChart.scales.y.min') === -50 && read('filtChart.scales.y.max') === 50,
+     JSON.stringify([read('filtChart.scales.x'), read('filtChart.scales.y')]));
+  run("$('btn-filt-flat').onclick()");
+  ok('再点一下又画回来，仍然不重新取数、数据列也还是那几列',
+     read('filtChart.opts.series[2].show') === true &&
+     read("$('btn-filt-flat').textContent") === '傅里叶极限：显示' &&
+     read('JSON.stringify(filtChart.data[2])') === flatJson &&
+     read('filtChart.data.length') === 5 && calls.length === callsF);
+  run("filtX.pinned = false; filtX.apply(); filtY.pinned = false; filtY.apply()");
+
+  const callsZ = calls.length;
+  run("$('filt-phmin').value = '5'; $('filt-phmin').oninput()");
+  ok('门限比包络还高 → 一个点都不在门限内：整列留空（不补 0、不画一条假的相位线），统计写 —',
+     phCol2().every(function (v) { return v === null; }) &&
+     read("$('filt-phpp').textContent") === '—' && calls.length === callsZ,
+     read("$('filt-phpp').textContent"));
+  run("$('filt-phmin').value = ''; $('filt-phmin').oninput()");
+  ok('门限留空 = 不设门限，整条都画（与滤波那边"留空 = 全通"同一个脾气），也不重新取数',
+     phCol2().every(function (v) { return v !== null; }) && calls.length === callsZ);
+  run("$('filt-phmin').value = '-20'; $('filt-phmin').oninput()");
+
+  // 加一根贴着 Nyquist 的分量（20 格那根 100 的幅度不变）：全通时每点相位步长被它带上去 ——
+  // 统计条要如实报出来，这就是"别信展开"的告示。（取数得是**新对象**：谱按对象身份缓存）
+  const twoTone = seriesOf(256, 20, 100, 500, 0);
+  twoTone.scan_id = 54;
+  twoTone.wavelength_um_per_thz = C_UM_THZ;
+  twoTone.value = twoTone.value.map(function (v, i) {
+    return v + 20 * Math.sin(2 * Math.PI * 126 * i / 255);
+  });
+  route = (m, url) => (url.indexOf('/pixel') > 0 ? { body: twoTone } : { body: {} });
+  await run("$('btn-data-draw').onclick()"); await tick(); await tick();
+  run("$('filt-lmin').value = ''; $('filt-lmax').value = ''; $('filt-lmin').oninput()");
+  ok('全通（带里含一根贴着 Nyquist 的分量）：逐点最大步长从 0.493 rad 涨到 0.7 rad 以上 —— 这个数就是"展开别信"的告示',
+     parseFloat(read("$('filt-phstep').textContent")) > 0.7 &&
+     read("$('filt-band').textContent").indexOf('全通') === 0,
+     read("$('filt-phstep').textContent") + ' rad / ' + read("$('filt-band').textContent"));
+  // 多根谱线时才看得出这条曲线在干什么：相位被拉平 ⇒ 与实测那条（各根带着自己的相位相加）
+  // 不再逐点相同，差值就是"没有对齐的那部分"。一根时两者必须相同（上面那条），这里反过来。
+  let flatDiff = 0;
+  const yM = yColF(), flatM = flatCol();
+  for (let i = 0; i < yM.length; i++) flatDiff = Math.max(flatDiff, Math.abs(flatM[i] - yM[i]));
+  ok('两根谱线时两条曲线不再逐点相同（相位已经拉平，差值正是没有对齐的那部分）',
+     flatDiff > 1, '最大差 ' + flatDiff);
+
+  // 纵轴「自动范围」按**左轴上那三列合起来**铺满（滤波后 + 傅里叶极限 + 包络）——
+  // 只按滤波后算的话，极限那条（这一带里比它高 39 ADU）会有尖顶画到窗外，而它就在同一根轴上。
+  const yWant = read('(function(){var lo=Infinity,hi=-Infinity;for(var c=1;c<=3;c++){var col=filtChart.data[c];' +
+    'for(var i=0;i<col.length;i++){var v=col[i];if(v===null||v===undefined)continue;if(v<lo)lo=v;if(v>hi)hi=v;}}' +
+    'var pad=(hi-lo)*0.05||0.05;return JSON.stringify([lo-pad,hi+pad]);})()');
+  const yGot = read("JSON.stringify([filtChart.scales.y.min, filtChart.scales.y.max])");
+  // 容差 = 纵轴框的小数位（decimals: 2）：套到图上的就是框里那两个数
+  ok('纵轴铺满按左轴三列合起来算（单看滤波后的话，极限那条的尖顶会画到窗外）',
+     Math.abs(read('filtChart.scales.y.min') - JSON.parse(yWant)[0]) < 0.005 &&
+     Math.abs(read('filtChart.scales.y.max') - JSON.parse(yWant)[1]) < 0.005,
+     yGot + ' vs ' + yWant);
+  ok('纵轴那两列合起来确实比只有滤波后时更宽（说明这一条真的起了作用）',
+     JSON.parse(yWant)[1] > read('Math.max.apply(null, filtChart.data[1])'), yWant);
+
+  route = (m, url) => (url.indexOf('/pixel') > 0 ? { body: bandBody } : { body: {} });
+
+  // 强度半高宽：强度 ∝ 包络²，所以取的是包络峰值的 1/√2。包络恒定就给不出数（上一条），
+  // 这里把那根正弦乘一个汉宁窗 —— 半高位置在 i/(n−1) = 0.31796 与 0.68204（汉宁窗降到 1/√2 处），
+  // 宽度 = 0.36407 × 255 × 100 fs ÷ 6.6712819 fs/µm。按**交流部分**算（不含均值那条基线）。
+  const hann = seriesOf(256, 20, 100, 500, 0);
+  hann.scan_id = 55;
+  hann.wavelength_um_per_thz = C_UM_THZ;
+  hann.value = hann.value.map((v, i) => 500 + (v - 500) * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / 255)));
+  route = (m, url) => (url.indexOf('/pixel') > 0 ? { body: hann } : { body: {} });
+  await run("$('btn-data-draw').onclick()"); await tick(); await tick();
+  run("$('filt-lmin').value = ''; $('filt-lmax').value = ''; $('filt-lmin').oninput()");
+  const hannWant = 0.364072 * 255 * 100 / 6.6712819;
+  const hannGot = parseFloat(read("$('filt-fwhm').textContent"));
+  ok('包络有起伏就给得出数：汉宁包络的半高宽 ≈ ' + hannWant.toFixed(1) + ' µm（两头插值，不是数点数）',
+     Math.abs(hannGot - hannWant) < 3, read("$('filt-fwhm').textContent"));
+  const fw0 = read("$('filt-fwhm').textContent");
+  run("$('filt-phmin').value = ''; $('filt-phmin').oninput()");
+  ok('半高宽与相位门限无关（门限只管相位画不画，不掺和包络的统计）',
+     read("$('filt-fwhm').textContent") === fw0, fw0 + ' → ' + read("$('filt-fwhm').textContent"));
+  run("$('filt-phmin').value = '-20'; $('filt-phmin').oninput()");
+  run("$('btn-data-axis').onclick()"); await tick();
+  ok('半高宽跟着横轴读法走：换到时间轴是同一串数换刻度（µm × 6.6712819 = fs）',
+     Math.abs(parseFloat(read("$('filt-fwhm').textContent")) - hannGot * 6.6712819) < 3,
+     read("$('filt-fwhm').textContent"));
+  run("$('btn-data-axis').onclick()"); await tick();
+
+  // ==================== 数据页：相位图（整幅图的相位差） ====================
+  // 口径：波段 = 〈滤波曲线〉那两个波长框（**唯一来源**）；每个像素跟**基准像素**差多少相位
+  // （弧度，写在 (−π, π]）。基准只是减一个常数 → **换基准不重取数**；同一个复数的大小 |R| 就是
+  // 条纹强度（免费得到，换着看不重算）。这里把后端那一遍读盘也演一遍：
+  // POST 起 + GET 跟进度 + .bin 两列 float32（相位 + 强度），形状在结果里。
+  console.log('\n[AA] 数据页相位图：一遍读盘 / 绕圈配色 / 换基准不重算');
+
+  const scan82 = { id: 82, name: '涡旋', count: 3, done: 3, start_um: 0, stop_um: 3,
+                   status: 'done', created_at: 1700000000, readback_to_um: 1.0 };
+  let mapRows = [scan82];
+  // 4×2 的一小张图（原始坐标 rect = 500,400,4,2）：一格一个已知相位、一个已知强度。
+  // 第 3 格强度只有 10（最强那个像素的 −40 dB）—— 默认门限 −20 dB，它落在门限以下。
+  const MAP_PHASE = [0.5, 0.5 + 3 * Math.PI / 2, -2.0, 0.5 + 2 * Math.PI + 0.25, 0.5, 0.3, -3.0, 2.9];
+  const MAP_AMP = [1000, 1000, 10, 800, 500, 500, 500, 500];
+  const mapBytes = (function () {
+    const f = new Float32Array(16);
+    for (let i = 0; i < 8; i++) { f[i] = MAP_PHASE[i]; f[8 + i] = MAP_AMP[i]; }
+    return f.buffer;
+  })();
+  const mapMeta = { scan_id: 82, w: 4, h: 2, rect: [500, 400, 4, 2], n: 3,
+                    k_lo: 192, k_hi: 196, k_c: 194, k_max: 1999, df_thz: 0.5,
+                    f_c_thz: 194.5, lam_c_um: 1.0309698, band: [1.02, 1.045] };
+  let mapJob = { running: false, scan_id: null, done: 0, total: 0, error: null, result: null };
+  let mapBin = mapBytes;
+  const mapRoute = (m, url) => {
+    if (url === '/api/scans') return { body: mapRows };
+    if (url.indexOf('phasemap.bin') > 0) return { buf: mapBin };
+    if (url === '/api/phasemap') return { body: { job: mapJob } };
+    if (url.indexOf('phasemap') > 0) {   // 后端在返回之前就把任务置成 running（线程随后才起来）
+      mapJob = { running: true, scan_id: 82, done: 0, total: 3, error: null, result: null };
+      return { body: { ok: true, scan_id: 82, total: 3, k_lo: 192, k_hi: 196 } };
+    }
+    return { body: {} };
+  };
+  route = mapRoute;
+
+  // 画布上第 i 格的颜色（RGBA 前三个）与色环第 k 格的颜色 —— 图上画的是什么，由它们说话
+  const mapPx = (i) => JSON.parse(read('JSON.stringify(Array.prototype.slice.call(' +
+    '$("map-canvas")._img.data,' + (i * 4) + ',' + (i * 4 + 3) + '))'));
+  const mapLut = (k) => JSON.parse(read('JSON.stringify(Array.prototype.slice.call(MAP_LUT,' +
+    (k * 3) + ',' + (k * 3 + 3) + '))'));
+  const mapBarPx = (i) => JSON.parse(read('JSON.stringify(Array.prototype.slice.call(' +
+    '$("map-bar")._img.data,' + (i * 4) + ',' + (i * 4 + 3) + '))'));
+  const lutIdx = (d) => (((((d + Math.PI) / (2 * Math.PI) * 256) | 0) % 256) + 256) % 256;  // 与 app.js 同一式
+
+  run("mapPolling.stop(); mapResult=null; mapData=null; mapLoadedKey=''; mapRef=null;" +
+      "mapView='phase'; mapSeq=0; dataLast=null; specLast=null; dataChart=null; filtChart=null;" +
+      "dataScans=[];");
+  await run('loadDataScans()'); await tick();
+  run("$('data-x').value = '500'; $('data-y').value = '400';");
+
+  // 色标（图例）：它讲的是配色，与有没有图无关 —— 一进页面就该摆着，否则「蓝是多少」只能靠记
+  ok('还没算就把色标摆出来了：一条 256 格的条 + −π / 0 / +π 三格刻度',
+     read("$('map-bar').width") === 256 && read("$('map-bar').height") === 1 &&
+     read("$('map-bar-lo').textContent") === '\u2212\u03c0' &&
+     read("$('map-bar-mid').textContent") === '0' &&
+     read("$('map-bar-hi').textContent") === '+\u03c0',
+     read("$('map-bar-lo').textContent") + ' / ' + read("$('map-bar-mid').textContent") +
+     ' / ' + read("$('map-bar-hi').textContent"));
+  ok('色标与相图**同一份配色表**：同一个格号，两边一个字节都不差（图例不会与图对不上）',
+     JSON.stringify(mapBarPx(0)) === JSON.stringify(mapLut(0)) &&
+     JSON.stringify(mapBarPx(128)) === JSON.stringify(mapLut(128)) &&
+     JSON.stringify(mapBarPx(255)) === JSON.stringify(mapLut(255)) &&
+     read('MAP_LUT.length') === 768,
+     JSON.stringify([mapBarPx(0), mapBarPx(128), mapBarPx(255)]));
+
+  // 波段只有一个来源：〈滤波曲线〉那张卡的两个波长框。两个都空 = 全通 → 没有载波可比。
+  run("$('filt-lmin').value = ''; $('filt-lmax').value = ''; $('filt-lmin').oninput()");
+  ok('两个波长框都空着（全通）= 没有"跟哪一根比"：按钮禁用，按钮自己说明为什么',
+     read("$('btn-map-run').disabled") === true &&
+     read("$('map-band').textContent").indexOf('全通') > 0 &&
+     read("$('btn-map-run').title").indexOf('算不了') === 0,
+     read("$('map-band').textContent") + ' | ' + read("$('btn-map-run').title"));
+
+  calls.length = 0;
+  await run("$('btn-map-run').onclick()"); await tick();
+  ok('全通时点「算相位图」：当场说清为什么，一个请求都不发（后端也会 400，前端不假装能算）',
+     calls.length === 0 && read("$('toast').textContent").indexOf('全通') > 0,
+     JSON.stringify(calls) + ' | ' + read("$('toast').textContent"));
+
+  run("$('filt-lmin').value = '1.02'; $('filt-lmax').value = '1.045'; $('filt-lmin').oninput()");
+  ok('填好波段（条纹所在的那一段）：按钮可用，文案写明波段在哪儿改、这一遍要读全盘',
+     read("$('btn-map-run').disabled") === false &&
+     read("$('map-band').textContent") === '波段：1.02 ~ 1.045 µm（在〈滤波曲线〉那张卡里改）' &&
+     read("$('btn-map-run').title").indexOf('每一帧读一遍') > 0,
+     read("$('map-band').textContent"));
+
+  run("$('filt-lmax').value = ''; $('filt-lmax').oninput()");
+  ok('只填一边：另一边就是不限（波长 ≥ 1.02 µm —— 短波那头是高频，管的是频率上限）',
+     read("$('map-band').textContent") === '波段：≥ 1.02 µm（在〈滤波曲线〉那张卡里改）',
+     read("$('map-band').textContent"));
+  run("$('filt-lmin').value = ''; $('filt-lmax').value = '1.045'; $('filt-lmin').oninput()");
+  ok('另一边同理：波长 ≤ 1.045 µm（长波那头是低频，管的是频率下限）',
+     read("$('map-band').textContent") === '波段：≤ 1.045 µm（在〈滤波曲线〉那张卡里改）',
+     read("$('map-band').textContent"));
+  run("$('filt-lmin').value = '1.02'; $('filt-lmin').oninput()");
+
+  calls.length = 0;
+  await run("$('btn-map-run').onclick()"); await tick(); await tick();
+  ok('起算：扫描号与两个波长原样发给后端，按钮锁住、进度从 0 报起',
+     calls.indexOf('POST /api/scans/82/phasemap?lmin=1.02&lmax=1.045') >= 0 &&
+     read("$('btn-map-run').disabled") === true &&
+     read("$('map-progress').textContent") === '正在读盘 0 / 3 张 …',
+     JSON.stringify(calls) + ' | ' + read("$('map-progress').textContent"));
+
+  mapJob = { running: true, scan_id: 82, done: 2, total: 3, error: null, result: null };
+  await run('mapPoll()');
+  ok('进度只照后端报的数写（前端不自己数）',
+     read("$('map-progress').textContent") === '正在读盘 2 / 3 张 …',
+     read("$('map-progress').textContent"));
+
+  mapJob = { running: false, scan_id: 82, done: 3, total: 3, error: null, result: mapMeta };
+  calls.length = 0;
+  await run('mapPoll()');
+  ok('算完：抓那一份二进制（两列 float32 一次取完）、进度收口、轮询停掉（没有进度可跟就别再问）',
+     calls.indexOf('GET /api/scans/82/phasemap.bin') >= 0 &&
+     read("$('map-progress').textContent") === '算完了：3 张' &&
+     read('mapPolling.running()') === false && read('mapData.ampMax') === 1000,
+     JSON.stringify(calls) + ' | ' + read("$('map-progress').textContent"));
+
+  ok('画布的内部尺寸 = 盘上那张图的像素数（CSS 只管缩放：不重采样、不插值）',
+     read("$('map-canvas').width") === 4 && read("$('map-canvas').height") === 2);
+  ok('基准那一格恒为 0 色（色环正中那一格）—— 相位差本来就是减出来的',
+     JSON.stringify(mapPx(0)) === JSON.stringify(mapLut(lutIdx(0))), JSON.stringify(mapPx(0)));
+  ok('差 3π/2 的格子先折到 (−π,π] 再上色：**绕圈的色环**，同一色 = 同一相位',
+     JSON.stringify(mapPx(1)) === JSON.stringify(mapLut(lutIdx(-Math.PI / 2))), JSON.stringify(mapPx(1)));
+  ok('门限以下的格子涂深灰：那里两个几乎为零的数相除，相位算得出却不可复现 —— 不是"相位为 0"',
+     JSON.stringify(mapPx(2)) === JSON.stringify([30, 41, 59]), JSON.stringify(mapPx(2)));
+  ok('统计条：留下那几根（含 Nyquist 上限）、公共载波、Δφ 范围、门限以下占多少、坐标口径',
+     read("$('map-lines').textContent") === '192 ~ 196（共 5 根 / Nyquist 到 1999）' &&
+     read("$('map-carrier').textContent") === '1.0310 µm（194.500 THz）' &&
+     read("$('map-range').textContent") === '-2.500 ~ 2.783' &&
+     read("$('map-blank').textContent") === '1 / 8（12.5%）' &&
+     read("$('map-size').textContent") === '4×2（原始坐标原点 500,400）' &&
+     read("$('map-empty').hidden") === true,
+     [read("$('map-lines').textContent"), read("$('map-carrier').textContent"),
+      read("$('map-range').textContent"), read("$('map-blank').textContent")].join(' | '));
+
+  ok('画布上挂了三件：停住读那一格、离开还原、点一下换基准（漏挂的表现是"点了没反应"）',
+     read('typeof $("map-canvas").onmousemove') === 'function' &&
+     read('typeof $("map-canvas").onmouseleave') === 'function' &&
+     read('typeof $("map-canvas").onclick') === 'function');
+
+  run("$('map-canvas').onmousemove({ clientX: 150, clientY: 50 })");
+  ok('鼠标停在哪一格就读那一格：相位差（折到 (−π,π]）+ 条纹强度（相对最强那个像素的 dB）',
+     read("$('map-hover').textContent") ===
+       '像素 (501, 400)　相位差 -1.571 rad　条纹强度 1000（0.0 dB）　｜　点一下：以它为基准',
+     read("$('map-hover').textContent"));
+  run("$('map-canvas').onmouseleave()");
+  ok('鼠标离开画布：那行字还给基准自己（基准是减数的那个，它弱了整幅图会整体转一个随机的角）',
+     read("$('map-hover').textContent").indexOf('基准 (500, 400)：相位 0.500 rad、条纹强度 1000（0.0 dB）') === 0,
+     read("$('map-hover').textContent"));
+
+  calls.length = 0;
+  run("$('map-canvas').onclick({ clientX: 250, clientY: 150 })");
+  ok('点一下换基准：基准格自己变成 0 色 —— **不重取数、不重算**（基准只是减一个常数）',
+     read("$('map-ref').textContent") === '(502, 401)' &&
+     JSON.stringify(mapPx(6)) === JSON.stringify(mapLut(lutIdx(0))) &&
+     calls.length === 0,
+     read("$('map-ref').textContent") + ' | ' + JSON.stringify(mapPx(6)) + ' | ' + JSON.stringify(calls));
+
+  run("$('data-x').value = '700'; $('data-y').value = '540'; $('btn-map-ref').onclick()");
+  ok('「基准＝取数像素」：那个像素不在这张图里 → 当场说清范围，基准不动（不夹取、不悄悄换一个）',
+     read("$('map-ref').textContent") === '(502, 401)' &&
+     read("$('toast').textContent").indexOf('那个像素不在这张图里（图上 x 500~503、y 400~401）') === 0,
+     read("$('toast').textContent"));
+
+  run("$('data-x').value = '503'; $('data-y').value = '401'; $('btn-map-ref').onclick()");
+  ok('在框里：基准搬过去（单向拷贝），基准格又是 0 色',
+     read("$('map-ref').textContent") === '(503, 401)' &&
+     JSON.stringify(mapPx(7)) === JSON.stringify(mapLut(lutIdx(0))),
+     read("$('map-ref').textContent") + ' | ' + JSON.stringify(mapPx(7)));
+
+  calls.length = 0;
+  run("$('map-canvas').onclick({ clientX: 50, clientY: 50 })");
+  ok('在图上点一下换基准：〈取数〉那两个框**一动不动**（相位图有自己的基准 —— 点图要瞬时，' +
+     '不能触发重读几千张 PNG 的曲线）',
+     read("$('map-ref').textContent") === '(500, 400)' && read("$('data-x').value") === '503' &&
+     read("$('data-y').value") === '401' && calls.length === 0,
+     read("$('map-ref').textContent") + ' / 框 ' + read("$('data-x').value") + ',' + read("$('data-y').value"));
+
+  calls.length = 0;
+  run("$('btn-map-view').onclick()");
+  ok('切「条纹强度」：同一个复数的大小 |R| 按相对最强那个像素的 dB 画（0 dB 到顶、−40 dB 到底）',
+     read("$('btn-map-view').textContent") === '看：条纹强度' &&
+     read("$('map-title').textContent").indexOf('#82　条纹强度') === 0 &&
+     JSON.stringify(mapPx(0)) === JSON.stringify([255, 255, 255]) &&
+     JSON.stringify(mapPx(2)) === JSON.stringify([0, 0, 0]) &&
+     calls.length === 0,
+     JSON.stringify(mapPx(0)) + ' / ' + JSON.stringify(mapPx(2)) + ' | ' + JSON.stringify(calls));
+  ok('强度图**不掐门限**（它就是用来看门限该设在哪的），统计条照实写',
+     read("$('map-blank').textContent") === '（强度视图不掐）', read("$('map-blank').textContent"));
+  ok('切强度视图：色标跟着换成灰阶（左端 = 底色 −40 dB、右端 = 最强 0 dB），刻度改成 dB',
+     JSON.stringify(mapBarPx(0)) === JSON.stringify([0, 0, 0]) &&
+     JSON.stringify(mapBarPx(255)) === JSON.stringify([255, 255, 255]) &&
+     read("$('map-bar-lo').textContent") === '\u221240 dB' &&
+     read("$('map-bar-mid').textContent") === '\u221220 dB' &&
+     read("$('map-bar-hi').textContent") === '0 dB',
+     read("$('map-bar-lo').textContent") + ' ~ ' + read("$('map-bar-hi').textContent"));
+  run("$('btn-map-view').onclick()");
+  ok('切回相位差：又按相位上色（同一份结果换着看，两列都在手里；基准这时是 (500,400)）',
+     read("$('btn-map-view').textContent") === '看：相位差' &&
+     JSON.stringify(mapPx(0)) === JSON.stringify(mapLut(lutIdx(0))), JSON.stringify(mapPx(0)));
+  ok('色标也跟着换回蓝→红（切换只重画，不重取数）',
+     JSON.stringify(mapBarPx(0)) === JSON.stringify(mapLut(0)) &&
+     read("$('map-bar-lo').textContent") === '\u2212\u03c0');
+
+  calls.length = 0;
+  run("$('map-phmin').value = ''; $('map-phmin').oninput()");
+  ok('门限留空 = 不设门限：整片都按相位上色（深灰那格没了）—— 改门限只重画，不重取数',
+     read("$('map-blank').textContent") === '0' &&
+     JSON.stringify(mapPx(2)) !== JSON.stringify([30, 41, 59]) && calls.length === 0,
+     read("$('map-blank').textContent") + ' / ' + JSON.stringify(mapPx(2)));
+  run("$('map-phmin').value = '-20'; $('map-phmin').oninput()");
+  ok('门限填回去：那一格又涂成深灰（框是唯一的准，没有分号第二套判断）',
+     read("$('map-blank').textContent") === '1 / 8（12.5%）', read("$('map-blank').textContent"));
+
+  run("$('filt-lmax').value = '1.05'; $('filt-lmax').oninput()");
+  ok('波段改过：立刻标出「波段改过，点重算」—— 手里这张还是老波段算的，不许冒充',
+     read("$('map-stale').hidden") === false &&
+     read("$('map-stale').textContent") === '波段改过，点重算', read("$('map-stale').textContent"));
+  run("$('filt-lmax').value = '1.045'; $('filt-lmax').oninput()");
+  ok('改回原来那两个数：标记又收起来（比的是两个数，不是"动过没有"这个动作）',
+     read("$('map-stale').hidden") === true);
+
+  mapRows = [{ id: 83, name: '新的一条', count: 3, done: 3, start_um: 0, stop_um: 3,
+               status: 'done', created_at: 1700000100, readback_to_um: 1.0 }, scan82];
+  await run('loadDataScans()'); await tick();
+  run("$('data-scan').value = '83'; $('data-scan').onchange()");
+  ok('换一条扫描：立刻标出这张图是哪一条的（现在选的是 #83）',
+     read("$('map-stale').hidden") === false &&
+     read("$('map-stale').textContent") === '图是 #82 的（现在选的是 #83）',
+     read("$('map-stale').textContent"));
+  mapRows = [scan82];
+  await run('loadDataScans()'); await tick();
+  run("$('data-scan').value = '82'; $('data-scan').onchange()");
+
+  // 慢响应：抓 .bin 的那一段还在路上时又换了一份结果 —— 回来时必须丢掉（老图不能当新图画出去）
+  route = (m, url) => (url.indexOf('phasemap.bin') > 0 ? { buf: mapBin, delayMs: 30 } : mapRoute(m, url));
+  run("mapData = null; mapLoadedKey = ''; mapResult = " + JSON.stringify(mapMeta) + ";");
+  const slowFetch = run('mapFetchArrays()');
+  await sleep(5);
+  run("mapResult = " + JSON.stringify(Object.assign({}, mapMeta, { k_lo: 193, k_hi: 197 })) + ";");
+  await slowFetch;
+  ok('慢响应保护：抓的路上又换了一份结果 → 这一份丢掉，不当成新图画出去（形状在结果里，序号说了算）',
+     read('mapLoadedKey') === '' && read('mapData === null') === true,
+     read('mapLoadedKey') + ' / ' + read('mapData'));
+
+  route = mapRoute;
+  mapBin = new ArrayBuffer(8);
+  run("mapData = null; mapLoadedKey = ''; mapResult = " + JSON.stringify(mapMeta) + ";");
+  await run('mapFetchArrays()'); await tick();
+  ok('字节数对不上（形状在结果里）：说清是多少、应该是多少，**不硬画**',
+     read('mapData === null') === true &&
+     read("$('toast').textContent") === '相位图数据长度不对（8 字节，应该是 64）',
+     read("$('toast').textContent"));
+
+  mapBin = mapBytes;
+  mapJob = { running: false, scan_id: 82, done: 3, total: 3, result: null,
+             error: '第 7 个点（idx 6）没采到图 —— 整条做不了：缺一个点就是另一条采样序列' };
+  await run('mapPoll()'); await tick();
+  ok('后端算不动（缺一个点这类）：把**原话**摆在进度那行并提示 —— 不补一个数、不画半张图',
+     read("$('map-progress').textContent") ===
+       '算不了：第 7 个点（idx 6）没采到图 —— 整条做不了：缺一个点就是另一条采样序列' &&
+     read("$('toast').textContent").indexOf('相位图失败：') === 0,
+     read("$('map-progress').textContent"));
+
+  route = (m, url) => (url === '/api/phasemap'
+    ? { ok: false, status: 500, body: { detail: '后端抽风' } } : mapRoute(m, url));
+  mapJob = { running: true, scan_id: 82, done: 1, total: 3, error: null, result: null };
+  run('mapPolling.start()');          // 起一个轮询（它会立刻问一次），再看它停不停得掉
+  await tick(); await tick();
+  ok('问不到进度（后端出错）：当场停掉轮询 —— 不留一个后台还在问的定时器，并把原因说出来',
+     read('mapPolling.running()') === false && read("$('toast').textContent") === '后端抽风',
+     read('mapPolling.running()') + ' | ' + read("$('toast').textContent"));
+  route = mapRoute;
+
+  // 扫描跑着也能算（只读盘上的帧、不碰设备）—— 代价是跟采图抢磁盘，所以先提醒一句
+  run("scanActive = true;");
+  mapJob = { running: false, scan_id: 82, done: 3, total: 3, error: null, result: mapMeta };
+  calls.length = 0;
+  await run("$('btn-map-run').onclick()"); await tick();
+  ok('扫描进行中：照算（不排队进设备线程），但先提醒一句会跟采图抢磁盘',
+     read("$('toast').textContent").indexOf('扫描进行中：这一遍要读全盘，会跟采图抢磁盘') === 0 &&
+     read("$('btn-map-run').title").indexOf('扫描进行中') > 0 &&
+     calls.indexOf('POST /api/scans/82/phasemap?lmin=1.02&lmax=1.045') >= 0,
+     read("$('toast').textContent"));
+  run("scanActive = false; mapPolling.stop();");
+
+  mapJob = { running: false, scan_id: 82, done: 3, total: 3, error: null, result: mapMeta };
+  run("mapResult=null; mapData=null; mapLoadedKey=''; mapPolling.stop();");
+  calls.length = 0;
+  run("showView('data')");
+  await sleep(30);
+  ok('进数据页就把后端手里那份接上（刷新页面、从别的页回来，不用再点一次「算相位图」）',
+     read('mapResult ? mapResult.scan_id : null') === 82 &&
+     read("$('map-progress').textContent") === '算完了：3 张' &&
+     read('mapData.w') === 4 &&
+     calls.indexOf('GET /api/phasemap') >= 0 &&
+     calls.indexOf('GET /api/scans/82/phasemap.bin') >= 0,
+     JSON.stringify(calls) + ' | ' + read("$('map-progress').textContent"));
+
+  run("$('data-tab-map').onclick()");
+  ok('页签切到「相位图」：另外三张卡收起（右栏仍是一张图的位置），说明行也跟着换',
+     read("$('card-map').hidden") === false && read("$('card-curve').hidden") === true &&
+     read("$('card-spec').hidden") === true && read("$('card-filt').hidden") === true &&
+     read("$('data-tab-note').textContent").indexOf('相位') > 0,
+     read("$('data-tab-note').textContent"));
+  run("$('data-tab-curve').onclick()");
+  ok('切回去：相位图那份结果还在手里（切页只改显示，不重算、不重取数）',
+     read("$('card-map').hidden") === true && read('mapData.w') === 4);
 
   route = () => ({ body: [] });
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');

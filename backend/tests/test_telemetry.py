@@ -8,19 +8,20 @@
      好几格，看着像采样率变高了）；
   3. 空闲 / 暂停时照旧自己轮询 —— 暂停不是 running，那两格界面不能僵。
 
-Telemetry 住在 server.py 里，而 server.py **导入时就会 store.init()**，所以这里先把
-DB_PATH 指到临时库再导入（模块级只导入一次，后面几个用例共用）。
+与别的离线单测一样**不依赖测试框架**（README 里那条"逐个文件直接跑"的命令得真的跑到用例）：
+直接跑：python backend/tests/test_telemetry.py
 """
 from __future__ import annotations
 
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(ROOT))
+_TMP = None      # 临时库（server 导入时就会 init，别碰真库）
+_TEL = None      # Telemetry 类，几条用例共用（模块只会导入一次）
 
 
 class _Snap:
@@ -64,14 +65,18 @@ class _FakeScanner:
         }
 
 
-@pytest.fixture(scope="module")
-def telemetry_cls(tmp_path_factory):
-    from backend import store
+def _telemetry_cls():
+    """先把库指到临时目录再导入 server —— server 导入时就会 store.init()。"""
+    global _TMP, _TEL
+    if _TEL is None:
+        from backend import store
 
-    store.DB_PATH = tmp_path_factory.mktemp("db") / "t.db"   # 导入 server 时会 init，别碰真库
-    from backend.server import Telemetry
+        _TMP = tempfile.TemporaryDirectory()
+        store.DB_PATH = Path(_TMP.name) / "t.db"
+        from backend.server import Telemetry
 
-    return Telemetry
+        _TEL = Telemetry
+    return _TEL
 
 
 def _tick(tel) -> None:
@@ -81,9 +86,9 @@ def _tick(tel) -> None:
     tel._loop()
 
 
-def test_scan_running_never_polls_the_device(telemetry_cls):
+def test_scan_running_never_polls_the_device():
     stage, scanner = _FakeStage(), _FakeScanner("running")
-    tel = telemetry_cls(stage, scanner, hz=50.0, hz_scan=2.0)
+    tel = _telemetry_cls()(stage, scanner, hz=50.0, hz_scan=2.0)
     for i in range(1, 6):
         scanner.index = i
         _tick(tel)
@@ -94,30 +99,50 @@ def test_scan_running_never_polls_the_device(telemetry_cls):
     assert [s[2] for s in samples] == [0.1, 0.2, 0.3, 0.4, 0.5], "目标值跟着点走"
 
 
-def test_same_point_is_not_recorded_twice(telemetry_cls):
+def test_same_point_is_not_recorded_twice():
     stage, scanner = _FakeStage(), _FakeScanner("running")
-    tel = telemetry_cls(stage, scanner, hz=50.0, hz_scan=2.0)
+    tel = _telemetry_cls()(stage, scanner, hz=50.0, hz_scan=2.0)
     scanner.index = 1
     for _ in range(3):
         _tick(tel)
     assert len(tel.trace(0.0, time.time() + 1.0)) == 1
 
 
-def test_point_without_a_reading_is_skipped(telemetry_cls):
+def test_point_without_a_reading_is_skipped():
     """index 动了但 actual_um 还没记上（首点读之前）：不记样本，不编一个位置。"""
     stage, scanner = _FakeStage(), _FakeScanner("running")
-    tel = telemetry_cls(stage, scanner, hz=50.0, hz_scan=2.0)
+    tel = _telemetry_cls()(stage, scanner, hz=50.0, hz_scan=2.0)
     scanner.index = 0                      # actual_um is None
     _tick(tel)
     assert tel.trace(0.0, time.time() + 1.0) == []
 
 
-@pytest.mark.parametrize("status", ["idle", "paused"])
-def test_idle_and_paused_still_poll(telemetry_cls, status):
-    stage, scanner = _FakeStage(), _FakeScanner(status)
-    tel = telemetry_cls(stage, scanner, hz=50.0, hz_scan=2.0)
-    scanner.index = 1
-    _tick(tel)
-    assert stage.polls == 1, f"{status} 时遥测必须自己轮询（否则界面会僵住）"
-    samples = tel.trace(0.0, time.time() + 1.0)
-    assert len(samples) == 1 and samples[0][1] == 10.0, samples
+def test_idle_and_paused_still_poll():
+    for status in ("idle", "paused"):
+        stage, scanner = _FakeStage(), _FakeScanner(status)
+        tel = _telemetry_cls()(stage, scanner, hz=50.0, hz_scan=2.0)
+        scanner.index = 1
+        _tick(tel)
+        assert stage.polls == 1, f"{status} 时遥测必须自己轮询（否则界面会僵住）"
+        samples = tel.trace(0.0, time.time() + 1.0)
+        assert len(samples) == 1 and samples[0][1] == 10.0, (status, samples)
+
+
+def main() -> int:
+    tests = [(n, f) for n, f in sorted(globals().items())
+             if n.startswith("test_") and callable(f)]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+        except Exception as exc:
+            failed += 1
+            print(f"FAIL  {name}\n      {type(exc).__name__}: {exc}")
+        else:
+            print(f"ok    {name}")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
