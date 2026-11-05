@@ -88,36 +88,48 @@ function showView(v) {
   }
   // 数据页只读：进页时刷一次扫描列表（新跑完的扫描要能选到），再把曲线按卡片尺寸重排
   if (view === 'data') {
-    loadDataScans();
+    // 扫描列表回来之后要再刷一次两张整幅图的「该重算」标记：
+    // 刚进页面时列表还是空的，scanIdOf() 给 null —— 那一格会写成「现在选的是 #null」（编出来的号）。
+    loadDataScans().then(function () { mapSyncUI(); alignSyncUI(); });
     loadDataSources();     // 「这条是哪台设备采的」的选项（系数只在后端，前端只拿键与文案）
     fitChart(dataChart, 'data-chart', 240);
     fitChart(specChart, 'spec-chart', 180);
     mapPolling.start();    // 后端手里那份相位图（上次算的、或刷新前的）接上；没有就立刻停
+    alignPolling.start();  // 强度对齐那张同理
   }
   location.hash = v;   // 刷新、或者开两个标签各停一页，都靠它
 }
 
 /* ==================== 请求 ==================== */
 
-async function request(method, path, body) {
+/* 一次请求的**前半段**：连不上、或者后端回了非 2xx —— 把原因摆出来并返回 null，
+   否则交回那个 response 让调用方自己取（JSON 还是字节）。
+
+   走二进制的 fetchPair 借不了 request 的 JSON 解析，但"怎么算失败"只有这一处：
+   连不上那句话与 detailText 那一段，两份各写一遍就是两个会各自走样的版本。 */
+async function fetchChecked(path, opts) {
   let resp;
   try {
-    resp = await fetch(path, {
-      method: method,
-      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body)
-    });
+    resp = await fetch(path, opts);
   } catch (err) {
     toast('连不上后端：' + err.message, true);
     return null;
   }
+  if (resp.ok) return resp;
   let data = null;
   try { data = await resp.json(); } catch (err) { /* 空响应体 */ }
-  if (!resp.ok) {
-    toast(detailText(data, resp.status), true);
-    return null;
-  }
-  return data;
+  toast(detailText(data, resp.status), true);
+  return null;
+}
+
+async function request(method, path, body) {
+  const resp = await fetchChecked(path, {
+    method: method,
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  if (!resp) return null;
+  try { return await resp.json(); } catch (err) { return null; }   // 空响应体
 }
 
 /* FastAPI 的 422 把 detail 放成 [{loc, msg}, ...]，直接塞进 textContent 会变成 [object Object] */
@@ -648,7 +660,7 @@ function makeChart(id, opt) {
     width: chartWidth($(id)),
     height: chartHeight($(id), h),   // 建图时的高度；随后 fitChart 按卡片实际尺寸校正
     scales: { x: { time: false } },
-    legend: { show: true },
+    legend: { show: opt.legend !== false },
     series: [{ label: opt.xlabel }].concat(opt.series),
     axes: [
       { stroke: '#64748b', grid: { stroke: '#e2e8f0' }, ticks: { stroke: '#cbd5e1' } },
@@ -1867,6 +1879,8 @@ const DATA_TABS = {
           note: '只留下选中的那段波长，加回时域' },
   map: { tab: 'data-tab-map', card: 'card-map', chart: null, height: 0,
          note: '整幅图里每个像素跟基准像素差多少相位' },
+  align: { tab: 'data-tab-align', card: 'card-align', chart: null, height: 0,
+           note: '整幅图里哪个像素的条纹更深（除掉了各自的直流）' },
 };
 
 function dataTabShow(name) {
@@ -1978,7 +1992,15 @@ function dataScaleToggle() {
    7) 纵轴是**功率**：(A²+B²)/2 —— 纯正弦幅度 A 进来，峰高就是 A²/2（单边均方功率）；
       切到 dB 是相对这条谱里最强的那根（0 dB = 最强）。
    8) 算在前端：那两列数据取一次就在手里，换读法、切 dB 都即时重算/重画，不再读几千张 PNG。
-      **物理系数（2 与 c）仍然只写在后端一处** —— 这里拿到的已经是 time_fs，只做 fs→THz 的换单位。 */
+      **物理系数（2 与 c）仍然只写在后端一处** —— 这里拿到的已经是 time_fs，只做 fs→THz 的换单位。
+   9) **谱线密度**（「谱线密度」下拉，1/2/4/8）：频率格从 k/T 缩到 k/(m·T)，同一条连续谱多采几个点。
+      **这不是补零**：非均匀采样没有"零该插在哪一刻"这回事，补零要先重采样，等于换一条采样序列
+      （第 2 条）。它也不是提高分辨率 —— 分辨率永远是 1/T（T 是真的观测了多久），
+      谱线间距才是 1/(m·T)，统计条里两格分开写。
+      整数格（k 是整数，即 j = m·k）上的 A/B **一根不差**，所以滤波、波段、相位图全都不跟着变：
+      那些要的是一条**完备**的基（k = 1..floor((n-1)/2) 加上直流正好 n 根），
+      细格多出来的半格分量不在这个基里，把它们加回时域会让重建失真（实测 m=4 全带加回误差 0.96 → 3.0）。
+      所以：**画跟着密度走，算钉在整数格**。 */
 /* 频谱横轴两种读法：频率（THz）与波长（µm）。λ = 系数 ÷ ν —— **同一串数换刻度**：
    每根谱线的功率不变，只换横坐标（不是把功率谱按密度换算，也不乘雅可比因子）。
    波长列是**降序**的（频率升 → 波长降），画之前倒一次（见 specXY）：一次置换，不产生新数。 */
@@ -1989,7 +2011,15 @@ const SPEC_AXIS = {
           fmax: '波长范围 (µm)', peak: '最强分量 (µm)', unit: 'µm' },
 };
 
+/* 相位那条轴写什么：**不是** atan2 原样 —— 已展开、已减去线性相位、零在最强那根上（见 specPhase）。 */
+const SPEC_PH_LABEL = '相位 (rad，去线性)';
+
 const SPEC_MIN_POINTS = 16;     // 比这少就不出图：几个点算出来的"谱"没有意义
+// 一根谱线「解得出」的条件数上限：**与 backend/bands.py 的 SOLVABLE_KAPPA 同一条判据**。
+// 低于它就当这根解不出来（系数被放大到没有意义），与后端丢掉同一根 —— 两边丢的不是同一批，
+// 滤波曲线与整幅图就说的不是同一条带。det > 0 挡不住这一类（等间隔奇数点的 Nyquist
+// 相对 det 是 0.94，两个特征值之比却是 6e-26）。
+const SPEC_SOLVABLE_KAPPA = 1e12;
 const SPEC_BAD_SHOWN = 3;       // 不合格的点最多列几个（够定位就行，不刷屏）
 const SPEC_FS_TO_THZ = 1e3;     // 1/fs = 1e15 Hz = 1000 THz：只换单位，不含任何物理系数
 const SPEC_DB_FLOOR = -180;     // dB 下限：功率为 0 的频点 log 发散，压在它上面
@@ -2003,14 +2033,28 @@ let specChartDb = null;         // 上面那张图是按哪种纵轴画的（换
 let specChartAxis = null;       // 上面那张图是按哪种横轴画的（同理：重建）
 let specAxis = 'freq';          // 频谱横轴：freq = 频率 (THz) | wave = 波长 (µm)
 let specDb = false;             // 纵轴：false = 功率 (ADU²)，true = dB（0 = 最强那根）
+let specDensity = 4;            // 谱线密度：频率格 = k/(密度·T)。只管画，算的一律在整数格上（见上面第 9 条）
 
 /* 这条序列的功率谱；不合格就返回 {error}（说清哪一点、为什么）。
    非均匀 DFT：频率格 k/T，每个频率上解一次 cos/sin 的最小二乘（2×2 正规方程），功率 = (A²+B²)/2。
    均匀采样时它就是教科书那个单边幅度谱的平方，非均匀采样时照样成立 —— 这正是"按真实点间距算"的意义。
 
    三角函数用**递推**省掉：固定一个点，第 k 格的相位正好是第 1 格的 k 倍，复数乘一步就到下一格
-   （K 步累计误差 ~1e-11，可忽略）。2000 点 × 1000 格约 20 ms，所以同步算、不用等。 */
-function pixelSpectrum(d) {
+   （K 步累计误差 ~1e-11，可忽略）。2000 点 × 1000 格实测 4.2 ms（Chromium headless）/ 3.8 ms（node），
+   所以同步算、不用等。
+   密度 m 只是把"第 1 格"的相位增量除以 m、格数乘 m：同一轮循环，多跑几圈。 */
+/* 这个 2×2 正规方程解不解得出 —— **与 backend/bands.py 的 solvable 同一条式子**
+   （参数就是 Gram 矩阵那三个数，判据是它的条件数，不是行列式的符号）。
+   两边必须丢同一批谱线：不然滤波曲线（前端）与整幅图（后端）说的不是同一条带。 */
+function specSolvable(scc, sss, scs) {
+  const mid = (scc + sss) / 2, disc = Math.hypot((scc - sss) / 2, scs);
+  const hi = mid + disc, lo = mid - disc;
+  if (!(hi > 0) || !(lo > 0)) return false;
+  return hi / lo <= SPEC_SOLVABLE_KAPPA;
+}
+
+function pixelSpectrum(d, m) {
+  m = m || 1;
   const n = d.value.length;
   const time = d[dataTimeKey()];        // 时间列跟着横轴口径走（原值口径下那串数大 1/系数）
   const bad = [];
@@ -2043,44 +2087,54 @@ function pixelSpectrum(d) {
   const df = 1 / span;                      // 频率步长（1/fs）
   const kMax = Math.floor((n - 1) / 2);     // 上限 = 1/(2×平均间距)，正好落在第 kMax 格
 
-  const scc = new Float64Array(kMax + 1), sss = new Float64Array(kMax + 1);
-  const scs = new Float64Array(kMax + 1), yc = new Float64Array(kMax + 1);
-  const ys = new Float64Array(kMax + 1);
-  const ph1 = 2 * Math.PI * df;
+  const K = kMax * m;                       // 画出来的谱线数（第 j 根 = 整数格 k/m 处）
+  const scc = new Float64Array(K + 1), sss = new Float64Array(K + 1);
+  const scs = new Float64Array(K + 1), yc = new Float64Array(K + 1);
+  const ys = new Float64Array(K + 1);
+  const ph1 = 2 * Math.PI * df / m;         // 第 1 根（细格）的相位增量
   for (let i = 0; i < n; i++) {
     const vi = d.value[i] - mean;           // 去均值：直流不画
-    const g = ph1 * (time[i] - t0);         // 第 1 格的相位
+    const g = ph1 * (time[i] - t0);         // 第 1 根的相位
     const c1 = Math.cos(g), s1 = Math.sin(g);
     let c = c1, s = s1;
-    for (let k = 1; k <= kMax; k++) {
-      scc[k] += c * c; sss[k] += s * s; scs[k] += c * s;
-      yc[k] += vi * c; ys[k] += vi * s;
-      const nc = c * c1 - s * s1;           // 走到下一格
+    for (let j = 1; j <= K; j++) {
+      scc[j] += c * c; sss[j] += s * s; scs[j] += c * s;
+      yc[j] += vi * c; ys[j] += vi * s;
+      const nc = c * c1 - s * s1;           // 走到下一根
       s = s * c1 + c * s1; c = nc;
     }
   }
 
-  const f = new Array(kMax), p = new Array(kMax);
-  const A = new Float64Array(kMax + 1), B = new Float64Array(kMax + 1);   // 索引就是格号 k
+  const f = new Array(K), p = new Array(K);
+  const A = new Float64Array(K + 1), B = new Float64Array(K + 1);   // 索引就是细格号 j
   let peakI = 0;
-  for (let k = 1; k <= kMax; k++) {
-    const det = scc[k] * sss[k] - scs[k] * scs[k];
+  for (let j = 1; j <= K; j++) {
+    const det = scc[j] * sss[j] - scs[j] * scs[j];
     let pw = 0;
-    if (det > 0) {
-      A[k] = (yc[k] * sss[k] - ys[k] * scs[k]) / det;
-      B[k] = (ys[k] * scc[k] - yc[k] * scs[k]) / det;
-      pw = (A[k] * A[k] + B[k] * B[k]) / 2;
+    if (specSolvable(scc[j], sss[j], scs[j])) {
+      A[j] = (yc[j] * sss[j] - ys[j] * scs[j]) / det;
+      B[j] = (ys[j] * scc[j] - yc[j] * scs[j]) / det;
+      pw = (A[j] * A[j] + B[j] * B[j]) / 2;
     }
-    f[k - 1] = k * df * SPEC_FS_TO_THZ;
-    p[k - 1] = pw;
-    if (pw > p[peakI]) peakI = k - 1;
+    f[j - 1] = j * df / m * SPEC_FS_TO_THZ;
+    p[j - 1] = pw;
+    if (pw > p[peakI]) peakI = j - 1;
   }
   if (!(p[peakI] > 0)) return { error: '这条序列一点起伏都没有（每个点的值都一样），做不了谱。' };
-  // A/B 一并带出去：**滤波那一步就是把选中的那几根按同样的 cos/sin 加回去**（见 filteredCurve）。
+  // A/B 一并带出去：**滤波那一步就是把选中的那几根按同样的 cos/sin 加回去**（见 filteredSignal）。
   // 丢掉它们就得把上面这一整轮重算一遍 —— 分量本来就在手里，没理由只留功率。
+  //
+  // **两份索引，两份用途**（见上面第 9 条）：
+  //   A/B     索引是**细格号 j**（1..K）—— 画谱、画相位用，跟着密度走；
+  //   cA/cB   索引是**整数格号 k**（1..kMax）—— 滤波、波段、包络用，钉死在完备基上。
+  // 整数格上两者数值完全相同（j = m·k），分成两份只是为了让"用错索引"不可能悄悄发生：
+  // 细格多出来的半格分量加回时域会让重建失真（实测 m=4 全带加回误差 0.96 → 3.0）。
+  const cA = new Float64Array(kMax + 1), cB = new Float64Array(kMax + 1);
+  for (let k = 1; k <= kMax; k++) { cA[k] = A[k * m]; cB[k] = B[k * m]; }
   return {
-    f: f, p: p, A: A, B: B, kMax: kMax, n: n, mean: mean, t0: t0, df: df, time: time,
-    span_fs: span, df_thz: df * SPEC_FS_TO_THZ,
+    f: f, p: p, A: A, B: B, cA: cA, cB: cB, kMax: kMax, m: m,
+    n: n, mean: mean, t0: t0, df: df, time: time,
+    span_fs: span, df_thz: df * SPEC_FS_TO_THZ, step_thz: df * SPEC_FS_TO_THZ / m,
     fmax_thz: kMax * df * SPEC_FS_TO_THZ, peakF: f[peakI], peakP: p[peakI],
   };
 }
@@ -2098,23 +2152,88 @@ function specSeries() {
 
 function specYLabel() { return specDb ? '功率 (dB，0 = 最强分量)' : '功率 (ADU²)'; }
 
-/* 右边那条轴：每根谱线的**相位**（弧度 —— atan2 本来就是弧度，不换算、也就没有换算系数）。
-   A·cos + B·sin = R·cos(2πf(t−t0) − φ)，所以 φ = atan2(B, A) ——
-   与滤波"把这几根加回来"用的是同一对分量，φ 的定义只有这一处。
-   **相位只在有信号的地方有意义**：门限以下的两个数都几乎是零，相除出来的相位是随机的
-   （画出来是噪声，不是相位），所以那里留空、曲线断开 —— 不插值、不补值、也不外推。
+/* 右边那条轴画的是什么（口径全在这一段里）：每根谱线解出来的分量相对**这条序列最早那一拍 t0** 的相位
+   φ = atan2(B, A)（A·cos + B·sin = R·cos(2πf(t−t0) − φ)，弧度，不换算）—— 与滤波"把这几根加回来"
+   用的是同一对分量，φ 的定义只有这一处。它是**一段一段算出来的**，画之前要做两件事，见 specPhase。
+
    门限由「相位门限 (dB)」那个框说了算（相对最强那根多少 dB 以内），**留空 = 不设门限**（整条都画）。 */
 function specPhaseGate() {
   const v = parseFloat($('spec-phmin').value);
   return isNaN(v) ? -Infinity : v;
 }
+/* 相位轴 = **偏离线性相位的那部分**，零钉在门限内最强的那一根上。
+
+   三步，一步一个决定：
+
+   1) **展开**：沿频率升序，相邻两根的相位差折到 (−π, π] 再累加（与滤波那条相位同一个做法）。
+      折算不出来的是"差了几个整圈"—— 那正是展开要去掉的东西。
+   2) **减去线性相位**（群延迟）。φ(ν) = 2π·ν·τ 是"整段信号比 t0 晚到了 τ"：几十 ps 的延迟
+      摊到 THz 上就是几万弧度的一条斜坡，不拿掉它，右边那条轴只剩这条斜坡，别的什么都看不见。
+      斜率 τ 由**门限内相邻两根都在画的那几对**按功率加权量出来（跨空档的两根不相邻，
+      它们之间差几个整圈本来就没法知道，不参与）；一步 = 2π·τ·(谱线间距)。
+   3) **平移到最强那根为 0**：减去 φ(ν_ref) + 斜率·(ν − ν_ref)，ν_ref = 门限内最强的那一根。
+      于是最强那根处的相位恒为 0、它附近几乎是平的（同一时刻到的分量相位都一样）；
+      剩下的起伏才是**色散** —— 各根到的时刻不一样，那才是这张图要说的事。
+
+   返回 {ph, step, n, tau_fs}：step = 相邻两根（同一段里）折过的最大差分，**展开的前提要 < π**；
+   tau_fs = 被拿掉的那条直线的群延迟（fs，相对 t0），量不出来（门限内没有相邻的两根）时 null。 */
 function specPhase() {
-  const s = specLast, gate = specPhaseGate(), out = new Array(s.p.length);
-  for (let i = 0; i < s.p.length; i++) {
-    const ok = s.p[i] > 0 && 10 * Math.log10(s.p[i] / s.peakP) >= gate;
-    out[i] = ok ? Math.atan2(s.B[i + 1], s.A[i + 1]) : null;   // 索引 i+1 就是格号 k
+  const s = specLast, gate = specPhaseGate(), K = s.p.length, out = new Array(K);
+  const idx = [];                                        // 门限内的细格下标（频率升序）
+  for (let i = 0; i < K; i++) {
+    out[i] = null;
+    if (s.p[i] > 0 && 10 * Math.log10(s.p[i] / s.peakP) >= gate) idx.push(i);
   }
-  return out;
+  const n = idx.length;
+  if (!n) return { ph: out, step: null, n: 0, tau_fs: null };
+
+  // 细格 k 的相位：s.B[k+1], s.A[k+1]（索引 i+1 就是细格号 j）
+  const raw = function (i) { return Math.atan2(s.B[i + 1], s.A[i + 1]); };
+  const wrap = function (d) { return d - 2 * Math.PI * Math.round(d / (2 * Math.PI)); };
+
+  // 1) 群延迟：只量**相邻两根都在门限内**的那几对，按功率加权（弱的那根决定这一对的分量）
+  const df = s.step_thz;                                 // 相邻细格的间隔（THz）
+  let sw = 0, sd = 0, step = 0;
+  for (let t = 1; t < n; t++) {
+    if (idx[t] !== idx[t - 1] + 1) continue;             // 中间隔着门限外的格：不是"相邻两根"
+    let d = raw(idx[t]) - raw(idx[t - 1]);
+    d = wrap(d);
+    if (Math.abs(d) > step) step = Math.abs(d);
+    const w = Math.min(s.p[idx[t]], s.p[idx[t - 1]]);
+    sw += w; sd += w * d;
+  }
+  const slope = sw > 0 ? sd / sw / df : 0;               // rad/THz
+
+  // 2) 展开：跨过门限空档时用斜率预测它"该走多远"，只把预测之外的残差折回来累加 ——
+  //    空档里少看了几根谱线，但斜率已经在手里，那一段的圈数就不是靠猜的。
+  //    **量不到斜率就不展开**：孤立的那几根之间差几个整圈无从判断，如实画 atan2 原值，
+  //    假装展开只是把猜出来的数画成一条线。
+  const measured = sw > 0;
+  if (measured) {
+    let prev = -1, prevRaw = 0, acc = 0;
+    for (let t = 0; t < n; t++) {
+      const i = idx[t], r = raw(i), stepT = slope * df * (i - prev);
+      if (prev >= 0) acc += stepT + wrap(r - prevRaw - stepT);
+      prev = i; prevRaw = r;
+      out[i] = acc;
+    }
+  } else {
+    for (let t = 0; t < n; t++) out[idx[t]] = raw(idx[t]);
+  }
+
+  // 3) 平移到最强那一根：零点是"看的人盯着的那根"，不是 t0 —— 零点在 t0 时这条线与横轴无关，
+  //    谁是零点由信号到达时刻决定，图上反而读不出东西。
+  let ref = idx[0];
+  for (let t = 1; t < n; t++) if (s.p[idx[t]] > s.p[ref]) ref = idx[t];
+  const refPh = out[ref], refF = s.f[ref];       // 先取出来：这个循环会就地改 out，不能边改边当基准
+  for (let t = 0; t < n; t++) {
+    const i = idx[t];
+    out[i] -= refPh + slope * (s.f[i] - refF);
+  }
+
+  // 量不到（门限内没有相邻的两根）就给 null：写个 0 会被读成"没绕过圈，可以放心"
+  const tau_fs = measured ? slope / (2 * Math.PI) * 1000 : null;   // rad/THz → ps → fs
+  return { ph: out, step: measured ? step : null, n: n, tau_fs: tau_fs };
 }
 
 /* 相位点稀的时候**只有线是看不见的**：门限内相邻的两个点之间隔着空档，uPlot 不连线，
@@ -2129,14 +2248,26 @@ function phasePointsBelow(max) {
   };
 }
 
-/* 门限改了只重画那一列：相位是一对现成分量的 atan2 —— 不重算谱、不重新取数。
+/* 门限改了只重画那一列：相位是现成那对分量算出来的（展开 + 减线性 + 平移到最强那根）——
+   不重算谱、不重新取数。
    右边那条轴没被钉住（它没有范围框），所以新的一列一进来它自己就重新铺满。
    **setData 之后必须把两个范围框再套一次**：uPlot 一收新数据就把 x/y 都按数据重新铺满，
    钉住的窗口也会被顶掉（与 renderSpectrum 里 setData 之后那一步同一个原因）。 */
 function specPhaseApply() {
   if (!specChart || !specLast || specLast.error) return;
-  specChart.setData(specXY());
+  const P = specPhase();
+  specChart.setData(specCols(P));
   applySpecRange();
+  specPhaseStats(P);
+}
+
+/* 统计条里那两格：**拿掉的那条直线**（群延迟）与**展开的前提**（逐根最大步长）。
+   与滤波那条相位同一个规矩：步长逼近 π 时相邻两根差几个整圈分不出来，展开不可信 ——
+   谱线密度 1× 时它就在 π 附近（每根差 2π·df·τ），所以这一格写出来，让人一眼知道该不该信。
+   门限内一根都没有就都是「—」；只有一根时没有"相邻的两根"，步长也没有。 */
+function specPhaseStats(P) {
+  setText('spec-ptau', P.tau_fs === null ? '—' : P.tau_fs.toFixed(1));
+  setText('spec-pstep', P.step === null ? '—' : P.step.toFixed(3));
 }
 
 /* 波长换算的系数来自后端（取数响应里那份）—— 前端一个物理常数都不写。 */
@@ -2151,9 +2282,12 @@ function specAxisState() {
 
 /* 图上的三列（横轴照当前读法、纵轴照功率/dB、右边那条照相位）。波长那一列倒过来画：
    uPlot 要横坐标递增，而 λ 随 ν 递减 —— 一次置换，每个点带着自己的值走（**两条纵列一起搬**），
-   不产生新数。 */
-function specXY() {
-  const s = specLast, y = specSeries(), ph = specPhase(), n = s.f.length;
+   不产生新数。
+   **展开不跟着置换走**：累加永远按频率升序（那是这条谱自己的顺序），置换只搬已经算好的数。 */
+function specXY() { return specCols(specPhase()); }
+
+function specCols(P) {
+  const s = specLast, y = specSeries(), ph = P.ph, n = s.f.length;
   if (specAxis !== 'wave') return [s.f, y, ph];
   const c = specC(), xs = new Array(n), ys = new Array(n), ps = new Array(n);
   for (let i = 0; i < n; i++) {
@@ -2184,8 +2318,9 @@ function renderSpectrum(d) {
   // 停在波长轴、这条响应却没有波长系数（老后端）→ **退回频率轴**：宁可显示频率，
   // 也不能拿 undefined 当横坐标画出一张空图。按钮那边会把原因写在 title 上。
   if (specAxis === 'wave' && !specC()) { specAxis = 'freq'; specAxisApplyLabels(); }
-  if (specSrc !== d || specScale !== dataScale) {   // 口径换了，时间列就换了，谱要重算
-    specLast = pixelSpectrum(d);
+  // 口径换了、密度改了，谱都要重算（密度只改画的格，整数格上那几根一个不差 —— 见第 9 条）
+  if (specSrc !== d || specScale !== dataScale || specLast === null || specLast.m !== specDensity) {
+    specLast = pixelSpectrum(d, specDensity);
     specSrc = d;
     specScale = dataScale;
   }
@@ -2193,8 +2328,8 @@ function renderSpectrum(d) {
   const empty = $('spec-empty');
   if (spec.error) {
     setText('spec-title', '—');
-    ['spec-n', 'spec-span', 'spec-df', 'spec-fmax', 'spec-peak', 'spec-peakval']
-      .forEach(function (id) { setText(id, '—'); });
+    ['spec-n', 'spec-span', 'spec-step', 'spec-df', 'spec-fmax', 'spec-peak', 'spec-peakval',
+     'spec-ptau', 'spec-pstep'].forEach(function (id) { setText(id, '—'); });
     empty.hidden = false;
     empty.className = 'hint warn';       // 不合格是"这条做不了"，不是"还没取数"
     empty.textContent = spec.error;
@@ -2210,7 +2345,8 @@ function renderSpectrum(d) {
     specChart.destroy();
     specChart = null;
   }
-  const data = specXY();
+  const P = specPhase();          // 一次算完：图上的第三列与统计条用的是**同一份**
+  const data = specCols(P);
   if (!specChart) {
     specChartDb = specDb;
     specChartAxis = specAxis;
@@ -2219,11 +2355,11 @@ function renderSpectrum(d) {
       height: 180,
       series: [{ label: specYLabel(), stroke: '#7c3aed', width: 1.2,
                  points: { show: showPointsBelow(400), size: 4 } },
-               // 相位（右边那条轴）：门限以外留空，曲线在那儿断开
-               { label: '相位 (rad)', stroke: '#b45309', width: 1, scale: 'y2',
+               // 相位（右边那条轴）：已展开、已减去线性相位、零在最强那根上；门限以外留空
+               { label: SPEC_PH_LABEL, stroke: '#b45309', width: 1, scale: 'y2',
                  points: { show: phasePointsBelow(400), size: 4, fill: '#b45309' } }],
       yaxis2: { scale: 'y2', side: 1, stroke: '#b45309', grid: { show: false },
-                ticks: { stroke: '#f0c48a' }, size: 58, label: '相位 (rad)' },
+                ticks: { stroke: '#f0c48a' }, size: 58, label: SPEC_PH_LABEL },
       data: data,
     });
     // 滚轮/拖动挂在新图上（重建后旧元素没了，见 rangeBox.attach）
@@ -2245,7 +2381,10 @@ function renderSpectrum(d) {
     (dataScale === 'raw' ? '读回原值' : '折算 µm'));
   setText('spec-n', String(spec.n));
   setText('spec-span', spec.span_fs.toFixed(1));
-  setText('spec-df', spec.df_thz.toFixed(3));      // 分辨率永远按频率写（波长刻度上疏密不均）
+  // 两格分开写：**谱线间距**跟着密度走，**分辨率**永远是 1/T（T 是真的观测了多久）。
+  // 波长刻度上疏密不均，所以两格都按频率写。
+  setText('spec-step', spec.step_thz.toFixed(3));
+  setText('spec-df', spec.df_thz.toFixed(3));
   if (specAxis === 'wave') {
     const c = specC();
     setText('spec-fmax', (c / spec.fmax_thz).toFixed(3) + ' ~ ' + (c / spec.f[0]).toFixed(1));
@@ -2255,6 +2394,7 @@ function renderSpectrum(d) {
     setText('spec-peak', spec.peakF.toFixed(3));
   }
   setText('spec-peakval', specNum(spec.peakP));
+  specPhaseStats(P);                      // 同一个 P：图上画的那条与统计条说的必须是同一次算出来的
 }
 
 /* 频率轴（X）与纵轴（Y）**各是一个范围框**（同一套规矩，见 rangeBox），各钉各的标记、各一个「自动范围」。 */
@@ -2302,7 +2442,8 @@ function applySpecRange() { specX.apply(); specY.apply(); }
 
 /* 「聚焦最强峰」：把频率轴窗口填成以最强分量为中心的一段。**与「自动范围」同一层** ——
    只是替你把两个数填进范围框并钉住（框仍然是唯一的准，之后滚轮/拖动照旧改框里的数）。
-   宽度 = max(20 根谱线, 峰频的 20%)：分辨率细的谱别只框住一根线，峰靠 0 的别框到负频率去。
+   宽度 = max(20 个**分辨率格**（1/T）, 峰频的 20%)：分辨率细的谱别只框住一根线，峰靠 0 的别框到负频率去。
+   用 1/T 而不是画出来的间距 —— 这是这条数据的属性，改谱线密度不该把窗口挪掉。
    波长读法下按同一个式子换算，**两端对调**（频率高的那头波长短，与 specAxisToggle 同式）。 */
 function specFocusPeak() {
   const s = specLast;
@@ -2368,11 +2509,38 @@ function filtBoxes() {
            lmax: isFinite(vmax) && vmax > 0 ? vmax : null };
 }
 
+/* 波段**只有这一个来源**：上面那两个框。`all` = 两个都空（全通）——
+   全通收不收由调用方判（相位图拒、强度对齐照算），"读哪两个框"这件事只在这里。 */
+function bandOf() {
+  const b = filtBoxes();
+  return { lmin: b.lmin, lmax: b.lmax, all: b.lmin === null && b.lmax === null };
+}
+
+/* 波段写成一句话。`allText` 是"两个框都空"时那句的后半 —— 两张整幅图对全通的处置不同，
+   前半句与格式只有这一份。 */
+function bandText(b, allText) {
+  if (b.all) return '波段：全通（两个波长框都空着）—— ' + allText;
+  // 波长与频率反向：**短波那一头是高频**。所以"波长最小"管的是频率上限 ⇒ 波长 ≥ lmin；
+  // "波长最大"管的是频率下限 ⇒ 波长 ≤ lmax（与 filtKeepRange 里那两个判断一一对应）。
+  const lo = b.lmin === null ? '≤ ' + b.lmax
+           : (b.lmax === null ? '≥ ' + b.lmin : b.lmin + ' ~ ' + b.lmax);
+  return '波段：' + lo + ' µm（在〈滤波曲线〉那张卡里改）';
+}
+
+/* 波段 → 查询串。`extra` 是这条流程自己多带的参数（相位图的 at_um），照原样拼在后面。 */
+function bandQuery(b, extra) {
+  const q = [];
+  if (b.lmin !== null) q.push('lmin=' + encodeURIComponent(b.lmin));
+  if (b.lmax !== null) q.push('lmax=' + encodeURIComponent(b.lmax));
+  if (extra) for (let i = 0; i < extra.length; i++) q.push(extra[i]);
+  return q.length ? '?' + q.join('&') : '';
+}
+
 /* 波长框里的两个数 → 谱上的第几根到第几根。λ 与 ν 反向：**短波那一头是高频**，
    所以「波长最小」管的是频率上限。两个框都空 = 全通；只填一边，另一边就是不限。 */
 function filtKeepRange(s) {
-  const b = filtBoxes();
-  if (b.lmin === null && b.lmax === null) return { ok: true, all: true, kLo: 1, kHi: s.kMax };
+  const b = bandOf();
+  if (b.all) return { ok: true, all: true, kLo: 1, kHi: s.kMax };
   const c = specC();
   if (!c) return { ok: false, why: '这次取数里没有波长换算系数（后端没给）—— 按波长选范围用不了。' };
   let kLo = 1, kHi = s.kMax;
@@ -2383,6 +2551,8 @@ function filtKeepRange(s) {
 
 /* 只留下 kLo~kHi 那几根谱线，加回时域。一根不剩（kHi < kLo）就是一条 0 平线 ——
    如实画成平线并在界面上说清，不假装没有这条曲线。
+   **这里的 k 一律是整数格号**（用 s.cA/s.cB）：一条完备的基才能原样加回去，
+   细格（谱线密度 > 1）多出来的那几根不在基里 —— 它们只画，不参与重建（见 pixelSpectrum 第 9 条）。
    **一次累加给出三样东西**（同源，相位不是另算一遍）：
      实部  Σ (A_k·cosθ + B_k·sinθ)            = 那条时间曲线（**直流不加回来**：绕 0 摆，
                                                   就是纯带通结果；像素均值留在统计条里）
@@ -2411,7 +2581,7 @@ function filteredSignal(s, kLo, kHi) {
   const w = 2 * Math.PI * s.df;
   let pSum = 0, fSum = 0;
   for (let k = kLo; k <= kHi; k++) {              // 带内功率重心（THz）：减线性相位用它
-    const p = s.A[k] * s.A[k] + s.B[k] * s.B[k];
+    const p = s.cA[k] * s.cA[k] + s.cB[k] * s.cB[k];
     pSum += p;
     fSum += p * k * s.df * SPEC_FS_TO_THZ;
   }
@@ -2423,8 +2593,8 @@ function filteredSignal(s, kLo, kHi) {
     let c = Math.cos(step * kLo), sn = Math.sin(step * kLo);
     let zr = 0, zi = 0;
     for (let k = kLo; k <= kHi; k++) {
-      zr += s.A[k] * c + s.B[k] * sn;
-      zi += s.A[k] * sn - s.B[k] * c;
+      zr += s.cA[k] * c + s.cB[k] * sn;
+      zi += s.cA[k] * sn - s.cB[k] * c;
       const nc = c * dc - sn * ds;
       sn = sn * dc + c * ds;
       c = nc;
@@ -2457,7 +2627,7 @@ function filteredSignal(s, kLo, kHi) {
   const tRef = s.time[jRef];
   const psi0 = envs[jRef] > 0 ? Math.atan2(ziA[jRef], zrA[jRef]) : 0;
   const mag = new Array(kHi + 1);
-  for (let k = kLo; k <= kHi; k++) mag[k] = Math.sqrt(s.A[k] * s.A[k] + s.B[k] * s.B[k]);
+  for (let k = kLo; k <= kHi; k++) mag[k] = Math.sqrt(s.cA[k] * s.cA[k] + s.cB[k] * s.cB[k]);
   const cp0 = Math.cos(psi0), sp0 = Math.sin(psi0);
   const flat = new Array(n);
   for (let i = 0; i < n; i++) {
@@ -2700,19 +2870,101 @@ const filtY = rangeBox({
 
 function applyFiltRange() { filtX.apply(); filtY.apply(); }
 
+/* ==================== 整幅图公共：相位图与强度对齐共用的一层 ====================
+   两张整幅图走的是同一条管道：起算 → 跟进度 → 抓两列 float32 → 画。管道里**不因图而异**
+   的那几件事住在这里（份的标识、坐标换算、取格、抓二进制、跟任务），各自那一份"哪两列、
+   怎么上色、说什么话"留在各自的段里。分成两处各写一遍，只会多出两个会各自走样的版本。 */
+
+/* 这一份**整幅图结果**落在原始坐标的哪一块（没裁过就是整幅）。裁剪只在读文件那一层减一次偏移，
+   所以坐标口径不因裁剪改变（与取数、剖面、质心同一套）。
+   名字里的 map 是必要的：这层只管"整幅图结果"的 meta，与扫描/裁剪记录里那些 rect 不是一回事。 */
+function mapRectOf(r) {
+  if (!r) return null;
+  return r.rect || [0, 0, r.w, r.h];
+}
+
+/* 哪一份**两列图**：扫描号 + 波段 + 幅面 —— 与 n、门限这类"显示这一层"的数无关。
+   两份流程都从它起头，多出来的那一格（相位图的"哪一刻"）由调用方接在后面。 */
+function pairKey(r) {
+  if (!r) return '';
+  return [r.scan_id, r.k_lo, r.k_hi, r.n, r.w, r.h].join('|');
+}
+
+/* 现在选的是哪一条扫描（两条整幅图都要它来判断"手里这张是不是当前这一条"）。 */
+function scanIdOf() { const s = dataScanPick(); return s ? s.id : null; }
+
+/* 鼠标落在画布上的哪一格：画布内部分辨率就是**盘上那张图**的像素数，这里只有一次比例换算，
+   不插值、不重采样 —— 返回的 x / y 是**原始坐标**。 */
+function pickCell(ev, canvasId, data, r) {
+  const box = $(canvasId).getBoundingClientRect();
+  if (!data || !box.width || !box.height) return null;
+  const sx = Math.floor((ev.clientX - box.left) / box.width * data.w);
+  const sy = Math.floor((ev.clientY - box.top) / box.height * data.h);
+  if (sx < 0 || sy < 0 || sx >= data.w || sy >= data.h) return null;
+  const rect = mapRectOf(r);
+  return { x: sx + rect[0], y: sy + rect[1], i: sy * data.w + sx };
+}
+
+/* 两列 float32 走二进制口：形状在结果里（w×h 各一列，连着给）。
+   失败的前半段走 `fetchChecked`（与 JSON 那条路同一处：连不上、非 2xx 各一句原话）；
+   这里只管二进制自己的两件事 —— 长度不对、以及慢响应。
+   抓不到 / 长度对不上就说清楚并返回 null —— **不硬画**（半张图比没有图更坏）。
+   `stale()` 在拿到字节之后、验长度之前问一次：这条流程换了对象（慢响应）就整份丢掉，
+   连"长度不对"都不该报 —— 那不是这一份的事。 */
+async function fetchPair(url, r, what, stale) {
+  const resp = await fetchChecked(url);      // 连不上 / 非 2xx：原因已经摆出来了
+  if (!resp) return null;
+  const buf = await resp.arrayBuffer();
+  if (stale && stale()) return null;
+  const n = r.w * r.h;
+  if (buf.byteLength !== n * 8) {
+    toast(what + '数据长度不对（' + buf.byteLength + ' 字节，应该是 ' + (n * 8) + '）', true);
+    return null;
+  }
+  return { first: new Float32Array(buf, 0, n), second: new Float32Array(buf, n * 4, n) };
+}
+
+/* 进度行上的每一句话：**从起算到画完，一条流程要说五种**，两条整幅图说的是同一套。
+   各拼一遍就是两个会各自走样的版本（改一处、另一处不动，界面上就开始说两种话）。 */
+const JOB_TEXT = {
+  started: function (total) { return '正在读盘 0 / ' + total + ' 张 …'; },   // 刚起算（后端还没读过一帧）
+  running: function (done, total) { return '正在读盘 ' + done + ' / ' + total + ' 张 …'; },
+  lost: '问不到进度：连不上后端（那条作业可能还在跑）',
+  fetching: '正在取数据…',                                                    // 算完了，两列 float32 还在路上
+  done: function (n) { return '算完了：' + n + ' 张'; },
+};
+
+/* 跟一个后台任务：POST 起算之后，GET 回来的 job 只有五种情形（running / lost / error /
+   waiting / done）。running / lost / error / done 各带一句该写进进度行的话（话在 JOB_TEXT）；
+   **waiting 不带** —— 那是"后端还拿着上一次的结果、这一次还没开始读"，进度行原样不动。
+   **没有进度可跟了就停节拍器**：问不到、算完了、算不动了 —— 停在这里，别让调用方各记一次。 */
+async function pollJob(url, polling) {
+  const d = await get(url);
+  const j = (d && d.job) || null;
+  if (j && j.running) {
+    return { state: 'running', text: JOB_TEXT.running(j.done, j.total) };
+  }
+  polling.stop();
+  // 问不到后端（连不上）：后端那条 job 可能还在跑 —— 照实说，别让进度行停在起算那一句
+  if (!j) return { state: 'lost', text: JOB_TEXT.lost };
+  if (j.error) return { state: 'error', error: j.error, text: '算不了：' + j.error };
+  if (!j.result) return { state: 'waiting' };
+  return { state: 'done', result: j.result, text: JOB_TEXT.done(j.result.n) };
+}
+
 /* ==================== 数据页：相位图（整幅图的相位差） ====================
    一个像素一个复数：把选中那段波长的谱线加回来，得到每个像素的带通信号，再与**全图共用的
    一条载波**相关、取幅角（弧度）；图上是**它减掉基准像素**那一个。
    为什么一遍扫得完、口径是什么，写在 `backend/phasemap.py` 的文件头 —— 这边只管显示：
    后端给相位与条纹强度两列 float32（走 phasemap.bin 那条二进制口），基准像素只是减一个常数，
    所以**换基准不重取数**（在图上点一下就是换基准）。
-   **相位是绕圈的**（写在 (−π, π]）：配色用**顺序**色图（MATLAB jet 那种蓝→青→绿→黄→红），
-   数值靠图下方那条**色标**（图例）读 —— 所以两端（−π 与 +π）分居蓝、红两头：
-   图上"红贴着蓝"的那条缝是绕圈，不是数据跳变。 */
+   **相位是绕圈的**（写在 (−π, π]）：配色用**循环**色图（HSV 色相绕一整圈，饱和度与亮度不动），
+   所以两端（−π 与 +π）几乎同色 —— 绕圈处接得上，图上不再出现那条"红贴着蓝"的假边。
+   数值照旧靠图下方那条**色标**（图例）读。 */
 const MAP_COLOR_N = 256;        // 色图与色标的格数（−π 落在第 0 格，+π 绕回第 0 格）
 const MAP_AMP_FLOOR_DB = -40;   // 强度那张图的底：−40 dB 再低都压在这里（不是留白）
 
-let mapResult = null;           // 后端那一份结果的 meta（扫描号 / 波段 / rect / 幅面 / 谱线）
+let mapResult = null;           // 后端那一份结果的 meta（扫描号 / 波段 / rect / 幅面 / 谱线 / 哪一刻）
 let mapData = null;             // {w, h, phase, amp, ampMax}：两列 float32 + 强度峰值
 let mapLoadedKey = '';          // 已经抓到手里的是哪一份（同一份不再抓一遍二进制）
 let mapRef = null;              // 基准像素，**原始坐标** {x, y}
@@ -2721,56 +2973,55 @@ let mapSeq = 0;                 // 抓二进制的序号：慢响应回来时可
 const mapPolling = poller(mapPoll, 400);
 let mapViewTitle = '';          // 「看」按钮原样的说明
 
-/* 配色表（256 格 × RGB）：**顺序色图**，就是 MATLAB 的 jet 那条分段线性式子
-     r = clamp(1.5 − |4x − 3|)、g = clamp(1.5 − |4x − 2|)、b = clamp(1.5 − |4x − 1|)
-   深蓝 → 青 → 绿 → 黄 → 深红。相图与图下方那条**色标**共用这一份 ——
-   "什么颜色是什么值"只有这一处说了算，图例与图上的颜色不可能对不上。 */
+/* 配色表（256 格 × RGB）：**循环色图** —— HSV 色相在 6 个纯色之间绕一整圈
+     红 → 黄 → 绿 → 青 → 蓝 → 品红 → 红（饱和度与亮度恒为 1，明暗不掺进来）。
+   每格取的是那一段**中点**的色相（x = (i + ½) / 256），不取端点：第 0 格与第 255 格
+   各差半个步进、正好对称，两端只差 3/255 —— −π 与 +π 看不出边界，绕圈处接得上。
+   （照端点取样会留约 24/255 的差，绕圈处仍露出一道浅缝。）
+   相图与图下方那条**色标**共用这一份 —— "什么颜色是什么值"只有这一处说了算。 */
 const MAP_LUT = (function () {
+  const from = [[255, 0, 0], [255, 255, 0], [0, 255, 0], [0, 255, 255], [0, 0, 255], [255, 0, 255]];
+  const to = [[255, 255, 0], [0, 255, 0], [0, 255, 255], [0, 0, 255], [255, 0, 255], [255, 0, 0]];
   const out = new Uint8Array(MAP_COLOR_N * 3);
-  const clamp01 = function (v) { return Math.max(0, Math.min(1, v)); };
   for (let i = 0; i < MAP_COLOR_N; i++) {
-    const x = i / (MAP_COLOR_N - 1);
-    out[i * 3] = Math.round(clamp01(1.5 - Math.abs(4 * x - 3)) * 255);
-    out[i * 3 + 1] = Math.round(clamp01(1.5 - Math.abs(4 * x - 2)) * 255);
-    out[i * 3 + 2] = Math.round(clamp01(1.5 - Math.abs(4 * x - 1)) * 255);
+    const h = (i + 0.5) / MAP_COLOR_N * 6;         // 色相 0~6：六段各占一格
+    const k = Math.floor(h) % 6, f = h - Math.floor(h);
+    for (let c = 0; c < 3; c++) out[i * 3 + c] = Math.round(from[k][c] + (to[k][c] - from[k][c]) * f);
   }
   return out;
 })();
 
+/* 哪一份图：公共那几格 + **哪一刻** —— 时刻不同就是另一份（要重新抓二进制）。 */
 function mapKey(r) {
-  return r ? [r.scan_id, r.k_lo, r.k_hi, r.n, r.w, r.h].join('|') : '';
+  if (!r) return '';
+  return pairKey(r) + '|' + (r.at_um === undefined ? 'whole' : 'at' + r.at_um);
 }
 
-function mapScanId() { const s = dataScanPick(); return s ? s.id : null; }
-
-function mapRect() {            // 这两列数组落在**原始坐标**的哪一块（没裁过就是整幅）
-  const r = mapResult;
-  if (!r) return null;
-  return r.rect || [0, 0, r.w, r.h];
+/* 那一刻填的是什么：**框里留空 = 整条扫描**（与门限留空 = 不设门限同一个脾气）| 一个数 = 读出位置 µm。
+   非数字、或在扫描范围外由后端拒（前端不判范围 —— 它不拥有那条扫描的点位）。 */
+function mapAtPick() {
+  const raw = String($('map-at-um').value || '').trim();
+  if (!raw) return null;
+  const v = parseFloat(raw);
+  return isFinite(v) ? v : NaN;
 }
 
-/* 相位图的波段**只有这一个来源**：〈滤波曲线〉那张卡的两个波长框。
-   两个都空 = 全通 —— 相位图要的是"跟哪一根比"，全通没有那一根，所以拒绝（见后端的 400）。 */
-function mapBand() {
-  const b = filtBoxes();
-  return { lmin: b.lmin, lmax: b.lmax, all: b.lmin === null && b.lmax === null };
+function mapAtQuery(at) {
+  return at === null ? '' : 'at_um=' + encodeURIComponent(at);
 }
 
-function mapBandText() {
-  const b = mapBand();
-  if (b.all) return '波段：全通（两个波长框都空着）—— 相位图算不了，先填一段';
-  // 波长与频率反向：**短波那一头是高频**。所以"波长最小"管的是频率上限 ⇒ 波长 ≥ lmin；
-  // "波长最大"管的是频率下限 ⇒ 波长 ≤ lmax（与 filtKeepRange 里那两个判断一一对应）。
-  const lo = b.lmin === null ? '≤ ' + b.lmax
-           : (b.lmax === null ? '≥ ' + b.lmin : b.lmin + ' ~ ' + b.lmax);
-  return '波段：' + lo + ' µm（在〈滤波曲线〉那张卡里改）';
+/* 「填中点」：把框填成这一条扫描两端的中点（用列表里那条扫描记的起止，不重取点位）。
+   只是把框填上，算不算由「算相位图」说了算 —— 与范围框"没手填就自动铺满"同一个脾气。 */
+function mapAtSeed() {
+  const s = dataScanPick();
+  if (!s) { toast('先选一条扫描', true); return; }
+  $('map-at-um').value = ((s.start_um + s.stop_um) / 2).toFixed(4);
+  mapSyncUI();
 }
 
-function mapBandQuery() {
-  const b = mapBand(), q = [];
-  if (b.lmin !== null) q.push('lmin=' + encodeURIComponent(b.lmin));
-  if (b.lmax !== null) q.push('lmax=' + encodeURIComponent(b.lmax));
-  return q.length ? '?' + q.join('&') : '';
+/* 相位图多带的那一个参数。全通时它照旧带上 —— 后端会按"全通 + 某一刻"回一句算不了。 */
+function mapBandQuery(at) {
+  return bandQuery(bandOf(), (at === null || at === undefined) ? null : [mapAtQuery(at)]);
 }
 
 function mapGate() {            // 强度门限 (dB)：留空 = 不设门限（与那两条相位门限同一个脾气）
@@ -2780,62 +3031,75 @@ function mapGate() {            // 强度门限 (dB)：留空 = 不设门限（�
 
 /* 按钮与提示的现状：波段从哪来、够不够算、手里这张是不是当前这一条、正在算什么。 */
 function mapSyncUI() {
-  setText('map-band', mapBandText());
-  const b = mapBand(), running = mapPolling.running();
+  const b = bandOf();
+  setText('map-band', bandText(b, '相位图算不了，先填一段'));
+  const running = mapPolling.running();
   const btn = $('btn-map-run');
   btn.disabled = b.all || running;
   btn.title = b.all
     ? '算不了：〈滤波曲线〉那张卡的两个波长框都空着（全通）—— 相位图要有"跟哪一根比"'
     : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；换基准像素不用。'
       + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : '');
-  const r = mapResult, cur = mapScanId();
+  // 扫描列表还没回来（刚进页面）时 cur 是 null —— 那时**不下判断**：
+  // 「现在选的是 #null」是编出来的号，列表一到就会自己纠正（showView 里接着刷一次）。
+  const r = mapResult, cur = scanIdOf();
   let why = '';
-  if (r && r.scan_id !== cur) why = '图是 #' + r.scan_id + ' 的（现在选的是 #' + cur + '）';
+  if (r && cur === null) why = '';
+  else if (r && r.scan_id !== cur) why = '图是 #' + r.scan_id + ' 的（现在选的是 #' + cur + '）';
   else if (r && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
+  else if (r && mapAtMoved(r)) why = '「看哪一刻」改过，点重算';
   $('map-stale').hidden = !why;
   if (why) setText('map-stale', running ? why + '（正在算新的…）' : why);
+  // 「哪一刻」这一格讲的是**手里那张图**实际算的是哪一刻（不是框里现在填的 —— 框改了就是"该重算"）
+  setText('map-at-note', mapAtNote(r));
+}
+
+/* 「哪一刻」那一格写什么：**手里这张图**实际算的是哪一刻（不是框里现在填的 —— 框改了就是"该重算"）。
+   一句话两个家（mapSyncUI 与 mapPaint 都往这一格写）迟早会走样，所以只有这一处拼。 */
+function mapAtNote(r) {
+  if (!r) return '—';
+  if (r.at_um === undefined) return '整条';
+  return fmt(r.at_um, 4) + ' µm（落在 idx ' + r.at_idx + '，' + fmt(r.at_um_actual, 4) + ' µm）';
+}
+
+/* 手里这张图与「现在选的时刻」是不是同一份：整条对整条、某一时刻对同一个 µm。 */
+function mapAtMoved(r) {
+  const want = mapAtPick();
+  if (want === null) return r.at_um !== undefined;          // 现在要整条，图却是某一刻的
+  if (r.at_um === undefined) return true;                    // 现在要某一刻，图却是整条的
+  return Math.abs(r.at_um - want) > 1e-9;
 }
 
 /* 起算：一遍读盘在后端后台跑（与裁剪同一套：POST 起、GET 跟进度，不占 HTTP 连接）。 */
 async function mapRun() {
   const s = dataScanPick();
   if (!s) { toast('先选一条扫描', true); return; }
-  if (mapBand().all) {
+  if (bandOf().all) {
     toast('相位图要有波段：〈滤波曲线〉那张卡的两个波长框都空着（全通）', true);
     return;
   }
   if (mapPolling.running()) return;
+  const at = mapAtPick();
+  if (at !== null && isNaN(at)) { toast('「看哪一刻」填的是读出位置 (µm)，先填一个数', true); return; }
   if (scanActive) toast('扫描进行中：这一遍要读全盘，会跟采图抢磁盘');
-  const d = await post('/api/scans/' + s.id + '/phasemap' + mapBandQuery());
+  const d = await post('/api/scans/' + s.id + '/phasemap' + mapBandQuery(at));
   if (!d) return;
-  setText('map-progress', '正在读盘 0 / ' + d.total + ' 张 …');
+  setText('map-progress', JOB_TEXT.started(d.total));
   mapPolling.start();           // 先定时再立刻问一次（poller 的规矩）
   mapSyncUI();
 }
 
-/* 进度：与裁剪同一个节拍器。**算完就停**（没有进度可跟了就不要再问）。 */
+/* 进度：与裁剪同一个节拍器。**算完就停**（停在哪一份情形里由 pollJob 一处说了算）。 */
 async function mapPoll() {
-  const d = await get('/api/phasemap');
-  if (!d) { mapPolling.stop(); mapSyncUI(); return; }
-  const j = d.job || {};
-  if (j.running) {
-    setText('map-progress', '正在读盘 ' + j.done + ' / ' + j.total + ' 张 …');
-    mapSyncUI();
-    return;
-  }
-  mapPolling.stop();
-  if (j.error) {
-    setText('map-progress', '算不了：' + j.error);
-    toast('相位图失败：' + j.error, true);
-    mapSyncUI();
-    return;
-  }
-  if (!j.result) { mapSyncUI(); return; }
-  const fresh = mapKey(j.result) !== mapLoadedKey;
-  mapResult = j.result;
+  const p = await pollJob('/api/phasemap', mapPolling);
+  if (p.text) setText('map-progress', p.text);     // 每种情形都带一句，只往 DOM 上写
+  if (p.state === 'error') { toast('相位图失败：' + p.error, true); mapSyncUI(); return; }
+  if (p.state !== 'done') { mapSyncUI(); return; }
+  const fresh = mapKey(p.result) !== mapLoadedKey;
+  mapResult = p.result;
   mapSyncUI();
   if (fresh) {
-    setText('map-progress', '正在取数据…');
+    setText('map-progress', JOB_TEXT.fetching);
     await mapFetchArrays();
   } else {
     mapPaint();
@@ -2847,41 +3111,24 @@ async function mapPoll() {
 async function mapFetchArrays() {
   const r = mapResult;
   const seq = ++mapSeq;
-  let resp;
-  try {
-    resp = await fetch('/api/scans/' + r.scan_id + '/phasemap.bin');
-  } catch (err) {
-    toast('连不上后端：' + err.message, true);
-    return;
-  }
-  if (!resp.ok) {
-    let data = null;
-    try { data = await resp.json(); } catch (err) { /* 空响应体 */ }
-    toast(detailText(data, resp.status), true);
-    return;
-  }
-  const buf = await resp.arrayBuffer();
-  if (seq !== mapSeq || !mapResult || mapKey(mapResult) !== mapKey(r)) return;   // 慢响应：换了一份了
-  const n = r.w * r.h;
-  if (buf.byteLength !== n * 8) {
-    toast('相位图数据长度不对（' + buf.byteLength + ' 字节，应该是 ' + (n * 8) + '）', true);
-    return;
-  }
-  const phase = new Float32Array(buf, 0, n);
-  const amp = new Float32Array(buf, n * 4, n);
+  // 慢响应：抓的路上又换了一份结果 → 这一份丢掉（序号说了算，形状在结果里）
+  const pair = await fetchPair('/api/scans/' + r.scan_id + '/phasemap.bin', r, '相位图',
+                               function () { return seq !== mapSeq || !mapResult || mapKey(mapResult) !== mapKey(r); });
+  if (!pair) return;
+  const n = r.w * r.h, amp = pair.second;
   let mx = 0;
   for (let i = 0; i < n; i++) if (amp[i] > mx) mx = amp[i];
-  mapData = { w: r.w, h: r.h, phase: phase, amp: amp, ampMax: mx };
+  mapData = { w: r.w, h: r.h, phase: pair.first, amp: amp, ampMax: mx };
   mapLoadedKey = mapKey(r);
   mapDefaultRef();
-  setText('map-progress', '算完了：' + r.n + ' 张');
+  setText('map-progress', JOB_TEXT.done(r.n));
   mapPaint();
   mapSyncUI();
 }
 
 /* 基准像素的初值：能用〈取数〉那个像素就用它（"我正看的就是基准"），不在框里就退到正中间。 */
 function mapDefaultRef() {
-  const r = mapRect();
+  const r = mapRectOf(mapResult);
   if (!r) return;
   const bx = parseInt($('data-x').value, 10), by = parseInt($('data-y').value, 10);
   const inside = isFinite(bx) && isFinite(by) &&
@@ -2891,28 +3138,18 @@ function mapDefaultRef() {
 }
 
 function mapRefIndex() {        // 基准在那两列数组里的下标（不在这张图里就是 null）
-  const r = mapRect();
+  const r = mapRectOf(mapResult);
   if (!r || !mapRef || !mapData) return null;
   const sx = mapRef.x - r[0], sy = mapRef.y - r[1];
   if (sx < 0 || sy < 0 || sx >= mapData.w || sy >= mapData.h) return null;
   return sy * mapData.w + sx;
 }
 
-/* 鼠标在哪一格：画布的内部分辨率就是**盘上那张图**的像素数，这里只有一次比例换算，
-   不插值、不重采样 —— 返回的 x / y 是**原始坐标**（与取数、剖面、质心同一套）。 */
-function mapPick(ev) {
-  const box = $('map-canvas').getBoundingClientRect();
-  if (!mapData || !box.width || !box.height) return null;
-  const sx = Math.floor((ev.clientX - box.left) / box.width * mapData.w);
-  const sy = Math.floor((ev.clientY - box.top) / box.height * mapData.h);
-  if (sx < 0 || sy < 0 || sx >= mapData.w || sy >= mapData.h) return null;
-  const r = mapRect();
-  return { sx: sx, sy: sy, x: sx + r[0], y: sy + r[1], i: sy * mapData.w + sx };
-}
+function mapPick(ev) { return pickCell(ev, 'map-canvas', mapData, mapResult); }   // 相位图与强度对齐各一个：画布与手里那份不同
 
 /* 画：一张 ImageData，逐像素上色。**基准那一格恒为 0**（相位差本来就是减出来的）。
-   Δφ 折到 (−π, π]：所以"差超过半个条纹"的地方颜色会重复 —— 那是绕圈，不是数据跳变。
-   配色与色标都是 MAP_LUT 一份（色标在下面 mapBarPaint）。 */
+   Δφ 折到 (−π, π]：所以"差超过半个条纹"的地方颜色会重复 —— 那是绕圈，不是数据跳变；
+   色图首尾同色，这种重复在图上不留边。配色与色标都是 MAP_LUT 一份（色标在下面 mapBarPaint）。 */
 function mapPaint() {
   mapBarPaint();                 // 色标讲的是配色，与有没有图无关：空态也要摆着
   const ids = ['map-ref', 'map-size', 'map-lines', 'map-carrier', 'map-range', 'map-blank'];
@@ -2922,6 +3159,7 @@ function mapPaint() {
     setText('map-title', '未算');
     setText('map-hover', '鼠标停在图上：读出那一点跟基准差多少。');
     empty.hidden = false;
+    mapRingPaint();                // 没有图就没有圈：曲线区收起来（它与有没有图同一个判据）
     return;
   }
   const r = mapResult, w = mapData.w, h = mapData.h;
@@ -2953,7 +3191,7 @@ function mapPaint() {
       const k = Math.round(Math.max(0, Math.min(1, (db - MAP_AMP_FLOOR_DB) / (0 - MAP_AMP_FLOOR_DB))) * 255);
       px[j] = k; px[j + 1] = k; px[j + 2] = k;
     } else {
-      // 折回来再查表：+π 与 −π 落在**同一格**（顺序色图的两端在图上接着，才不会多出一条假边）
+      // 折回来再查表：+π 与 −π 落在**同一格**（循环色图首尾同色，绕圈处不会多出一条假边）
       const k = ((((d + Math.PI) / twoPi * MAP_COLOR_N) | 0) % MAP_COLOR_N + MAP_COLOR_N) % MAP_COLOR_N;
       px[j] = MAP_LUT[k * 3]; px[j + 1] = MAP_LUT[k * 3 + 1]; px[j + 2] = MAP_LUT[k * 3 + 2];
     }
@@ -2961,20 +3199,26 @@ function mapPaint() {
   }
   ctx.putImageData(img, 0, 0);
   mapDrawRef(ctx, w, h);
+  mapDrawRing(ctx);              // 圈相位那一圈（没圈就是空操作）
 
-  const rect = mapRect();
+  const rect = mapRectOf(mapResult);
   setText('map-title', '#' + r.scan_id + '　' + (ampView ? '条纹强度' : '相位差') +
+    (r.at_um === undefined ? '' : '（' + fmt(r.at_um, 4) + ' µm 那一刻）') +
     '　' + (r.rect ? '裁剪块 ' + w + '×' + h + ' @ (' + rect[0] + ',' + rect[1] + ')' : w + '×' + h));
   setText('map-ref', '(' + mapRef.x + ', ' + mapRef.y + ')');
   setText('map-size', w + '×' + h + (r.rect ? '（原始坐标原点 ' + rect[0] + ',' + rect[1] + '）' : ''));
   setText('map-lines', r.k_lo + ' ~ ' + r.k_hi + '（共 ' + (r.k_hi - r.k_lo + 1) + ' 根 / Nyquist 到 ' + r.k_max + '）');
-  setText('map-carrier', (r.lam_c_um === null ? '—' : r.lam_c_um.toFixed(4) + ' µm') +
-    '（' + r.f_c_thz.toFixed(3) + ' THz）');
+  // 某一时刻那张**没有公共载波**：相位基准就是那一刻自己，报载波反而是假的
+  setText('map-carrier', r.at_um !== undefined ? '—（某一时刻不取载波）'
+    : (r.lam_c_um === null ? '—' : r.lam_c_um.toFixed(4) + ' µm')
+      + (r.lam_c_um === null ? '' : '（' + r.f_c_thz.toFixed(3) + ' THz）'));
   setText('map-range', lo <= hi ? lo.toFixed(3) + ' ~ ' + hi.toFixed(3) : '—');
+  setText('map-at-note', mapAtNote(r));
   setText('map-blank', ampView ? '（强度视图不掐）'
     : (blank ? blank + ' / ' + (w * h) + '（' + (blank * 100 / (w * h)).toFixed(1) + '%）' : '0'));
   empty.hidden = true;
   setText('map-hover', mapIdleText());
+  mapRingPaint();                  // 换了一张图：那一圈按新图重取（圆心、半径都不动）
 }
 
 /* 图下方那条**色标（图例）**：就是把同一份配色表摊开画一遍，配三格刻度 ——
@@ -3002,8 +3246,8 @@ function mapBarPaint() {
   setText('map-bar-hi', ampView ? '0 dB' : '+π');
   cv.title = ampView
     ? '条纹强度：相对最强那个像素的 dB（0 dB 到顶、−40 dB 以下压到底色）'
-    : '相位差 (rad)：−π（深蓝）到 +π（深红）—— 但**两端是同一个相位**（绕圈），' +
-      '所以图上红贴着蓝的那条缝是绕圈，不是数据跳变；深灰 = 门限以下（不是相位 0）';
+    : '相位差 (rad)：−π（红）绕一圈回到 +π（还是红）—— **两端是同一个相位**（绕圈），' +
+      '所以绕圈处接得上、图上没有那条假边；深灰 = 门限以下（不是相位 0）';
 }
 
 /* 基准那一格画十字线：先画一层暗的再画白的 —— 相位图上什么底色都有，一层线总有看不见的地方。 */
@@ -3038,7 +3282,7 @@ function mapIdleText() {
   const db = mapDb(ri);
   return '基准 (' + mapRef.x + ', ' + mapRef.y + ')：相位 ' + mapData.phase[ri].toFixed(3) +
     ' rad、条纹强度 ' + fmt(mapData.amp[ri], 0) + (db === null ? '' : '（' + db.toFixed(1) + ' dB）') +
-    '　｜　鼠标停在图上读任意一点，点一下换基准';
+    '　｜　' + (mapRingOn ? '鼠标停在图上读任意一点，点一下以它为圆心' : '鼠标停在图上读任意一点，点一下换基准');
 }
 
 function mapHover(ev) {
@@ -3052,21 +3296,13 @@ function mapHover(ev) {
   const db = mapDb(p.i);
   setText('map-hover', '像素 (' + p.x + ', ' + p.y + ')　相位差 ' + (d >= 0 ? '+' : '') + d.toFixed(3) +
     ' rad　条纹强度 ' + fmt(mapData.amp[p.i], 0) + (db === null ? '' : '（' + db.toFixed(1) + ' dB）') +
-    '　｜　点一下：以它为基准');
-}
-
-function mapClick(ev) {
-  const p = mapPick(ev);
-  if (!p) return;
-  mapRef = { x: p.x, y: p.y };
-  mapPaint();
-  mapSyncUI();
+    '　｜　' + (mapRingOn ? '点一下：以它为圆心' : '点一下：以它为基准'));
 }
 
 /* 「基准＝取数像素」：把基准换回左边〈取数〉填的那一个（不重新取数、也不重画那条曲线）。 */
 function mapRefFromBoxes() {
   if (!mapData) { toast('还没有算出来的相位图', true); return; }
-  const r = mapRect();
+  const r = mapRectOf(mapResult);
   const bx = parseInt($('data-x').value, 10), by = parseInt($('data-y').value, 10);
   if (!isFinite(bx) || !isFinite(by)) { toast('〈取数〉里的像素坐标还没填', true); return; }
   if (bx < r[0] || by < r[1] || bx >= r[0] + r[2] || by >= r[1] + r[3]) {
@@ -3087,6 +3323,477 @@ function mapViewToggle() {
     : '条纹强度 = |R|（那个复数的大小），按**相对最强那个像素**的 dB 画，' + MAP_AMP_FLOOR_DB +
       ' dB 到底色；**这张不掐门限** —— 它就是用来看门限该设在哪的。';
   mapPaint();
+}
+
+/* ==================== 数据页：圈相位（绕一个圆的相位差曲线） ====================
+   在相位图上点一下定圆心、给一个半径，沿这个圆周逐点取相位差，画成一条曲线：
+   **横轴是绕行角度（0° 在右边、逆时针为正，与图上取点同一套），纵轴是相位差（rad）**。
+   相位**无包裹**（见 mapRingSamples）：图上按 (−π, π] 上色，曲线这边展开成连续的 ——
+   锯齿不是数据、是取模，所以曲线里不该留着它。展开的前提（相邻步长 < π）由统计条里那个
+   「展开最大步长」照实报出来，逼近 π 就说明这一步可能少算/多算了一整圈。
+   取点按**整格**：θ 走 N 步，每步落在 (cx + R cosθ, cy − R sinθ) 四舍五入的那一格；
+   落在图外、或条纹强度在门限以下的点**留空**（曲线断开）—— 与图上涂深灰是同一件事。
+
+   **一个圆一个来源**：圆心与半径只在这里说一次（mapRing），重画图、重画曲线、
+   写统计条都从它取 —— 免得图上画一个圆、曲线取另一圈的点。 */
+
+const MAP_RING_STEPS = 720;     // 一整圈取多少点（0.5° 一个，圆上够细、又不至于把噪声画成结构）
+
+/* 一个圆一个来源：圆心在 mapRing（原始坐标 px），**半径只在输入框里**
+   （mapRingRadius 是它唯一的读法）—— 两处各存一份，改的时候迟早只改一处。 */
+let mapRing = null;             // {cx, cy}：原始坐标的圆心；null = 还没圈
+let mapRingOn = false;          // 「圈相位」模式开着时点图 = 定圆心（关着 = 换基准，原来那个）
+let mapRingChart = null;        // 那条曲线的 uPlot
+
+function mapRingRadius() {      // 框是唯一的准：填不正（非数、<1）就是这条曲线算不了
+  const v = parseFloat(String($('map-ring-r').value || '').trim());
+  return isFinite(v) && v >= 1 ? v : NaN;
+}
+
+/* 圆心与半径是不是都齐了：齐了才有曲线 */
+function mapRingReady() {
+  return !!(mapData && mapResult && mapRing && isFinite(mapRingRadius()));
+}
+
+/* 走一圈取数：返回 {theta, d, miss}，步数与角度都在这里定。
+   θ 从 0 起、逆时针为正：屏幕 y 朝下，所以取点写 cy − R·sinθ（与鼠标看到的方向一致）。
+   **同一格可能被取到多次**（半径小、点密时）：那是这一圈的实情，不合并、不插值。
+
+   **这里是「无包裹」（unwrap）**：取到的相位差先与图上同一个折法落进 (−π, π]，再沿绕行方向
+   逐点展开 —— 相邻两点的**最短角差**（差值折进 (−π, π]）累加。所以曲线连续、不再有锯齿；
+   它数的是"沿这个圆一共走了多少相位"，一圈走 1 圈就写 1、走 3 圈就写 3。
+   展开的前提是**相邻步长小于 π**：0.5° 一格、圆上很难跳半个条纹，但真跳了就解错一圈 ——
+   统计条里那个「展开时最大的那一步」就是给人看这个前提站不站得住的（逼近 π 时不可信）。
+   断开的点（图外、门限以下）**不参与累加**，下一段接着前面的相位往上走（不从头再展开）。 */
+function mapRingSamples() {
+  const r = mapResult, w = mapData.w, h = mapData.h, rect = mapRectOf(r);
+  const R = mapRingRadius(), cx = mapRing.cx - rect[0], cy = mapRing.cy - rect[1];
+  const ri = mapRefIndex(), refPh = ri === null ? 0 : mapData.phase[ri];
+  const den = mapData.ampMax > 0 ? mapData.ampMax : 1;
+  const gate = mapGate();
+  const thr = gate === -Infinity ? -Infinity : den * Math.pow(10, gate / 20);
+  const twoPi = 2 * Math.PI;
+  const theta = [], ph = [];
+  let miss = 0, acc = 0, prev = null, maxStep = 0;
+  for (let i = 0; i <= MAP_RING_STEPS; i++) {
+    const t = i / MAP_RING_STEPS * twoPi;
+    theta.push(t * 180 / Math.PI);           // 横轴写角度（度）：一圈读起来比 0~6.28 直观
+    const x = Math.round(cx + R * Math.cos(t));
+    const y = Math.round(cy - R * Math.sin(t));
+    ph.push(null);
+    if (x < 0 || y < 0 || x >= w || y >= h) { miss++; continue; }
+    const k = y * w + x;
+    if (mapData.amp[k] < thr) { miss++; continue; }
+    let d = mapData.phase[k] - refPh;
+    d -= twoPi * Math.round(d / twoPi);      // 与图上同一个折法：落进 (−π, π]
+    if (prev === null) {                     // 第一点（或断口之后的第一点）：以它自己为起点
+      acc = d;
+    } else {
+      let step = d - prev;
+      step -= twoPi * Math.round(step / twoPi);   // 最短角差：这一步实际转了多少
+      if (Math.abs(step) > maxStep) maxStep = Math.abs(step);
+      acc += step;
+    }
+    prev = d;
+    ph[i] = acc;
+  }
+  return { theta: theta, d: ph, miss: miss, maxStep: maxStep, w: w, h: h, rect: rect };
+}
+
+/* 曲线：横轴一度一格，纵轴按展开后的相位自动铺满（无包裹 → 不再固定在 ±π 上）。
+   **不画点**（720 个点会把线糊成一片）。 */
+function mapRingPaint() {
+  const box = $('map-ring-chart'), stats = $('map-ring-stats');
+  if (!mapRingReady()) {
+    if (mapRingChart) { mapRingChart.destroy(); mapRingChart = null; }
+    box.innerHTML = '';
+    stats.hidden = true;
+    // 三种"没有曲线"的原因各说各的：没有图 / 没有圆心 / 半径填得不对 —— 都写成"点图定圆心"
+    // 的话，人改了半天半径框不知道为什么还是没反应
+    setText('map-ring-note', !mapData || !mapResult ? '先算相位图'
+      : !mapRing ? '点图定圆心（先开「圈相位」）'
+        : '半径得是 ≥ 1 的数（单位是图上的像素）');
+    return;
+  }
+  const s = mapRingSamples();
+  if (!mapRingChart) {
+    mapRingChart = makeChart('map-ring-chart', {
+      xlabel: '绕行角度 (°)',
+      height: 150,
+      legend: false,               // 一根 series：图例只占一行高度，标题已经说清纵轴是什么
+      series: [{ label: '相位差 (rad)', stroke: '#2563eb', width: 1.5, points: { show: false } }],
+      yaxis: {
+        // 展开后的相位没有固定的上下界（绕几圈就有几圈）：按这一条自己的数铺满
+        values: function (u, splits) {
+          return splits.map(function (v) { return (v === 0 ? '0' : (v > 0 ? '+' : '') + v.toFixed(2)); });
+        },
+        size: 56,
+      },
+    });
+  }
+  mapRingChart.setData([s.theta, s.d]);
+  fitChart(mapRingChart, 'map-ring-chart', 150);
+
+  // 统计条按**取到数的那些点**算（断开的点不参与 —— null 不是 0）。
+  // 展开之后「绕了几圈」和「峰-谷」说的是同一件事（峰-谷 / 2π），所以只报前者；
+  // 另一个数是**展开时最大的那一步** —— 它逼近 π 就说明展开的前提快站不住了。
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < s.d.length; i++) {
+    const v = s.d[i];
+    if (v === null) continue;
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  const got = s.d.length - 1 - s.miss;
+  stats.hidden = false;
+  setText('map-ring-c', '(' + mapRing.cx + ', ' + mapRing.cy + ')');
+  setText('map-ring-rr', fmt(mapRingRadius(), 0) + ' px');
+  setText('map-ring-turn', lo <= hi ? ((hi - lo) / (2 * Math.PI)).toFixed(2) + ' 圈' : '—');
+  setText('map-ring-pp', lo <= hi ? (hi - lo).toFixed(3) : '—');
+  setText('map-ring-step', s.maxStep > 0 ? s.maxStep.toFixed(3) : '—');
+  setText('map-ring-miss', s.miss + ' / ' + (s.d.length - 1) +
+    (s.miss ? '（图外或门限以下，曲线在那里断开）' : ''));
+  setText('map-ring-note', got > 0
+    ? '绕一圈 ' + got + ' 点'
+    : '整圈都在图外或门限以下 —— 换个小半径、或把圆心挪进有信号的地方');
+  return s;
+}
+
+/* 在图上把这一圈画出来（十字线之后再画，免得被相图盖住）：先暗一圈再亮一圈，
+   什么底色上都看得见。基准那格的小十字由 mapDrawRef 画，两个各管各的。 */
+function mapDrawRing(ctx) {
+  if (!mapData || !mapRing) return;
+  const rect = mapRectOf(mapResult);
+  const x = mapRing.cx - rect[0], y = mapRing.cy - rect[1];
+  const R = mapRingRadius();
+  if (!isFinite(R)) return;
+  ctx.save();
+  const ring = function (color, off) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(x + 0.5 + off, y + 0.5 + off, R, 0, 2 * Math.PI);
+    ctx.stroke();
+  };
+  ring('rgba(15,23,42,.85)', 1);
+  ring('rgba(255,255,255,.95)', 0);
+  // 圆心：一个小十字
+  ctx.strokeStyle = 'rgba(255,255,255,.95)';
+  ctx.beginPath();
+  ctx.moveTo(x - 4, y + 0.5); ctx.lineTo(x + 5, y + 0.5);
+  ctx.moveTo(x + 0.5, y - 4); ctx.lineTo(x + 0.5, y + 5);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* 点图：开着「圈相位」就是定圆心（**不动基准**），关着就还是换基准。 */
+function mapClick(ev) {
+  const p = mapPick(ev);
+  if (!p) return;
+  if (mapRingOn) {
+    mapRing = { cx: p.x, cy: p.y };
+    mapPaint();                  // 圆画上去（也把十字线重画一遍）
+    mapRingPaint();              // 曲线跟着换一圈
+    mapSyncUI();
+    return;
+  }
+  mapRef = { x: p.x, y: p.y };
+  mapPaint();
+  mapRingPaint();                // 基准变了 = 整条曲线整体平移，得重画（不重取数）
+  mapSyncUI();
+}
+
+/* 「圈相位」开关：开了点图定圆心；关了点图换基准 */
+function mapRingToggle() {
+  mapRingOn = !mapRingOn;
+  const btn = $('btn-map-ring');
+  setText('btn-map-ring', mapRingOn ? '圈相位：开' : '圈相位：关');
+  btn.setAttribute('aria-pressed', mapRingOn ? 'true' : 'false');
+  btn.title = mapRingOn
+    ? '点图上任意一处 = 定圆心（**不再换基准**）；半径在右边那个框里，改了就重画曲线。'
+    : '圈相位：开了以后在图上点的那一下是**定圆心**（不再换基准），再填半径，就沿这个圆周逐点取相位、画成一条曲线。关掉 = 点图换基准（原来那个）。';
+  mapPaint();
+  mapRingPaint();
+  mapSyncUI();
+}
+
+/* 「装满一圈」：半径 = 圆心到幅面四边里最近的那条 − 2（整圈都在图里，不会画到图外） */
+function mapRingFit() {
+  if (!mapData || !mapResult) { toast('还没有算出来的相位图', true); return; }
+  if (!mapRing) { toast('先在图上点一下定圆心（先开「圈相位」）', true); return; }
+  const rect = mapRectOf(mapResult);
+  const cx = mapRing.cx - rect[0], cy = mapRing.cy - rect[1];
+  const r = Math.min(cx, cy, mapData.w - 1 - cx, mapData.h - 1 - cy) - 2;
+  if (!(r >= 1)) { toast('圆心贴着边：整圈放不进去', true); return; }
+  $('map-ring-r').value = String(Math.round(r));
+  mapPaint();
+  mapRingPaint();
+}
+
+/* ==================== 数据页：强度对齐（整幅图的带内交流能量） ====================
+   每个像素三步：① 减掉它自己的直流 d（这条扫描该像素所有帧的均值；带通结果 b 本来就不含直流）
+   ② 除以 d^((2n−1)/(2n))（n 在界面上填）③ 平方积分（逐点平方再求和，**不除以点数**）：
+       S = Σ b(t)² / d^((2n−1)/(2n))
+   除以它自己的直流就是「对齐」：亮暗与照明不均被除掉，图上比的是条纹的相对深度。
+   **后端只给两张与 n 无关的图**（Σb² 与 d，走 align.bin），所以改 n、改门限都只重画 ——
+   不重读盘、不重算带通。换波段、换扫描才要重算。全通也能算（这里不需要载波）。
+   配色是**线性**灰度：0 → 最深，最强那一格 → 最白（不做对数 —— 图上直接读的是 S 的比例）。
+   门限以下（直流太小）的像素涂深灰，不当成 0。 */
+
+let alignResult = null;         // 后端那一份结果的 meta（扫描号 / 波段 / rect / 幅面 / 谱线 / 直流中位数）
+let alignData = null;           // {w, h, energy, dc}：两列 float32（与 n 无关）
+let alignLoadedKey = '';        // 已经抓到手里的是哪一份（同一份不再抓一遍二进制）
+let alignSeq = 0;               // 抓二进制的序号：慢响应回来时可能已经换了一份
+const alignPolling = poller(alignPoll, 400);
+
+/* n：归一化的强度（指数 = (2n−1)/(2n)）。**框是唯一的准**；填了不合法的东西就说清，
+   不悄悄换一个默认值顶上（换了就是另一张图）。
+
+   下限是 1/2，不是 0：n < 1/2 时指数 (2n−1)/(2n) 为负，d^负 会把直流小的像素**放大**
+   （n=0.1 时指数 −4），整幅图被几个暗点顶死。这个下限只有这一处说了算 ——
+   index.html 的 min 属性只是浏览器里的提示，拦不住手打。 */
+function alignN() {
+  const v = parseFloat(String($('align-n').value || '').trim());
+  return isFinite(v) && v >= 0.5 ? v : NaN;
+}
+
+function alignExponent(n) { return (2 * n - 1) / (2 * n); }
+
+/* 直流门限 (dB)：相对**整幅图直流的中位数**（不是最强像素 —— 直流常有零星热点）。
+   留空 = 不掐。返回 ADU 阈值：0 与"直流本来就是 0"同一个结果 —— 那些像素本来就除不了。 */
+function alignGate() {
+  const v = parseFloat($('align-dcmin').value);
+  if (!isFinite(v) || !alignResult || !(alignResult.dc_median > 0)) return 0;
+  return alignResult.dc_median * Math.pow(10, v / 20);
+}
+
+/* 算完 n 之后的那一列（每个像素一个数）：S = Σb² / d^α。**显示这一层唯一的算式**，
+   画图与 hover 都走它 —— 两处各写一遍迟早会给出两个数。
+   直流落在门限以下的像素给 NaN（涂灰，不当成 0）。 */
+function alignSeries() {
+  if (!alignData) return null;
+  const n = alignN();
+  if (!isFinite(n)) return null;
+  const ex = alignExponent(n), gate = alignGate(), cnt = alignData.w * alignData.h;
+  const out = new Float64Array(cnt);
+  for (let i = 0; i < cnt; i++) {
+    const d = alignData.dc[i];
+    out[i] = (!(d > 0) || d < gate) ? NaN : alignData.energy[i] / Math.pow(d, ex);
+  }
+  return out;
+}
+
+/* 这一列里最强的那一格（**跳过门限以下的**：直流小的像素除出来极大，先取最大值再掐，
+   色标会被一个孤立坏点顶死）。 */
+function alignTop(vals) {
+  let top = 0;
+  for (let i = 0; i < vals.length; i++) if (vals[i] === vals[i] && vals[i] > top) top = vals[i];
+  return top;
+}
+
+/* 手里那一列算好的数与它的峰值：**一次重画算一遍**，hover 直接用。
+   每次 mousemove 现算一遍（全幅 1440×1080 是 12 MB 的 Float64Array + 逐像素 Math.pow，实测约 29 ms）
+   会让 hover 掉帧。作废的条件就是那三个输入：换了数据、改了 n、改了门限。 */
+let alignCache = null;          // {key, vals, top}
+
+function alignSeriesCached() {
+  if (!alignData || !alignResult) return null;
+  const key = alignLoadedKey + '|' + alignN() + '|' + alignGate();
+  if (alignCache && alignCache.key === key) return alignCache;
+  const vals = alignSeries();
+  if (!vals) return null;
+  alignCache = { key: key, vals: vals, top: alignTop(vals) };
+  return alignCache;
+}
+
+/* 按钮与提示的现状：波段从哪来、n 填对没有、手里这张是不是当前这一条、正在算什么。
+   波段与相位图是同一段波长（同一个来源、同一份读法），两个都空 = 全通 ——
+   这里**照算**（不需要载波），与相位图的区别只有 bandText 里那半句。 */
+function alignSyncUI() {
+  const b = bandOf();
+  setText('align-band', bandText(b, '所有谱线的交流能量'));
+  const n = alignN(), running = alignPolling.running();
+  const btn = $('btn-align-run');
+  btn.disabled = !isFinite(n) || running;
+  btn.title = !isFinite(n)
+    ? '算不了：n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)，n < 1/2 会变成负数、把暗点放大）'
+    : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；改 n、改门限不用。'
+      + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : '');
+  // 扫描列表还没回来时 cur 是 null —— 不下判断（见 mapSyncUI 同一处说明）
+  const r = alignResult, cur = scanIdOf();
+  let why = '';
+  if (r && cur === null) why = '';
+  else if (r && r.scan_id !== cur) why = '图是 #' + r.scan_id + ' 的（现在选的是 #' + cur + '）';
+  else if (r && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
+  $('align-stale').hidden = !why;
+  if (why) setText('align-stale', running ? why + '（正在算新的…）' : why);
+}
+
+/* 起算：一遍读盘在后端后台跑（与相位图、裁剪同一套：POST 起、GET 跟进度）。 */
+async function alignRun() {
+  const s = dataScanPick();
+  if (!s) { toast('先选一条扫描', true); return; }
+  if (!isFinite(alignN())) { toast('n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)）', true); return; }
+  if (alignPolling.running()) return;
+  if (scanActive) toast('扫描进行中：这一遍要读全盘，会跟采图抢磁盘');
+  const d = await post('/api/scans/' + s.id + '/align' + bandQuery(bandOf(), null));
+  if (!d) return;
+  setText('align-progress', JOB_TEXT.started(d.total));
+  alignPolling.start();
+  alignSyncUI();
+}
+
+/* 进度：与相位图同一个节拍器。**算完就停**（停在哪一份情形里由 pollJob 一处说了算）。 */
+async function alignPoll() {
+  const p = await pollJob('/api/align', alignPolling);
+  if (p.text) setText('align-progress', p.text);   // 每种情形都带一句，只往 DOM 上写
+  if (p.state === 'error') { toast('强度对齐失败：' + p.error, true); alignSyncUI(); return; }
+  if (p.state !== 'done') { alignSyncUI(); return; }
+  const fresh = pairKey(p.result) !== alignLoadedKey;
+  alignResult = p.result;
+  alignSyncUI();
+  if (fresh) {
+    setText('align-progress', JOB_TEXT.fetching);
+    await alignFetchArrays();
+  } else {
+    alignPaint();
+  }
+}
+
+/* 两列 float32 走二进制口：形状在结果里（w×h），长度对不上就是坏了 —— 说清楚，别硬画。 */
+async function alignFetchArrays() {
+  const r = alignResult;
+  const seq = ++alignSeq;
+  // 慢响应：抓的路上又换了一份结果 → 这一份丢掉（序号说了算，形状在结果里）
+  const pair = await fetchPair('/api/scans/' + r.scan_id + '/align.bin', r, '强度对齐',
+                               function () { return seq !== alignSeq || !alignResult || pairKey(alignResult) !== pairKey(r); });
+  if (!pair) return;
+  alignData = { w: r.w, h: r.h, energy: pair.first, dc: pair.second };
+  alignLoadedKey = pairKey(r);
+  setText('align-progress', JOB_TEXT.done(r.n));
+  alignPaint();
+  alignSyncUI();
+}
+
+function alignPick(ev) { return pickCell(ev, 'align-canvas', alignData, alignResult); }
+
+/* 图上那套数值的写法：三格刻度与 hover 共用（一个数只有一处决定它长什么样）。 */
+function alignNum(v) {
+  if (!isFinite(v)) return '—';
+  if (v === 0) return '0';
+  const a = Math.abs(v);
+  if (a >= 1000) return String(Math.round(v));
+  if (a >= 10) return v.toFixed(1);
+  if (a >= 0.1) return v.toFixed(2);
+  return Number(v.toPrecision(3)).toString();
+}
+
+/* 画：一张 ImageData，逐像素上色。**线性**灰度：k = v / 最强 × 255（0 最深、最强最白），
+   门限以下的直流涂深灰并计数（那是「算得出却不可复现」，不是 0）。 */
+function alignPaint() {
+  alignBarPaint();               // 色标那条灰度条本身：与有没有图无关，空态也要摆着
+  const ids = ['align-size', 'align-lines', 'align-dcmed', 'align-blank'];
+  const empty = $('align-empty');
+  const n = alignN();
+  const cached = alignSeriesCached();
+  const vals = cached && cached.vals;
+  if (!alignData || !alignResult || !vals) {
+    for (let i = 0; i < ids.length; i++) setText(ids[i], '—');
+    setText('align-n-note', isFinite(n) ? n + '（指数 ' + alignExponent(n).toFixed(4) + '）' : '—');
+    setText('align-title', '未算');
+    alignScaleText(null);
+    setText('align-hover', '鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。');
+    empty.hidden = false;
+    return;
+  }
+  const r = alignResult, w = alignData.w, h = alignData.h;
+  const top = cached.top;
+  let blank = 0;
+  for (let i = 0; i < w * h; i++) if (vals[i] !== vals[i]) blank++;
+  const cv = $('align-canvas');
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }   // 内部 1:1，CSS 负责缩放
+  const ctx = cv.getContext('2d');
+  if (!ctx) return;
+  const img = ctx.createImageData(w, h), px = img.data;
+  for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+    const v = vals[i];
+    if (v !== v) {
+      px[j] = 30; px[j + 1] = 41; px[j + 2] = 59; px[j + 3] = 255;
+      continue;
+    }
+    // **线性**：k = v / 最强 × 255（0 最深、最强最白）。v 可能是负的（数据本该非负，
+    // 但两个 float32 相减/缩放后可能有 −0），一律夹到 0 这一头。
+    const k = Math.round(Math.max(0, Math.min(1, top > 0 ? v / top : 0)) * 255);
+    px[j] = k; px[j + 1] = k; px[j + 2] = k; px[j + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const rect = mapRectOf(r);
+  setText('align-title', '#' + r.scan_id + '　强度对齐' +
+    '　' + (r.rect ? '裁剪块 ' + w + '×' + h + ' @ (' + rect[0] + ',' + rect[1] + ')' : w + '×' + h));
+  setText('align-n-note', n + '（指数 ' + alignExponent(n).toFixed(4) + '）');
+  setText('align-size', w + '×' + h + (r.rect ? '（原始坐标原点 ' + rect[0] + ',' + rect[1] + '）' : ''));
+  setText('align-lines', r.k_lo + ' ~ ' + r.k_hi + '（共 ' + (r.k_hi - r.k_lo + 1) +
+    ' 根 / Nyquist 到 ' + r.k_max + '）' +
+    (r.band[0] === null && r.band[1] === null ? '　全通' : ''));
+  setText('align-dcmed', fmt(r.dc_median, 1));
+  setText('align-blank', blank ? blank + ' / ' + (w * h) + '（' + (blank * 100 / (w * h)).toFixed(1) + '%）' : '0');
+  empty.hidden = true;
+  alignScaleText(top);
+  setText('align-hover', alignIdleText());
+}
+
+/* 色标的三格刻度：讲的是**这一张图的数**（0 → 最深、最强 → 最白），与图上那条线性式子同源。
+   没有图时中间与右端写「—」—— 不拿一个跟手里这张无关的数顶着；
+   左端恒为 0（最深那一端与有没有图无关）。 */
+function alignScaleText(top) {
+  const cv = $('align-bar');
+  cv.title = top === null
+    ? '强度对齐：线性灰度（0 → 最深、最强那一格 → 最白）；深灰 = 直流在门限以下（不是 0）'
+    : '强度对齐：线性灰度 —— 最深 = 0、最白 = ' + alignNum(top) +
+      '（这张图里最强的那一格）；深灰 = 直流在门限以下（不是 0）';
+  setText('align-bar-lo', '0');      // 左端永远是 0（最深），与有没有图无关
+  setText('align-bar-mid', top === null ? '—' : alignNum(top / 2));
+  setText('align-bar-hi', top === null ? '—' : alignNum(top));
+}
+
+/* 色标那条灰度条本身：第 0 格 = 最深、第 255 格 = 最白 —— 与图上同一条线性式子。 */
+function alignBarPaint() {
+  const cv = $('align-bar');
+  if (cv.width !== 256 || cv.height !== 1) { cv.width = 256; cv.height = 1; }
+  const ctx = cv.getContext('2d');
+  if (!ctx) return;
+  const img = ctx.createImageData(256, 1), px = img.data;
+  for (let i = 0, j = 0; i < 256; i++, j += 4) {
+    px[j] = px[j + 1] = px[j + 2] = i; px[j + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function alignIdleText() {
+  const n = alignN();
+  if (!alignData || !isFinite(n)) return '鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。';
+  return '每个像素：S = Σ b² ÷ d^' + alignExponent(n).toFixed(4) + '（n = ' + n + '）' +
+    '　｜　线性灰度（最白 = 最强那一格）　｜　鼠标停在图上读任意一点';
+}
+
+function alignHover(ev) {
+  if (!alignData) return;
+  const p = alignPick(ev);
+  if (!p) { setText('align-hover', alignIdleText()); return; }
+  const cached = alignSeriesCached();
+  if (!cached) return;
+  const vals = cached.vals;
+  const v = vals[p.i], d = alignData.dc[p.i];
+  if (!(v === v)) {
+    setText('align-hover', '像素 (' + p.x + ', ' + p.y + ')　直流 ' + fmt(d, 1) +
+      ' ADU 在门限以下 —— 没算（不是 0）');
+    return;
+  }
+  const top = cached.top;
+  const share = top > 0 ? v / top : 0;
+  setText('align-hover', '像素 (' + p.x + ', ' + p.y + ')　S = ' + alignNum(v) +
+    '　直流 ' + fmt(d, 1) + ' ADU（最强的 ' + (share * 100).toFixed(1) + '%）');
 }
 
 /* ==================== 分栏拖动 ==================== */
@@ -3739,13 +4446,17 @@ function wire() {
   $('data-tab-spec').onclick = function () { dataTabShow('spec'); };
   $('data-tab-filt').onclick = function () { dataTabShow('filt'); };
   $('data-tab-map').onclick = function () { dataTabShow('map'); };
+  $('data-tab-align').onclick = function () { dataTabShow('align'); };
   // 滤波范围：填完就重算（2500 点、整段重建也就几毫秒，不用等失焦），「全通」= 清空两个框。
   // 相位图跟的是**同一段波长**，所以改完这两格还要把它的「波段改过」标出来。
   ['filt-lmin', 'filt-lmax'].forEach(function (id) {
-    $(id).oninput = function () { renderFiltered(); mapSyncUI(); };
+    $(id).oninput = function () { renderFiltered(); mapSyncUI(); alignSyncUI(); };
   });
   $('filt-phmin').oninput = renderFiltered;
   $('btn-map-run').onclick = mapRun;
+  // 「看哪一刻」：改了只是把「该重算」标出来 —— 它换的是**权重**，跟基准/门限那种"只改显示"不一样
+  $('map-at-um').oninput = mapSyncUI;
+  $('btn-map-at-mid').onclick = mapAtSeed;
   $('btn-map-ref').onclick = mapRefFromBoxes;
   $('btn-map-view').onclick = mapViewToggle;
   $('map-phmin').oninput = mapPaint;              // 门限只改显示（不重算、不重取数）
@@ -3754,7 +4465,21 @@ function wire() {
   $('map-canvas').onmousemove = mapHover;
   $('map-canvas').onmouseleave = function () { setText('map-hover', mapIdleText()); };
   $('map-canvas').onclick = mapClick;
+  // 圈相位：开关只管"点图是定圆心还是换基准"；半径改了只重画（不重算、不重取数）
+  $('btn-map-ring').onclick = mapRingToggle;
+  $('map-ring-r').oninput = function () { mapPaint(); mapRingPaint(); };
+  $('btn-map-ring-fit').onclick = mapRingFit;
   wireNote('btn-map-note', 'map-note');
+  $('btn-align-run').onclick = alignRun;
+  // n 与直流门限都**只改显示**（后端给的两张图与 n 无关）：改了立刻重画，不重读盘
+  $('align-n').oninput = function () { alignPaint(); alignSyncUI(); };
+  $('align-dcmin').oninput = alignPaint;
+  $('align-canvas').onmousemove = alignHover;
+  $('align-canvas').onmouseleave = function () { setText('align-hover', alignIdleText()); };
+  wireNote('btn-align-note', 'align-note');
+  alignBarPaint();                                // 色标与有没有图无关：出生就摆着
+  alignScaleText(null);                           // 还没有图：三格刻度写「—」，不拿一个无关的数顶着
+  alignSyncUI();
   mapViewTitle = $('btn-map-view').title;         // 原样的说明（切到强度视图时换成那一句）
   mapBarPaint();                                  // 色标（图例）与有没有图无关：出生就摆着
   mapSyncUI();
@@ -3768,6 +4493,12 @@ function wire() {
   $('btn-filt-axis').onclick = dataAxisToggle;   // 与像素曲线共用读法（同一次取数、同一批点）
   dataTabShow('curve');                        // 初值：HTML 里就停在曲线页，这里把文案与页签对齐
   $('btn-spec-peak').onclick = specFocusPeak;  // 频率轴收到最强那根附近（填框 + 钉住，与「自动范围」同层）
+  // 谱线密度：只改"画几根"，算的一律在整数格上（滤波、波段、相位图都不跟着变）——
+  // 见 pixelSpectrum 上面第 9 条。换密度就按手里那份重算，不重新取数。
+  $('spec-density').onchange = function () {
+    specDensity = parseInt($('spec-density').value, 10) || 1;
+    if (dataLast) renderSpectrum(dataLast);
+  };
   $('btn-spec-db').onclick = specToggleDb;     // 纵轴：功率 ↔ dB（同一串数换刻度，不重算）
   $('spec-phmin').oninput = specPhaseApply;    // 相位门限：只改右边那一列（不重算谱、不取数）
   $('btn-spec-axis').onclick = specAxisToggle; // 横轴：频率 ↔ 波长（同一串数换刻度，不重算）
@@ -3784,6 +4515,7 @@ function wire() {
   $('data-scan').onchange = function () {
     dataScanInfo();
     mapSyncUI();          // 手里那张相位图是不是这一条的，立刻标出来
+    alignSyncUI();        // 强度对齐那张同理
     if (dataChart) drawPixelCurve();
   };
 

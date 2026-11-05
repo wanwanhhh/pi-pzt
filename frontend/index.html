@@ -432,6 +432,7 @@
           <button id="data-tab-spec" class="tab" role="tab" aria-selected="false">频谱</button>
           <button id="data-tab-filt" class="tab" role="tab" aria-selected="false">滤波曲线</button>
           <button id="data-tab-map" class="tab" role="tab" aria-selected="false">相位图</button>
+          <button id="data-tab-align" class="tab" role="tab" aria-selected="false">强度对齐</button>
         </span>
         <span id="data-tab-note">这个像素随扫描位置怎么变</span>
       </p>
@@ -500,7 +501,7 @@
             <button id="btn-spec-db" class="ghost"
                     title="纵轴换一种读法：功率 = 该频率上正弦分量的均方功率（(A²+B²)/2，纯正弦幅度 A 进来峰高就是 A²/2）；dB = 相对这条谱里最强的那根（0 dB = 最强）。同一串数换刻度，不重算、不重新取数。">纵轴：功率 (ADU²)</button>
             <button id="btn-spec-note" class="ghost" aria-expanded="false"
-                    title="谱是怎么算出来的、右边那条相位是什么（真实点间距、整条参与、去均值、不加窗、按采图顺序、缺一个点整条不算、相位只在有信号的地方画）—— 点开看，看完收起">说明</button>
+                    title="谱是怎么算出来的、右边那条相位是什么（真实点间距、整条参与、去均值、不加窗、按采图顺序、缺一个点整条不算、相位怎么展开、去掉的那条线性相位是什么、零在哪一根）—— 点开看，看完收起">说明</button>
           </div>
         </div>
         <div class="tools">
@@ -511,7 +512,16 @@
           <button id="btn-spec-fit" class="ghost"
                   title="按这条谱把频率轴铺满；滚轮/拖动改过的范围也用它复位">自动范围</button>
           <button id="btn-spec-peak" class="ghost"
-                  title="把频率轴收到最**强**那根附近（宽度 = 它自己的 20%，太窄时至少 20 根谱线宽）。**只是替你把两个数填进范围框并钉住** —— 与「自动范围」同一层，框仍然是唯一的准，之后照旧可以滚轮/拖动改。多数谱的有用分量挤在低频那一小段，铺满整条轴（一直铺到 Nyquist）时它们是贴边的一根线。">聚焦最强峰</button>
+                  title="把频率轴收到最**强**那根附近（宽度 = 它自己的 20%，太窄时至少 20 个分辨率格）。**只是替你把两个数填进范围框并钉住** —— 与「自动范围」同一层，框仍然是唯一的准，之后照旧可以滚轮/拖动改。多数谱的有用分量挤在低频那一小段，铺满整条轴（一直铺到 Nyquist）时它们是贴边的一根线。">聚焦最强峰</button>
+          <span class="tsep"></span>
+          <label class="mini" for="spec-density">谱线密度</label>
+          <select id="spec-density"
+                  title="同一条谱多采几个点画出来：频率格从 1/T 缩到 1/(密度×T)。**这不是补零、也不是提高分辨率** —— 分辨率永远是 1/T（你确实观测了多久），这里改的只是谱线间距。整数格上的功率一根不变，滤波曲线、波段、相位图也都不跟着变（它们钉在整数格上：只有那一组才是完备的基）。">
+            <option value="1">1×（每格一根）</option>
+            <option value="2">2×</option>
+            <option value="4" selected>4×</option>
+            <option value="8">8×</option>
+          </select>
           <span class="tsep"></span>
           <label class="mini" for="spec-ymin" id="spec-ymin-k">功率最小 (ADU²)</label>
           <input id="spec-ymin" class="mini" type="number" step="any">
@@ -522,16 +532,19 @@
           <span class="tsep"></span>
           <label class="mini" for="spec-phmin">相位门限 (dB)</label>
           <input id="spec-phmin" class="mini" type="number" step="any" value="-20"
-                 title="右边那条相位只在**有信号**的地方有意义：只画功率不低于「最强那根 − 这个数」的谱线，其余留空、曲线断开。噪声底上两个几乎为零的数相除，出来的是随机相位 —— 画出来是噪声，不是相位。留空 = 不设门限（整条照画）。">
+                 title="右边那条相位只在**有信号**的地方有意义：只画功率不低于「最强那根 − 这个数」的谱线，其余留空、曲线断开。噪声底上两个几乎为零的数相除，出来的是随机相位 —— 画出来是噪声，不是相位；展开与减线性相位也只沿着门限内那几对相邻的谱线走（不拿噪声当台阶）。留空 = 不设门限（整条照画）。">
         </div>
         <div class="chart" id="spec-chart"></div>
         <dl class="stats inline">
           <div><dt>变换点数</dt><dd id="spec-n">—</dd></div>
           <div><dt>真实跨度 (fs)</dt><dd id="spec-span">—</dd></div>
-          <div><dt id="spec-df-k">频率分辨率 (THz)</dt><dd id="spec-df">—</dd></div>
+          <div><dt>谱线间距 (THz)</dt><dd id="spec-step">—</dd></div>
+          <div><dt id="spec-df-k">频率分辨率 1/T (THz)</dt><dd id="spec-df">—</dd></div>
           <div><dt id="spec-fmax-k">频率上限 (THz)</dt><dd id="spec-fmax">—</dd></div>
           <div><dt id="spec-peak-k">最强分量 (THz)</dt><dd id="spec-peak">—</dd></div>
           <div><dt>峰值 (ADU²)</dt><dd id="spec-peakval">—</dd></div>
+          <div><dt title="右边那条相位里**被减掉的那条直线**的斜率，换算成时间：整段信号比这条序列最早那一拍晚到多久。由门限内相邻两根谱线的相位差量出来 —— 一根都不相邻时量不到，写「—」。">群延迟 τ (fs)</dt><dd id="spec-ptau">—</dd></div>
+          <div><dt title="门限内相邻两根谱线的相位差，最大那个（已折到 (−π, π]，取绝对值）。**展开的前提是它小于 π**：逼近 π 时多绕一圈与少绕一圈分不出来，那段相位不可信。">逐根最大步长 (rad)</dt><dd id="spec-pstep">—</dd></div>
         </dl>
         <p class="hint" id="spec-empty">还没有取数。上面画出曲线之后，这里就是它的频谱。</p>
         <p class="hint" id="spec-note" hidden>横轴可以换<b>频率</b>（THz）或<b>波长</b>（µm，λ = c/ν）—— 同一串数换刻度，
@@ -542,13 +555,28 @@
           已去均值（直流那根柱子会压掉别的峰，不画）、不加窗，<b>整条扫描的全部点</b>（可视范围只影响看，不参与变换），
           一律按<b>采图顺序</b>（与上面那个「连线顺序」无关）。频率步长 = 1/T（T 是真实首末跨度），
           上限卡在<b>名义 Nyquist</b> = 1/(2×平均间距)：越界给的是混叠，不是信息。
+          <b>「谱线密度」是画得密不密，不是分辨率</b>：它把频率格从 1/T 缩到 1/(密度×T)，同一条曲线多采几个点
+          （统计条里「谱线间距」跟着它变，<b>「频率分辨率 1/T」永远不变</b> —— 那是你真的观测了多久）。
+          它不是补零：非均匀采样没有"零该插在哪一刻"这回事，补零要先重采样，等于换一条采样序列。
+          <b>整数格上的功率一根不变</b>，所以滤波曲线、波段、相位图都不跟着变 —— 那几样钉在整数格上
+          （只有那一组才是完备的基，细格多出来的半根不在里面，加回时域会把重建弄歪）。
           <b>缺一个点（没采到图 / 没记下读数）整条就不算</b> —— 谱里没有"断开"这回事，补一个数出来就是另一条序列。
-          <b>右边那条是相位</b>：每根谱线解出来的分量相对<b>这条序列里最早那一拍（t0）</b>的相位
-          （A·cos + B·sin = R·cos(2πf(t−t0) − φ)，所以 φ = atan2(B, A)），单位是<b>弧度</b>，写在 (−π, π] 里 ——
-          图上那一跳是绕回来，不是数据跳变。<b>相位只在有信号的地方有意义</b>：
-          「相位门限」那个框以下的谱线不画（留空、曲线断开）—— 那两个数都几乎是零，相除出来的相位是随机的
-          （画出来是噪声，不是相位）；框里留空就是不设门限。相位与频率刻度是同一套：
-          换口径、换频率/波长轴时它跟着一起换，不重新取数、也不重算谱。
+          <b>右边那条是相位，已展开、已去掉线性相位</b>：每根谱线解出来的分量相对这条序列里最早那一拍（t0）
+          的相位 <b>φ = atan2(B, A)</b>（A·cos + B·sin = R·cos(2πf(t−t0) − φ)，单位弧度）。
+          ① <b>沿频率升序逐根展开</b>：相邻两根的相位差折到 (−π, π] 再累加 —— 不展开的话每一根都是独立的一个角，
+          连起来是一排锯齿，看不出趋势；② <b>减去线性相位</b>：「整段信号比 t0 晚到 τ」在频域上就是一条
+          2π·ν·τ 的斜坡（几十 ps 摊到 THz 上是几万弧度），不拿掉它，别的什么都看不见。τ 由门限内相邻两根
+          都在画的谱线量出来，写在统计条的「群延迟 τ」那一格；③ <b>零钉在门限内最强的那一根上</b> ——
+          于是最强那根处相位恒为 0、它附近几乎是平的（同一时刻到的分量相位都一样），<b>剩下的起伏才是色散</b>：
+          各根到的时刻不一样，那才是这张图要说的事。
+          <b>相位只在有信号的地方有意义</b>：「相位门限」那个框以下的谱线不画（留空、曲线断开），
+          它们的相位也<b>不参与</b>量斜率与展开（那两个数都几乎是零，相除出来的是随机角，
+          拿它当台阶会把整数圈错一路带到后面的谱线上）—— 跨过空档时按斜率接上去，不靠猜；
+          框里留空就是不设门限（整条都算，噪声也照算）—— 那时这两格就是"这段相位别信"的告示：
+          群延迟被噪声带偏，逐根最大步长逼近 π。
+          展开的前提是相邻两根差不到 π：统计条里「逐根最大步长」就是这个数，逼近 π 时
+          （<b>密度 1× 常见</b>）多绕一圈与少绕一圈分不出来，那段相位别看。
+          相位与频率刻度是同一套：换口径、换频率/波长轴时它跟着一起换，不重新取数、也不重算谱。
           右边这条轴<b>只有自动范围</b>（没有范围框、也不吃滚轮/拖动）—— 它按门限内那些谱线自己铺满
           （整条；缩放、平移都不带动它，所以两个窗口的相位能直接对看）。</p>
       </section>
@@ -674,10 +702,26 @@
           <span class="tsep"></span>
           <button id="btn-map-ref" class="ghost"
                   title="把基准像素换成〈取数〉里填的那一个（你正在看曲线的那一点）。基准只决定「零在哪」，整片形状不变；它得落在**有信号**的地方，不然整幅图会整体转一个随机的角。">基准＝取数像素</button>
+          <span class="tsep"></span>
+          <label class="mini" for="map-at-um">看哪一刻 (µm)</label>
+          <input id="map-at-um" class="mini" type="number" step="any" placeholder="整条（留空）"
+                 title="留空 = 整条扫描（把这一节扫描积成一个数，默认）。填一个读出位置 (µm) = 只看**扫描走到那一处**时每个像素的相位：离它最近的那一帧会被算进「落在哪一拍」，标题与统计条照实写出。**带内只有一根谱线时两者逐像素相同**（那一刻的载波相位全图共用，减基准就抵消）——有两根以上才看得出差别。换时刻要重算（权重变了），换基准、切相位/强度、改门限都不用。">
+          <button id="btn-map-at-mid" class="ghost"
+                  title="把框填成这一条扫描两端的中点 —— 已算过相位图时就是那份的范围内，省得先猜一个数。留空 = 整条扫描。">填中点</button>
           <label class="mini" for="map-phmin">强度门限 (dB)</label>
           <input id="map-phmin" class="mini" type="number" step="any" value="-20"
                  title="相对**最强那个像素**的 dB：以下的像素涂成深灰（不是把相位当成 0）。那里条纹太弱，相位是「算得出却不可复现」的那些 —— 噪声底上两个几乎为零的数相除。留空 = 不设门限。">
           <span class="hint" id="map-progress">—</span>
+        </div>
+        <div class="tools">
+          <button id="btn-map-ring" class="ghost" aria-pressed="false"
+                  title="圈相位：开了以后在图上点的那一下是**定圆心**（不再换基准），再填半径，就沿这个圆周逐点取相位、画成一条曲线。关掉 = 点图换基准（原来那个）。">圈相位：关</button>
+          <label class="mini" for="map-ring-r">半径 (px)</label>
+          <input id="map-ring-r" class="mini" type="number" step="1" min="1" value="80"
+                 title="圆周的半径，单位是**图上的像素**（不是 µm）—— 幅面 1440×1080 时取 300 左右就能绕一整圈。改半径只重画曲线，不重算相位图。">
+          <button id="btn-map-ring-fit" class="ghost"
+                  title="把半径填成「圆心到幅面四条边里最近的那条」再减 2 —— 整圈都落在图里，不会有一截画到图外。">装满一圈</button>
+          <span class="hint" id="map-ring-note">—</span>
         </div>
         <div class="mapbox"><canvas id="map-canvas" width="8" height="8"></canvas></div>
         <!-- 色标（图例）：与相图**同一份配色表**（app.js 的 MAP_LUT）现画的一条，CSS 只负责拉宽。
@@ -693,8 +737,20 @@
           <div><dt>幅面</dt><dd id="map-size">—</dd></div>
           <div><dt>留下谱线</dt><dd id="map-lines">—</dd></div>
           <div><dt>公共载波</dt><dd id="map-carrier" title="全图共用的那一个参考频率 —— 取的是留下那一段的正中间那一根。像素之间的差与它同源，所以差值与它无关（它只决定"跟谁比"）。">—</dd></div>
+          <div><dt>哪一刻</dt><dd id="map-at-note" title="整条：积成一个数。某一时刻：算的是那一刻（落在哪一帧上照实写）。">整条</dd></div>
           <div><dt>Δφ 范围 (rad)</dt><dd id="map-range">—</dd></div>
           <div><dt>门限以下</dt><dd id="map-blank">—</dd></div>
+        </dl>
+        <!-- 圈相位曲线：绕圆心一整圈的相位差（0° 在右边、逆时针为正 —— 与图上取点同一套）。
+             画的是**折回后的值**（与图上颜色一一对应），不展开：锯齿就是绕圈。 -->
+        <div class="chart" id="map-ring-chart"></div>
+        <dl class="stats inline" id="map-ring-stats" hidden>
+          <div><dt>圆心</dt><dd id="map-ring-c">—</dd></div>
+          <div><dt>半径</dt><dd id="map-ring-rr">—</dd></div>
+          <div><dt>绕了几圈</dt><dd id="map-ring-turn" title="沿这个圆走一圈，相位一共转过多少圈（峰-谷 ÷ 2π）。螺旋的拓扑荷 m 就等于它：m=1 是 1 圈，m=3 是 3 圈。">—</dd></div>
+          <div><dt>走过的相位 (rad)</dt><dd id="map-ring-pp" title="这一圈里取到的最大相位减最小相位（展开之后）。1 圈 = 6.28 rad；三臂螺旋就是 18.8 rad。">—</dd></div>
+          <div><dt>展开最大步长 (rad)</dt><dd id="map-ring-step" title="展开时相邻两点之间转过最多的那一步。**逼近 π 就不可信** —— 那说明这一步可能少算/多算了一整圈（与〈滤波曲线〉那条相位的「逐点最大步长」同一个门槛）。">—</dd></div>
+          <div><dt>取不到的点</dt><dd id="map-ring-miss">—</dd></div>
         </dl>
         <p class="hint" id="map-hover">鼠标停在图上：读出那一点跟基准差多少。</p>
         <p class="hint" id="map-empty">还没有算。左边选一条扫描，在〈滤波曲线〉那张卡里填好波长范围（就是条纹那一段），再点「算相位图」。</p>
@@ -706,19 +762,93 @@
           所以基准只管「零在哪」—— 换基准**不重算**，点图上任意一处就是换基准。
           <b>为什么不能拿〈滤波曲线〉那条相位平均</b>：那条把首点锚成 0、还减掉了每像素自己的线性相位
           （为了看残差）—— 被锚掉的那个常数<b>正是这里要量的东西</b>，两条相减会几乎恒等于 0。
-          配色是<b>顺序色图</b>（MATLAB jet 那种：深蓝 → 青 → 绿 → 黄 → 深红），哪一色是多少照
-          图下方那条<b>色标</b>读。相位是<b>绕圈</b>的（写在 (−π, π]）：两端 −π 与 +π 分居蓝、红
-          两头，所以图上<b>红贴着蓝</b>的那条缝是绕圈、不是数据跳变（差超过半个条纹处颜色会重复）；
+          配色是<b>循环色图</b>（HSV 的色相绕一整圈：红 → 黄 → 绿 → 青 → 蓝 → 品红 → 红），
+          哪一色是多少照图下方那条<b>色标</b>读。相位是<b>绕圈</b>的（写在 (−π, π]）：两端 −π 与 +π
+          落在<b>同一个颜色</b>上，所以绕圈处接得上 —— 图上不会多出一条"红贴着蓝"的假边
+          （差超过半个条纹的地方颜色会重复，那是绕圈，不是数据跳变）；<b>深灰</b>才是"没有信号"。
           <b>本版不做空间解包裹</b>。
           <b>深灰 = 门限以下</b>：那里条纹太弱，相位算得出却不可复现，所以涂掉 —— 不是把它当成 0
           （框里留空 = 不设门限，整片都画）。切「条纹强度」看的是同一个复数的大小 |R|：
           哪块有干涉条纹、哪块没有，一眼就看出来。
+          <b>「看哪一刻」</b>：默认「整条扫描」= 把这一节扫描积成一个数（上面说的就是这一种）。
+          选「某一时刻」再填一个读出位置，算的是<b>扫描走到那一处时</b>每个像素的相位 ——
+          那一刻每个像素的带通信号 z(t) 取幅角，与〈滤波曲线〉那条相位曲线同源（只是用在所有像素上）。
+          <b>带内只有一根谱线时，它跟「整条」那张逐像素完全相同</b>：那一刻只有一个全图共用的
+          载波相位，减掉基准就抵消了 —— 这种波段上换时刻看不出差别，不是没算对。
+          带内有两根以上、它们之间有色散时才真的看得出来（那一刻各根怎么相加，随 t 变）。
+          换时刻要重算（权重跟着换），换基准、切相位/强度、改门限都不用。
           <b>一遍读盘</b>：算一次要把这条扫描的每一帧读一遍（未裁剪 2000 张约十几秒，裁到 400×300 约 1 s）；
           换波段、换扫描要重算，换基准、切相位/强度、改门限都不用。数据全部来自盘上<b>已经落盘的帧</b>：
           不重采、不碰设备，扫描跑着也能算（会跟采图抢磁盘，界面上先提醒一句）。
           <b>缺一个点（没图 / 没记读数）整条不算</b> —— 与频谱那张图同一条规矩：补一个数出来就是另一条序列。
           坐标是<b>保存的 PNG 自己的坐标</b>（与质心、剖面、取数同一套）：裁过的扫描也是这一套，
           偏移只在读文件那一层减一次，所以图上点出来的坐标直接能填进〈取数〉。</p>
+      </section>
+
+      <!-- 强度对齐：把〈滤波曲线〉那段波长用在**整幅图的每个像素**上，得到每个像素的
+           「带内交流能量 ÷ 它自己直流的 (2n−1)/(2n) 次方」。每个像素除自己的直流 = 对齐：
+           亮暗、照明不均被除掉，图上比的是条纹的相对深度。后端一遍读盘只给两张与 n 无关的图
+           （Σb² 与 d），所以**改 n、改门限只重画**，不重读盘。全通也能算（不需要载波）。 -->
+      <section class="card grow" id="card-align" hidden>
+        <div class="head">
+          <h2><span class="sub" id="align-title">未算</span>
+            <span class="sub" id="align-stale" hidden>波段改过，点重算</span>
+          </h2>
+          <div class="right">
+            <button id="btn-align-note" class="ghost" aria-expanded="false"
+                    title="这张图的口径（三步各做什么、n 是什么意思、门限相对谁、代价）—— 点开看，看完收起">说明</button>
+          </div>
+        </div>
+        <div class="tools">
+          <button id="btn-align-run" class="primary">算强度对齐</button>
+          <span class="hint" id="align-band">—</span>
+          <span class="tsep"></span>
+          <label class="mini" for="align-n">n</label>
+          <input id="align-n" class="mini" type="number" step="any" min="0.5" value="3"
+                 data-min="0.5"
+                 title="归一化的强度：每个像素除自己的直流，指数是 (2n−1)/(2n)。n 越大亮度差压得越狠 —— n→∞ 是「完全归一化」（只剩条纹对比度的平方），n=1/2 是「完全不归一化」（就是带内交流能量，亮的像素仍然更亮）。默认 3（指数 5/6）。**改它只重画**：后端给的两张图与 n 无关。">
+          <label class="mini" for="align-dcmin">直流门限 (dB)</label>
+          <input id="align-dcmin" class="mini" type="number" step="any" value="-40"
+                 title="相对**整幅图直流的中位数**多少 dB：直流比它更小的像素不画（涂深灰并计数）。那些像素的 d^((2n−1)/(2n)) 极小，一除就爆炸 —— 那是「算得出却不可复现」，不是当成 0。留空 = 不掐。">
+          <span class="hint" id="align-progress">—</span>
+        </div>
+        <div class="mapbox"><canvas id="align-canvas" width="8" height="8"></canvas></div>
+        <div class="mapscale">
+          <canvas id="align-bar" width="256" height="1"></canvas>
+          <div class="mapscale-x">
+            <span id="align-bar-lo">0</span><span id="align-bar-mid">—</span><span id="align-bar-hi">—</span>
+          </div>
+        </div>
+        <dl class="stats inline">
+          <div><dt>n</dt><dd id="align-n-note">—</dd></div>
+          <div><dt>幅面</dt><dd id="align-size">—</dd></div>
+          <div><dt>留下谱线</dt><dd id="align-lines">—</dd></div>
+          <div><dt>直流中位数 (ADU)</dt><dd id="align-dcmed">—</dd></div>
+          <div><dt>门限以下</dt><dd id="align-blank">—</dd></div>
+        </dl>
+        <p class="hint" id="align-hover">鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。</p>
+        <p class="hint" id="align-empty">还没有算。左边选一条扫描，在〈滤波曲线〉那张卡里填好波长范围（就是条纹那一段；留空 = 全通，这里也能算），再点「算强度对齐」。</p>
+        <p class="hint" id="align-note" hidden><b>这张图答的是「整幅图里，哪个像素的条纹更深」</b>：
+          每个像素按〈滤波曲线〉那张卡选中的<b>同一段波长</b>重建它的带通信号 b(t)
+          （每个点用它自己那一刻的时间，与那条曲线同一份非均匀最小二乘），然后做三步：
+          <b>① 减掉它自己的直流</b>（这条扫描该像素所有帧的均值；b 本来就不含直流，这一步自动满足）；
+          <b>② 除以它自己直流的 (2n−1)/(2n) 次方</b>；<b>③ 平方积分</b>（逐点平方再求和，<b>不除以点数</b>）。
+          合成一句：<b>S = Σ b(t)² / d^((2n−1)/(2n))</b>。
+          <b>为什么除以直流叫「对齐」</b>：亮的地方 b 大、暗的地方 b 小，直接比就是比亮度；
+          每个像素除自己的 d，亮暗与照明不均就被除掉，剩下的是<b>条纹的相对深度</b>。
+          <b>n 是什么意思</b>：指数 (2n−1)/(2n) 是归一化程度 —— n 越大压得越狠。
+          n=1/2 时指数 0（完全不归一化，就是带内交流能量）；n=1 时是 d¹（散粒噪声受限下的信噪比平方）；
+          n→∞ 时指数 2（完全归一化，只剩对比度的平方）。<b>改 n 只重画</b>：后端给的是 Σb² 与 d
+          两张与 n 无关的图，n 只在显示这一层乘上去。
+          <b>不除以点数</b>：所以数值随扫描长短线性增长，<b>跨扫描不能比绝对值</b>；同一张图里的明暗关系
+          不受影响（色标是相对最强那一格的比例：0 → 最深、最强 → 最白）。
+          <b>门限相对整幅图直流的中位数</b>（不是最强那个像素 —— 直流常有零星热点，按最强算会把整片掐掉）：
+          以下的像素涂深灰并计数，留空 = 不掐。
+          <b>图是线性灰度</b>（不做对数）：最深 = 0、最白 = 这张图里最强的那一格，图下方色标写着这三格数；
+          hover 报的是 S 的原值与它占最强的百分比。
+          <b>全通也能算</b>：与相位图不同，这里不需要载波，全通就是「所有谱线的交流能量」。
+          <b>代价</b>：一遍读盘，与相位图同档；但累加要 2K 张图（K = 带内谱线根数，相位图只要 2 张），
+          超上限会当场拒并说清怎么办。坐标是<b>保存的 PNG 自己的坐标</b>，裁过的也是这一套。</p>
       </section>
     </div>
 
