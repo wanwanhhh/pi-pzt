@@ -35,6 +35,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import store
 from .ccd import make_capture
+from .wholemap import WholeMap
 from .config import (
     CROP_H,
     CROP_W,
@@ -879,17 +880,26 @@ def api_scan_delete(scan_id: int) -> dict:
     return {"ok": True}
 
 
-# ------------------------------------------------------------------ 数据页：相位图
-# 整幅图的**相位差**：把这条扫描的每一帧读一遍，得到每个像素跟基准像素差多少相位
-# （为什么一遍扫得完、口径是什么，见 backend/phasemap.py 的文件头）。
-# 一条 2000 点、未裁剪的扫描要十几秒，所以与裁剪同一个做法：后台线程 + 进度，不占 HTTP 连接。
-# 只读盘上的图、不碰设备，所以扫描跑着也能算 —— 代价同样是跟采图抢磁盘（界面上先提醒一句）。
-# **结果只在内存里**（相位 + 条纹强度两个 float32 数组）：它答的是"这一条、这一段波长"，换波段
-# 重算一遍（权重变了）；**换基准像素不用重算** —— 那只是减一个常数，在界面上做。
+# ------------------------------------------------------------------ 数据页：整幅图（相位图 / 强度对齐）
+# 两件事同一套机制：起算 → 后台线程读完整条扫描 → job 字典报进度 → 两列 float32 走 .bin。
+# 机制住在 backend/wholemap.py；这里只留**每条作业自己的那几行**（怎么算、下发前摘掉什么、
+# .bin 里两列的顺序），以及六条**各自独立**的路由 —— 路由不并成带 kind 的一条，
+# 理由写在 wholemap.py 的文件头（那是把重复换成接口变宽）。
+#
+# 相位图：整幅图的**相位差**（口径与两个时间口径见 backend/phasemap.py 的文件头）。
+# 强度对齐：每个像素的带内交流能量除以它自己直流的 (2n−1)/(2n) 次方（见 intensity_align.py）。
+# 两者都只读盘上的图、不碰设备，所以扫描跑着也能算 —— 代价是跟采图抢磁盘（界面上先提醒一句）。
+# **结果只在内存里**：换波段要重算（权重变了）；相位图换基准像素不用重算（减一个常数，在界面上做）。
 
-_PHASE_JOB: dict = {"running": False, "scan_id": None, "done": 0, "total": 0,
-                    "error": None, "result": None}
-_PHASE_MAP: Optional[dict] = None     # 最近算完的那一份：meta + phase/amp 两个数组
+def _phase_run(plan: dict, progress, lmin, lmax, at_um):
+    """相位图怎么算：`at_um` 留空是整条，给了就是那一刻（同一段读盘，只换权重）。"""
+    from . import phasemap
+
+    if at_um is None:
+        return phasemap.phase_map(plan["items"], crop=plan["rect"], lmin=lmin, lmax=lmax,
+                                  progress=progress)
+    return phasemap.phase_map_at(plan["items"], at_um, crop=plan["rect"], lmin=lmin,
+                                 lmax=lmax, progress=progress)
 
 
 def _phase_meta(res: Optional[dict]) -> Optional[dict]:
@@ -899,86 +909,93 @@ def _phase_meta(res: Optional[dict]) -> Optional[dict]:
     return {k: v for k, v in res.items() if k not in ("phase", "amp")}
 
 
-def _phase_plan(scan_id: int, lmin: Optional[float], lmax: Optional[float]) -> dict:
-    """要读哪些帧、按哪个波段 —— 不合格的当场拒掉，别让它跑到一半才报。"""
-    from . import phasemap
+def _align_run(plan: dict, progress, lmin, lmax):
+    """强度对齐怎么算：一遍读盘得到两张与 n 无关的图（n 与门限全在界面上）。"""
+    from . import intensity_align
+
+    return intensity_align.align_maps(plan["items"], crop=plan["rect"], lmin=lmin, lmax=lmax,
+                                      progress=progress)
+
+
+def _align_meta(res: Optional[dict]) -> Optional[dict]:
+    """下发给界面的那一份：两个数组留在后端；另给 `dc_median`（直流门限相对它，界面不该自己再遍历一遍）。"""
+    import numpy as np
+
+    if res is None:
+        return None
+    out = {k: v for k, v in res.items() if k not in ("energy", "dc")}
+    out["dc_median"] = float(np.median(res["dc"]))
+    return out
+
+
+_PHASE = WholeMap("相位图", _phase_run, _phase_meta,
+                  lambda res: [res["phase"], res["amp"]], "phasemap")
+_ALIGN = WholeMap("强度对齐", _align_run, _align_meta,
+                  lambda res: [res["energy"], res["dc"]], "align")
+
+
+def _map_plan(scan_id: int, lmin: Optional[float], lmax: Optional[float]) -> dict:
+    """要读哪些帧、按哪个波段 —— 两条作业共用的一段（不合格当场拒，别让它跑到一半才报）。
+
+    **只做共有的那几条**：404、正在裁剪 409、逐点校验、波段 → 谱线。
+    "全通收不收"是各自的规矩（相位图不收、强度对齐照算），留在调用方。
+    """
+    from . import bands, frames
 
     if store.get_scan(scan_id) is None:
         raise HTTPException(404, "扫描不存在")
     crop = store.get_crop(scan_id)
     if crop and crop["state"] != "done":
         raise HTTPException(409, "这条扫描正在裁剪，等它跑完再算")
-    if lmin is None and lmax is None:
-        raise HTTPException(400, "相位图要有波段：〈滤波曲线〉那张卡的两个波长框都空着（全通）"
-                                 "就没有载波可比 —— 先填一段波长（条纹所在的那一段）")
     points = store.get_points(scan_id)
-    for i, p in enumerate(points):
-        where = f"第 {i + 1} 个点（idx {p['idx']}）"
-        if p["actual_um"] is None:
-            raise HTTPException(400, f"{where}没记下读出位置 —— 整条做不了："
-                                     "缺一个点就是另一条采样序列")
-        if not p["image_path"]:
-            raise HTTPException(400, f"{where}没采到图 —— 整条做不了："
-                                     "缺一个点就是另一条采样序列")
-    items = [(p["idx"], p["actual_um"], DATA_DIR / p["image_path"]) for p in points]
-    t = [p["actual_um"] * TIME_FS_PER_UM for p in points]
+    items = [(p["idx"], p["actual_um"],
+              DATA_DIR / p["image_path"] if p["image_path"] else None) for p in points]
+    # 逐点校验只有一处：frames.usable（「缺一个点就是另一条采样序列」这句话的家在那里）。
+    # 它顺带把「少于 3 个点」判掉 —— 那正是空扫描先炸 max() 的那一格。
     try:
-        k_lo, k_hi, k_max, df_thz = phasemap.band_lines(lmin, lmax, len(t), max(t) - min(t))
+        frames.usable(items, "整幅图")
+        t = [p * TIME_FS_PER_UM for (_, p, _) in items]
+        bands.band_lines(lmin, lmax, len(t), max(t) - min(t))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"items": items, "k_lo": k_lo, "k_hi": k_hi, "k_max": k_max, "df_thz": df_thz,
+    # 只留 plan 的读者要的两样：要读哪些帧、裁成哪一块。
+    # 波段 → 谱线在这里算完只是为了**当场拒**（不合格别等跑到一半才报），
+    # k_max / df_thz 属于结果元数据，结果里本来就有，不必经 plan 中转。
+    return {"items": items,
             "rect": (crop["x0"], crop["y0"], crop["w"], crop["h"]) if crop else None}
-
-
-def _phase_worker(scan_id: int, plan: dict, lmin: Optional[float], lmax: Optional[float]) -> None:
-    from . import phasemap
-
-    def progress(done: int, _total: int) -> None:
-        _PHASE_JOB["done"] = done
-
-    try:
-        res = phasemap.phase_map(plan["items"], crop=plan["rect"], lmin=lmin, lmax=lmax,
-                                 progress=progress)
-    except Exception as exc:                     # noqa: BLE001 —— 整条失败，把原话说给界面
-        log.warning("相位图失败：#%s %s", scan_id, exc)
-        _PHASE_JOB.update(running=False, error=str(exc))
-        return
-    res["scan_id"] = scan_id
-    global _PHASE_MAP
-    _PHASE_MAP = res
-    _PHASE_JOB.update(running=False, result=_phase_meta(res))
 
 
 @app.post("/api/scans/{scan_id}/phasemap")
 def api_phase_run(scan_id: int,
                   lmin: Optional[float] = Query(None, description="波长最小 (µm)"),
-                  lmax: Optional[float] = Query(None, description="波长最大 (µm)")) -> dict:
+                  lmax: Optional[float] = Query(None, description="波长最大 (µm)"),
+                  at_um: Optional[float] = Query(None, description="只算这一刻（读出位置 µm）"
+                                                                 " —— 不给就是整条")) -> dict:
     """算这一条扫描的整幅相位图（后台线程；进度看 GET /api/phasemap）。
 
     波段就是数据页〈滤波曲线〉那张卡的两个框（同一段波长）—— **两个都空（全通）时拒绝**：
     全通没有载波可比。只读盘上的图、不碰设备。
+
+    `at_um` 给了就是**某一时刻**那张：那一刻每个像素的相位（与整条同一个读盘，换的只是权重）。
     """
-    if _PHASE_JOB["running"]:
-        raise HTTPException(409, f"上一张相位图还在算（{_PHASE_JOB['done']} / "
-                                 f"{_PHASE_JOB['total']} 张），等它跑完再点")
-    plan = _phase_plan(scan_id, lmin, lmax)
-    _PHASE_JOB.update(running=True, scan_id=scan_id, done=0, total=len(plan["items"]),
-                      error=None, result=None)
-    threading.Thread(target=_phase_worker, args=(scan_id, plan, lmin, lmax),
-                     daemon=True, name="phasemap").start()
-    return {"ok": True, "scan_id": scan_id, "total": len(plan["items"]),
-            "k_lo": plan["k_lo"], "k_hi": plan["k_hi"]}
+    if lmin is None and lmax is None:
+        raise HTTPException(400, "相位图要有波段：〈滤波曲线〉那张卡的两个波长框都空着（全通）"
+                                 "就没有载波可比 —— 先填一段波长（条纹所在的那一段）")
+    plan = _map_plan(scan_id, lmin, lmax)
+    if at_um is not None:
+        lo = min(p[1] for p in plan["items"])
+        hi = max(p[1] for p in plan["items"])
+        if not (lo <= at_um <= hi):
+            raise HTTPException(400, f"那一刻不在这一条扫描里（{lo:.4g} ~ {hi:.4g} µm）")
+    out = _PHASE.start(scan_id, plan, lmin=lmin, lmax=lmax, at_um=at_um)
+    out["at_um"] = at_um
+    return out
 
 
 @app.get("/api/phasemap")
 def api_phase_state() -> dict:
-    """相位图的进度 + 最近算完的那一份（**不含两个数组**：它们走 phasemap.bin）。
-
-    与 /api/crops 同一个形状：进度、错误、结果都在 job 里，界面只认这一份。
-    """
-    job = dict(_PHASE_JOB)
-    job["result"] = _phase_meta(_PHASE_MAP)
-    return {"job": job}
+    """相位图的进度 + 最近算完的那一份（**不含两个数组**：它们走 phasemap.bin）。"""
+    return _PHASE.state()
 
 
 @app.get("/api/scans/{scan_id}/phasemap.bin")
@@ -988,15 +1005,37 @@ def api_phase_bin(scan_id: int) -> Response:
     数组按**盘上那张图**的顺序摆，`rect` 把它落回**原始坐标** —— 与取数、剖面同一套，
     裁过的和没裁过的可以对着看。
     """
-    import numpy as np
+    return _PHASE.bin_response(scan_id)
 
-    if _PHASE_MAP is None or _PHASE_MAP["scan_id"] != scan_id:
-        raise HTTPException(404, "这一条还没有算好的相位图")
-    a = _PHASE_MAP
-    buf = np.concatenate([a["phase"].ravel(), a["amp"].ravel()]).astype("<f4").tobytes()
-    return Response(content=buf, media_type="application/octet-stream",
-                    headers={"X-Map-W": str(a["w"]), "X-Map-H": str(a["h"]),
-                             "Cache-Control": "no-store"})
+
+# 强度对齐：**n 不进后端**（这里只给 Σb² 与 d 两张与 n 无关的图，指数与门限全在界面上算），
+# **全通也能算**（与相位图的区别：这里不需要载波）。
+
+@app.post("/api/scans/{scan_id}/align")
+def api_align_run(scan_id: int,
+                  lmin: Optional[float] = Query(None, description="波长最小 (µm)"),
+                  lmax: Optional[float] = Query(None, description="波长最大 (µm)")) -> dict:
+    """算这一条扫描的整幅强度对齐图（后台线程；进度看 GET /api/align）。
+
+    波段就是数据页〈滤波曲线〉那张卡的两个框（与相位图同一段波长）—— **两个都空 = 全通，
+    照算**（这里不需要载波，全通就是所有谱线的交流能量）。只读盘上的图、不碰设备。
+    """
+    return _ALIGN.start(scan_id, _map_plan(scan_id, lmin, lmax), lmin=lmin, lmax=lmax)
+
+
+@app.get("/api/align")
+def api_align_state() -> dict:
+    """强度对齐的进度 + 最近算完的那一份（**不含两个数组**：它们走 align.bin）。"""
+    return _ALIGN.state()
+
+
+@app.get("/api/scans/{scan_id}/align.bin")
+def api_align_bin(scan_id: int) -> Response:
+    """带内交流能量 Σb² 与直流 d：两个 float32 数组连着给（各 w×h、行优先），形状在结果里。
+
+    数组按**盘上那张图**的顺序摆，`rect` 把它落回**原始坐标** —— 与取数、剖面、相位图同一套。
+    """
+    return _ALIGN.bin_response(scan_id)
 
 
 # ------------------------------------------------------------------ 数据页：裁剪

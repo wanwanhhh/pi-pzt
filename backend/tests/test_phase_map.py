@@ -10,6 +10,8 @@
      一根谱线时"两个像素每个时刻的相位差"是一条常数曲线，它的平均就是这里的数。
   3. **缺一个点整条不算**（没图 / 没记读数）：与频谱那张图同一条规矩。
   4. 波段 → 谱线（λ = c/ν、上限卡名义 Nyquist）、裁剪只改读文件那一层（rect 是原始坐标）。
+  5. **解不出的那根要丢掉**：判据是 2×2 正规方程的条件数（`bands.solvable`），不是行列式的符号 ——
+     等间隔奇数点扫描的 Nyquist 那根 det > 0 却烂到系数放大 1e11，相位图两种等价算法差 3 rad。
 
 直接跑：python backend/tests/test_phase_map.py
 """
@@ -22,8 +24,16 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from backend.bands import SOLVABLE_KAPPA, solvable  # noqa: E402
 from backend.config import TIME_FS_PER_UM, WAVELENGTH_UM_PER_THZ  # noqa: E402
-from backend.phasemap import band_lines, phase_map, weight_vector  # noqa: E402
+from backend.phasemap import (  # noqa: E402
+    _grid,
+    band_lines,
+    moment_weight_vector,
+    phase_map,
+    phase_map_at,
+    weight_vector,
+)
 from backend.thorlabs_ccd import _save_png16  # noqa: E402
 
 
@@ -235,6 +245,81 @@ def test_band_lines_follows_lambda_equals_c_over_nu():
         raise AssertionError("跨度 0 没有报错")
 
 
+def test_unsolvable_line_is_dropped_by_the_condition_number():
+    """**解不出的那根要丢**，判据是条件数 —— 不是 `det > 0`。
+
+    等间隔奇数点扫描的 Nyquist 那根：`det ≈ 2.4e-19 > 0`（`det > 0` 放行），
+    可两个特征值之比只有 6e-26 —— 系数被放大到 1e11，相位图两种等价算法差 3.1 rad。
+    实测（本机 49 条扫描、5482 根）：真实读数噪声下最大 κ = 3.2e7，离这条线还有五个数量级；
+    读数抖到 1e-6 µm（真实噪声的千分之一）时 Nyquist 那根才升到 1e11、1e-9 µm 时到 1e25。
+    """
+    # 刀尖：2001 点、步距严格相等（读数一点噪声都没有）
+    n = 2001
+    t = np.arange(n, dtype=np.float64) * TIME_FS_PER_UM
+    span = float(t[-1] - t[0])
+    th = 2 * np.pi * (1 / span) * (t - t.min())
+    k_nyq = (n - 1) // 2
+    c, s = np.cos(k_nyq * th), np.sin(k_nyq * th)
+    scc, sss, scs = float(c @ c), float(s @ s), float(c @ s)
+    det = scc * sss - scs * scs
+    assert det > 0, "这条用例要的正是「det > 0 但解不出」那一格"
+    assert not solvable(scc, sss, scs), (scc, sss, scs)
+    # 同一串采样上低一档那根必须还解得出（判据不能把整条带都掐掉）
+    c, s = np.cos((k_nyq - 1) * th), np.sin((k_nyq - 1) * th)
+    assert solvable(float(c @ c), float(s @ s), float(c @ s))
+    # 相位图真的把它丢掉了：留下的最后一根不是 Nyquist 那根
+    _t, _t0, _df, _th, rows = _grid(t, 1, k_nyq, span)
+    assert rows[-1][0] < k_nyq, rows[-1][0]
+    assert len(rows) == k_nyq - 1, len(rows)
+
+    # 真实读数噪声（40 nm）下同一根必须留着：判据不能把真实扫描的 Nyquist 一起掐掉
+    rng = np.random.default_rng(11)
+    tj = np.arange(n, dtype=np.float64) + rng.normal(0, 0.04, n)
+    spanj = float(tj[-1] - tj[0])
+    thj = 2 * np.pi * (1 / spanj) * (tj - tj.min())
+    c, s = np.cos(k_nyq * thj), np.sin(k_nyq * thj)
+    assert solvable(float(c @ c), float(s @ s), float(c @ s)), "40 nm 噪声下 Nyquist 那根本该留着"
+
+    # 判据是**相对量**：同一串采样整体缩放（µm ↔ fs）不影响结论
+    c, s = np.cos(k_nyq * th), np.sin(k_nyq * th)
+    assert solvable(4 * float(c @ c), 4 * float(s @ s), 4 * float(c @ s)) == solvable(
+        float(c @ c), float(s @ s), float(c @ s))
+    assert SOLVABLE_KAPPA == 1e12, "这条线本身是决定（见 bands.py 那一段实测）"
+
+
+def test_only_none_counts_as_all_pass():
+    """**「全通」只有一个判据：没填（None）**。填了 0 / 负数 / nan 是填错了，当场拒。
+
+    从前这里按 `> 0` 判，于是 `?lmin=0` 被静默当成「不限」—— 而 server 的
+    「相位图全通必拒」判的是 `is None`，中间那格（0/负/nan）就是没人管的过道：
+    一条 API 直连就能绕过守卫，让相位图按全通算。
+    """
+    n, span = 101, 600.0
+    for bad in (0, -1.0, float("nan")):
+        for args in ((bad, None), (None, bad)):
+            try:
+                band_lines(args[0], args[1], n, span)
+            except ValueError as exc:
+                assert "正数" in str(exc), exc
+            else:
+                raise AssertionError(f"{args} 被当成了全通（应当拒）")
+    # 填得太小（商溢出成 inf）也是填错了，报的话要能看懂，不是 OverflowError
+    try:
+        band_lines(1e-310, None, n, span)
+    except ValueError as exc:
+        assert "太" in str(exc), exc
+    else:
+        raise AssertionError("1e-310 没有报错")
+    # 只填一边时，报错话术不许漏出 None（用户没填那个框，看到 None 不知道该改哪儿）。
+    # 只填 lmax → 下限落到 Nyquist 之外 → 一根不剩，此时那句话该说「波长 ≤ x µm」。
+    try:
+        band_lines(None, 3.0, n, span)
+    except ValueError as exc:
+        assert "None" not in str(exc) and "≤" in str(exc), exc
+    else:
+        raise AssertionError("lmax=3.0（下限在 Nyquist 之外）该是空波段")
+
+
 def test_missing_point_refuses_the_whole_scan():
     """缺一个点（没图 / 没记读数）整条不算 —— 说清是第几个点；与频谱那张图同一条规矩。"""
     import tempfile
@@ -335,6 +420,124 @@ def test_weight_vector_is_really_one_pass():
             yc, ys = xm @ cc, xm @ ss
             want += W[j] * ((yc * sss - ys * scs) / det - 1j * (ys * scc - yc * scs) / det)
         assert abs((u * x).sum() - want) < 1e-6 * max(1.0, abs(want)), (u * x).sum() - want
+
+
+def test_moment_map_equals_the_single_line_map_when_one_line():
+    """**单根谱线时，某一时刻的相位图与整条那张逐像素相同** —— 这是这个功能的边界。
+
+    一根谱线时每个像素就是 a·cos(ωt+φ)：t 只给全图共用一个常数相位 ωt_j，减掉基准就抵消了。
+    所以单根波段上开「某一时刻」看不出差别（图上会明说），差别只在带内多根时才出现。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        s = _scan(6, 5, 48, 9, tmp=Path(d))
+        lmin, lmax = _band_of(s["k_sig"], s["df_thz"])
+        whole = phase_map(s["items"], lmin=lmin, lmax=lmax)
+        for um in (0.0, s["items"][17][1], s["items"][-1][1]):
+            snap = phase_map_at(s["items"], um, lmin=lmin, lmax=lmax)
+            assert (snap["k_lo"], snap["k_hi"]) == (9, 9), (snap["k_lo"], snap["k_hi"])
+            ref = (3, 4)
+            dw = _wrap(whole["phase"] - whole["phase"][ref])
+            ds = _wrap(snap["phase"] - snap["phase"][ref])
+            assert np.abs(_wrap(ds - dw)).max() < 1e-6, np.abs(_wrap(ds - dw)).max()
+            # 包络差一个 N：整条那张是 Σ_t 的累加，单拍那张不累加 —— 相位不受它影响，强度要看除以 N
+            assert np.allclose(snap["amp"] * len(s["items"]), whole["amp"], rtol=1e-6)
+
+
+def test_moment_map_equals_the_per_pixel_signal_at_that_frame():
+    """**定义的自证**：某一时刻的图 = 前端 `filteredSignal` 在那一拍的 z，逐像素解出来对着比。
+
+    z_i(t_j) = Σ_k c_k·e^(i·2πk·df·(t_j−t0))，c_k 由逐像素最小二乘给出 —— 这就是那一刻
+    每个像素的带通信号复数；相位 = arg、包络 = |z|。带内三根（互相干涉）才看得出它随时刻走。
+    """
+    import tempfile
+
+    rng = np.random.default_rng(11)
+    n, w, h = 40, 4, 5
+    um = list(np.cumsum(rng.uniform(0.05, 0.09, n)))
+    t = np.array(um) * TIME_FS_PER_UM
+    span = float(t.max() - t.min())
+    df, df_thz = 1.0 / span, 1e3 / span
+    t0 = float(t.min())
+    th = 2 * np.pi * df * (t - t0)
+    lines = {12: 26.0, 13: 14.0, 15: 7.0}
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        images, paths = [], []
+        for i in range(n):
+            img = np.empty((h, w), dtype=np.uint16)
+            for y in range(h):
+                for x in range(w):
+                    v = 480.0
+                    for k, a in lines.items():
+                        v += a * np.cos(k * th[i] + 0.4 * x - 0.3 * y)
+                    img[y, x] = int(round(v))
+            images.append(img)
+            p = tmp / f"scan0002_{i:05d}.png"
+            _save_png16(p, img)
+            paths.append(p)
+        items = [(i, float(um[i]), paths[i]) for i in range(n)]
+        lmin = WAVELENGTH_UM_PER_THZ / ((max(lines) + 0.5) * df_thz)
+        lmax = WAVELENGTH_UM_PER_THZ / ((min(lines) - 0.5) * df_thz)
+        got = phase_map_at(items, um[23], lmin=lmin, lmax=lmax)
+        assert (got["k_lo"], got["k_hi"]) == (min(lines), max(lines)), (got["k_lo"], got["k_hi"])
+        assert (got["at_idx"], got["at_j"]) == (23, 23), (got["at_idx"], got["at_j"])
+        series = np.array([np.asarray(im).ravel() for im in images], dtype=np.float64).T
+        c = _ls_coeffs(series, th, got["k_lo"], got["k_hi"])
+        want = np.zeros(c.shape[0], dtype=complex)
+        for j, k in enumerate(range(got["k_lo"], got["k_hi"] + 1)):
+            want += c[:, j] * np.exp(1j * 2 * np.pi * k * df * (t[23] - t0))
+
+    gotp = got["phase"].reshape(-1)
+    assert np.allclose(np.cos(gotp), np.cos(np.angle(want)), atol=2e-4)
+    assert np.allclose(np.sin(gotp), np.sin(np.angle(want)), atol=2e-4)
+    assert np.allclose(got["amp"].reshape(-1), np.abs(want), rtol=2e-4)
+
+
+def test_moment_map_really_moves_with_the_moment_when_several_lines():
+    """带内多根时，换时刻**确实换出一张不同的图** —— 而且要跟着逐像素相位一起动。
+
+    两根幅度相当的谱线：z(t) = c1·e^(iθ1) + c2·e^(iθ2)，θ 差随 t 走 ⇒ 相位分布也跟着走。
+    这条防的是"看着加了个参数、其实权重跟时刻无关"那类假实现。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        n, w, h = 48, 4, 4
+        um = [i * 0.08 for i in range(n)]
+        t = np.array(um) * TIME_FS_PER_UM
+        span = float(t.max() - t.min())
+        df, df_thz = 1.0 / span, 1e3 / span
+        th = 2 * np.pi * df * (t - t.min())
+        # 两根幅度**不等**：等幅时 z 的相位在整幅图上只是整体转一圈，减掉基准就看不见了 ——
+        # 那一刻的相位分布要随 t 变，得让两根的相对权重随各自的相位动（这就是色散的样子）。
+        lines = {10: 30.0, 11: 10.0}
+        images, paths = [], []
+        for i in range(n):
+            img = np.empty((h, w), dtype=np.uint16)
+            for y in range(h):
+                for x in range(w):
+                    v = 500.0
+                    v += 30.0 * np.cos(10 * th[i] + 0.6 * x)
+                    v += 10.0 * np.cos(11 * th[i] - 0.9 * x)
+                    img[y, x] = int(round(v))
+            images.append(img)
+            p = tmp / f"scan0003_{i:05d}.png"
+            _save_png16(p, img)
+            paths.append(p)
+        items = [(i, float(um[i]), paths[i]) for i in range(n)]
+        lmin = WAVELENGTH_UM_PER_THZ / ((max(lines) + 0.5) * df_thz)
+        lmax = WAVELENGTH_UM_PER_THZ / ((min(lines) - 0.5) * df_thz)
+        a = phase_map_at(items, um[0], lmin=lmin, lmax=lmax)
+        b = phase_map_at(items, um[n // 2], lmin=lmin, lmax=lmax)
+        assert (a["k_lo"], a["k_hi"]) == (10, 11), (a["k_lo"], a["k_hi"])
+        ref = (2, 2)
+        da = _wrap(a["phase"] - a["phase"][ref])
+        db = _wrap(b["phase"] - b["phase"][ref])
+        # 半圈之后两根的相对权重翻过来了，相位分布必须跟着走（不是差一个常数）
+        assert np.abs(_wrap(db - da)).max() > 0.3, np.abs(_wrap(db - da)).max()
 
 
 def main() -> int:

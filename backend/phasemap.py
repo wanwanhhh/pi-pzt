@@ -4,10 +4,17 @@
 
     R_i = Σ_t u'(t)·x_i(t)        相位 = arg R_i（弧度），条纹强度 = |R_i|
 
+**两个口径共用同一段累加**（差别只在权重 u 怎么取，见 `moment_weights`）：
+
+- **整条**（默认）：u' = Σ_k W_k·g_k(t)，W_k = Σ_t e^(i2π(k−k_c)·df·Δt) —— 一节扫描出一个数；
+- **某一时刻**（`moment_weights`）：u'(t) = Σ_k g_k(t)·e^(i2πk·df·(t_j−t0)) —— 就是前端的
+  `filteredSignal` 在 t_j 那一拍的 z（同一个式子），只是用在所有像素上。
+  单根谱线时它与整条那张**逐像素完全相同**（ωt_j 是全图共用常数，减基准就抵掉了）。
+
 **为什么是一遍扫完**：R 对样本是**线性**的（每根谱线的 A/B 本来就是从样本上解两个线性方程
 解出来的），所以整幅图 = 每帧一次「权重 × 图」的累加 —— **像素个数不进代价**，代价全在解 PNG 上。
 换基准像素因此**不用重算**：Δφ = arg R_i − arg R_ref，减一个常数而已（在界面上做）。
-换波段要重扫一遍（u' 变了）。
+换波段要重扫一遍（u' 变了）；换时刻也要重扫一遍（u' 也变了）—— 两者都只是换一条权重。
 
 **口径**（与前端那一个像素的滤波曲线同源，只是把它一次用在所有像素上）：
 
@@ -32,149 +39,180 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
+from .bands import band_lines, solvable   # 波段 → 谱线、「解不解得出」：那条规矩的家在 bands.py
 from .config import TIME_FS_PER_UM, WAVELENGTH_UM_PER_THZ
 
 
-def band_lines(lmin: Optional[float], lmax: Optional[float], n: int, span_fs: float):
-    """两个波长框（µm）→ 留下哪几根谱线。返回 (k_lo, k_hi, k_max, df_thz)。
+def _grid(t_fs, k_lo: int, k_hi: int, span_fs: float):
+    """公共的一段：时间列 → (th, t0, df, [(k, g_k), ...])。
 
-    与前端 `filtKeepRange` 同一条规矩：λ = c/ν，上限卡**名义 Nyquist**
-    （kMax = floor((n-1)/2)，与频谱那张图同一个上限）；只填一边，另一边就是不限；
-    两个框都空 = 全通。**相位图不收全通**（没有载波可比）—— 由调用方判，这里照实返回 1..kMax。
-    """
-    k_max = (n - 1) // 2
-    if k_max < 1:
-        raise ValueError(f"只有 {n} 个点，做不了谱（至少要 3 个）")
-    if not (span_fs > 0):
-        raise ValueError("所有点的读出位置都在同一处（跨度 0），做不了谱")
-    df_thz = 1e3 / span_fs
-    k_lo, k_hi = 1, k_max
-    if lmin is not None and lmin > 0:
-        k_hi = min(k_hi, math.floor((WAVELENGTH_UM_PER_THZ / lmin) / df_thz))
-    if lmax is not None and lmax > 0:
-        k_lo = max(k_lo, math.ceil((WAVELENGTH_UM_PER_THZ / lmax) / df_thz))
-    if k_hi < k_lo:
-        raise ValueError(
-            f"{lmin} ~ {lmax} µm 这一段里一根谱线都没有（谱的格是 {df_thz:.4g} THz）"
-        )
-    return int(k_lo), int(k_hi), int(k_max), df_thz
-
-
-def weight_vector(t_fs, k_lo: int, k_hi: int, k_c: float, span_fs: float):
-    """一场扫描一条：把「每个点的样本」直接变成复数的权重 u'(t)（已含去均值）。
-
-    u'(t) = Σ_k W_k·g_k(t) − (Σ_t u(t))/N
-
-    - g_k(t)：第 k 根谱线「由样本解出 c_k = A_k − iB_k」的那一行（2×2 那套，与 app.js 同式）；
-    - W_k = Σ_t e^(i2π(k−k_c)·df·(t−t0))：与公共载波相关的那一串（全是 W 的模在带内成形）。
+    g_k 是第 k 根谱线「由样本解出 c_k = A_k − iB_k」的那一行（2×2 那套，与 app.js 同式）；
+    th 是第 1 格的相位（弧度，k 倍就是第 k 格）。解不出（2×2 退化）的那根直接跳过 ——
+    与前端不把它当系数同一个道理。
     """
     import numpy as np
 
     t = np.asarray(t_fs, dtype=np.float64)
-    n = t.size
     t0 = float(t.min())
     df = 1.0 / float(span_fs)
-    th = 2.0 * math.pi * df * (t - t0)          # 第 1 格的相位（弧度），k 倍就是第 k 格
-    u = np.zeros(n, dtype=np.complex128)
+    th = 2.0 * math.pi * df * (t - t0)
+    rows = []
     for k in range(k_lo, k_hi + 1):
         c = np.cos(k * th)
         s = np.sin(k * th)
         scc = float(c @ c)
         sss = float(s @ s)
         scs = float(c @ s)
-        det = scc * sss - scs * scs
-        if det <= 0:
+        # 解不解得出只有 bands.solvable 一处说了算（条件数，不是行列式的符号）
+        if not solvable(scc, sss, scs):
             continue
-        # x ↦ c_k 的那一行（去均值在下面整条一起做）
-        g = ((sss * c - scs * s) - 1j * (scc * s - scs * c)) / det
-        w = np.exp(1j * (k - k_c) * th).sum()
-        u += w * g
-    return u - u.sum() / n, df
+        det = scc * sss - scs * scs
+        rows.append((k, ((sss * c - scs * s) - 1j * (scc * s - scs * c)) / det))
+    return t, t0, df, th, rows
+
+
+def _demean(u, n: int):
+    """去均值照做（前端也去）：不去的话直流量会按每个像素自己的亮度漏进系数里。"""
+    return u - u.sum() / n
+
+
+def weight_vector(t_fs, k_lo: int, k_hi: int, k_c: float, span_fs: float):
+    """**整条**一场扫描一条：把「每个点的样本」直接变成复数的权重 u'(t)（已含去均值）。
+
+    u'(t) = Σ_k W_k·g_k(t) − (Σ_t u(t))/N
+
+    W_k = Σ_t e^(i2π(k−k_c)·df·(t−t0))：与公共载波相关的那一串（全是 W 的模在带内成形）。
+    """
+    import numpy as np
+
+    t, t0, df, th, rows = _grid(t_fs, k_lo, k_hi, span_fs)
+    u = np.zeros(t.size, dtype=np.complex128)
+    for k, g in rows:
+        u += np.exp(1j * (k - k_c) * th).sum() * g
+    return _demean(u, t.size), df
+
+
+def moment_weight_vector(t_fs, k_lo: int, k_hi: int, span_fs: float, at_fs: float):
+    """**某一时刻**的权重 u'(t)：让 Σ_t u'(t)·x(t) = z(t_j)（前端 `filteredSignal` 那一拍的复数）。
+
+        z(t_j) = Σ_k c_k·e^(i·2πk·df·(t_j−t0))，c_k 由 g_k 给出 ⇒ u'(t) = Σ_k g_k(t)·e^(iθ_k(t_j))
+
+    **没有公共载波**：时刻本身就定死了相位基准（θ_k(t_j) 是绝对的那一拍），所以不取 k_c。
+    单根谱线时它给出来的相位图与 `weight_vector` 那张**逐像素相同**（ωt_j 全图共用、减基准就抵消）；
+    带内多根时相位才随 t_j 走 —— 那时它画的才是"这一刻的相位分布"。
+    """
+    import numpy as np
+
+    t, t0, df, th, rows = _grid(t_fs, k_lo, k_hi, span_fs)
+    tj = float(at_fs) - t0
+    u = np.zeros(t.size, dtype=np.complex128)
+    for k, g in rows:
+        u += g * np.exp(1j * 2.0 * math.pi * k * df * tj)
+    return _demean(u, t.size), df
+
+
+def _nearest_frame(t_fs, at_fs: float) -> int:
+    """离这个时刻最近的那一帧（只是给界面报"你选的是第几个点"，权重仍按给的那个时刻算）。"""
+    t = [abs(float(x) - float(at_fs)) for x in t_fs]
+    return t.index(min(t))
+
+
+def _accumulate(items, crop, u, workers: int, progress):
+    """一遍读盘：每帧一次「权重 × 图」的累加。**像素个数不进代价**，代价全在解 PNG 上。
+
+    u 与像素无关（`weight_vector` / `moment_weight_vector` 各给一条），所以两个口径共用这一段。
+    读盘走 `frames.read_frames`（三条不变式与有界窗口都在那里）；这里只剩累加那两行。
+    返回 (shape, re, im)。
+
+    **不改成批矩阵乘**：实测相位图每帧只做 2 次乘加（全幅 2000 帧里主线程数学约 1.4 s、
+    解码约 3.8 s），改成批反而把解码的并行度让给 GEMM，5.24 s → 5.86 s。只借它的有界窗口省内存。
+    """
+    import numpy as np
+
+    from . import frames
+
+    shape = None
+    total_re = total_im = None
+    for i, sh, f in frames.read_frames(items, crop=crop, workers=workers,
+                                       dtype=np.float64, progress=progress):
+        if shape is None:
+            shape = sh
+            total_re = np.zeros(sh, dtype=np.float64)
+            total_im = np.zeros(sh, dtype=np.float64)
+        total_re += u[i].real * f
+        total_im += u[i].imag * f
+    return shape, total_re, total_im
+
+
+def _check_items(items) -> None:
+    """**缺一个点整条不算**（没图 / 没记读数）：判断在 `frames.usable`，这里只报"做不了相位图"。"""
+    from . import frames
+
+    frames.usable(items, "相位图")
+
+
+def _result(items, crop, shape, re, im, lmin, lmax, k_lo, k_hi, k_max, df_thz, k_c, **extra):
+    """两个口径共用的一份结果：相位、条纹强度、形状、波段元数据。"""
+    import numpy as np
+
+    x0, y0 = (crop[0], crop[1]) if crop else (0, 0)
+    h, w = shape
+    phase = np.arctan2(im, re).astype(np.float32)
+    amp = np.hypot(re, im).astype(np.float32)
+    f_c_thz = k_c * df_thz
+    out = {
+        "phase": phase, "amp": amp,
+        "w": int(w), "h": int(h),
+        "rect": [int(x0), int(y0), int(w), int(h)] if crop else None,
+        "n": len(items), "k_lo": k_lo, "k_hi": k_hi, "k_c": k_c, "k_max": int(k_max),
+        "df_thz": df_thz, "f_c_thz": f_c_thz,
+        "lam_c_um": (WAVELENGTH_UM_PER_THZ / f_c_thz) if f_c_thz > 0 else None,
+        "band": [lmin, lmax],
+    }
+    out.update(extra)
+    return out
 
 
 def phase_map(items, crop=None, lmin=None, lmax=None, workers: int = 8,
               progress: Optional[Callable[[int, int], None]] = None) -> dict:
-    """扫一遍这一条扫描的所有帧 → 每个像素一个复数（相位 + 条纹强度）。
+    """**整条**扫一遍这一条扫描的所有帧 → 每个像素一个复数（相位 + 条纹强度）。
 
     items 是 [(序号, 读出位置 µm, PNG 路径 | None), ...]（与 png_pixel_series 同一形状）。
-    **缺一个点整条不算**（没图 / 没记读数）：谱里没有"断开"这回事，少一个点就是另一条采样序列 ——
-    与频谱那张图同一条规矩，当场说清是第几个点。
-
     crop 给了就是 (x0, y0, w, h)：帧已经被裁成**原始坐标**里的那一块。返回的 rect 是**原始坐标**，
     数组是**盘上那张图**的形状 —— 坐标口径不因裁剪改变（与取数、剖面同一套）。
 
     返回 {phase, amp（float32 二维，h×w）, rect, w, h, n, k_lo, k_hi, k_c, k_max,
           df_thz, f_c_thz, lam_c_um, band}。
     """
-    import numpy as np
-    from .thorlabs_ccd import _png_gray
-
-    n = len(items)
-    if n < 3:
-        raise ValueError(f"只有 {n} 个点，做不了相位图（至少要 3 个）")
-    for i, (idx, um, path) in enumerate(items):
-        where = f"第 {i + 1} 个点（idx {idx}）"
-        if um is None:
-            raise ValueError(f"{where}没记下读出位置 —— 整条做不了：缺一个点就是另一条采样序列")
-        if path is None:
-            raise ValueError(f"{where}没采到图 —— 整条做不了：缺一个点就是另一条采样序列")
-
+    _check_items(items)
     t_fs = [p * TIME_FS_PER_UM for (_, p, _) in items]
     span = max(t_fs) - min(t_fs)
-    k_lo, k_hi, k_max, df_thz = band_lines(lmin, lmax, n, span)
+    k_lo, k_hi, k_max, df_thz = band_lines(lmin, lmax, len(items), span)
     k_c = (k_lo + k_hi) / 2.0
     u, _ = weight_vector(t_fs, k_lo, k_hi, k_c, span)
+    shape, re, im = _accumulate(items, crop, u, workers, progress)
+    return _result(items, crop, shape, re, im, lmin, lmax, k_lo, k_hi, k_max, df_thz, k_c)
 
-    x0, y0 = (crop[0], crop[1]) if crop else (0, 0)
 
-    def frame(it):
-        """读一帧并把它乘进增量里；形状与裁剪记录对不上当场报错（不猜、不缩）。"""
-        i, (idx, _, path) = it
-        arr = _png_gray(path)
-        if arr is None:
-            raise ValueError(f"第 {i + 1} 个点（idx {idx}）的图读不出来：{path}")
-        if arr.ndim != 2:
-            raise ValueError(f"第 {i + 1} 个点（idx {idx}）不是灰度图")
-        if crop and (arr.shape[1], arr.shape[0]) != (int(crop[2]), int(crop[3])):
-            raise ValueError(
-                f"第 {i + 1} 个点的图是 {arr.shape[1]}×{arr.shape[0]}，裁剪记录写着 "
-                f"{crop[2]}×{crop[3]} —— 库和文件对不上，先查清"
-            )
-        return i, arr.shape, arr
+def phase_map_at(items, at_um: float, crop=None, lmin=None, lmax=None, workers: int = 8,
+                 progress: Optional[Callable[[int, int], None]] = None) -> dict:
+    """**某一时刻**（按读出位置 µm 指定）每个像素的相位与包络 —— 与 `phase_map` 同一段读盘。
 
-    done = 0
-    shape = None
-    total_re = total_im = None
-    jobs = list(enumerate(items))
-    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-        for i, sh, arr in pool.map(frame, jobs):
-            if shape is None:
-                shape = sh
-                total_re = np.zeros(sh, dtype=np.float64)
-                total_im = np.zeros(sh, dtype=np.float64)
-            elif sh != shape:
-                raise ValueError(
-                    f"第 {i + 1} 个点的图是 {sh[1]}×{sh[0]}，"
-                    f"别的点是 {shape[1]}×{shape[0]} —— 尺寸不齐，整条做不了相位图"
-                )
-            f = arr.astype(np.float64)
-            total_re += u[i].real * f
-            total_im += u[i].imag * f
-            done += 1
-            if progress:
-                progress(done, n)
+    单根谱线时它与 `phase_map` **逐像素相同**（那个时刻的载波相位是全图共用的，减基准就抵掉）；
+    带内多根时这里画的才是"这一刻的相位分布"，随 at_um 走。
 
-    re, im = total_re, total_im
-    phase = np.arctan2(im, re).astype(np.float32)
-    amp = np.hypot(re, im).astype(np.float32)
-    h, w = shape
-    f_c_thz = k_c * df_thz
-    return {
-        "phase": phase, "amp": amp,
-        "w": int(w), "h": int(h),
-        "rect": [int(x0), int(y0), int(w), int(h)] if crop else None,
-        "n": int(n), "k_lo": k_lo, "k_hi": k_hi, "k_c": k_c, "k_max": int(k_max),
-        "df_thz": df_thz, "f_c_thz": f_c_thz,
-        "lam_c_um": (WAVELENGTH_UM_PER_THZ / f_c_thz) if f_c_thz > 0 else None,
-        "band": [lmin, lmax],
-    }
+    返回在 `phase_map` 那一份之上多三个：`at_um`（你要的那一刻）、`at_idx`（离它最近的点序号）、
+    `at_um_actual`（那一帧真实记下的读出位置 —— 界面要照实说"落在哪一拍上"）。
+    """
+    _check_items(items)
+    t_fs = [p * TIME_FS_PER_UM for (_, p, _) in items]
+    span = max(t_fs) - min(t_fs)
+    k_lo, k_hi, k_max, df_thz = band_lines(lmin, lmax, len(items), span)
+    j = _nearest_frame(t_fs, float(at_um) * TIME_FS_PER_UM)
+    u, _ = moment_weight_vector(t_fs, k_lo, k_hi, span, float(at_um) * TIME_FS_PER_UM)
+    shape, re, im = _accumulate(items, crop, u, workers, progress)
+    # 这一刻**没有公共载波**（相位基准就是那一拍本身）：k_c 只在结果里占位，界面按 at_* 说话
+    k_c = (k_lo + k_hi) / 2.0
+    return _result(items, crop, shape, re, im, lmin, lmax, k_lo, k_hi, k_max, df_thz, k_c,
+                   at_um=float(at_um), at_idx=items[j][0], at_j=int(j),
+                   at_um_actual=items[j][1])
