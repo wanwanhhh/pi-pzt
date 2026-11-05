@@ -208,6 +208,9 @@ main { flex: 1 1 auto; min-height: 0; padding: var(--gap); }
 }
 .tools label.mini { margin: 0; white-space: nowrap; }
 .tools input.mini { width: 86px; }
+/* 工具行里的复选框：全局 input 是"占满一行"，这里不能跟着长成一条 */
+.tools label.chk-inline { display: inline-flex; align-items: center; gap: 5px; }
+.tools label.chk-inline input { display: inline-block; width: auto; margin: 0; }
 /* 通用规则是 input, select 都 width:100%（表单里要撑满），工具行里不能那样：
    一个下拉框会把整行吃掉、挤到下一行去。按内容宽度来。 */
 .tools select { width: auto; }
@@ -430,6 +433,21 @@ td.bad { color: var(--bad); }
 #ccd-cross::before { left: 12px; top: 0; width: 2px; height: 26px; }
 #ccd-cross::after { top: 12px; left: 0; height: 2px; width: 26px; }
 #ccd-cross[hidden] { display: none; }
+/* 80% 能量圆：原始数据、不扣背景；只画在“看到的这一帧”上。圆心就是上面那个质心十字，
+   所以这里只画圆 + 直径标签，不再画第二个圆心。虚线表示“量出来的圈”，不是图像的一部分。 */
+#ccd-ring {
+  position: absolute; transform: translate(-50%, -50%); pointer-events: none;
+  border: 1.5px dashed #38bdf8; border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, .75);
+}
+#ccd-ring[hidden] { display: none; }
+#ccd-ring-label {
+  position: absolute; transform: translate(-50%, -100%); pointer-events: none;
+  padding: 1px 5px; border-radius: 3px; white-space: nowrap;
+  background: rgba(15, 23, 42, .84); color: #f8fafc;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+#ccd-ring-label[hidden] { display: none; }
 /* 取剖面的切线：画的就是"过点的整行 / 整列"这两条线本身（横贯整个画面），
    与质心那个自动算出来的十字（#ccd-cross）区分开：这个是你点的，那个是后端算的。 */
 .cut { position: absolute; inset: 0; pointer-events: none; }

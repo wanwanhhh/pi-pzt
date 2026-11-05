@@ -59,6 +59,13 @@ from .config import (
     TL_CAPTURE_TIMEOUT_S,
     TL_DLL_DIR,
     TL_EXPOSURE_US,
+    TL_ENERGY_BG_MAX_FRACTION,
+    TL_ENERGY_BG_WARN_FRACTION,
+    TL_ENERGY_COARSE_FRACTION,
+    TL_ENERGY_FRACTION,
+    TL_ENERGY_WINDOW_FACTOR,
+    TL_ENERGY_WINDOW_MAX,
+    TL_ENERGY_WINDOW_MIN,
     TL_FULL_ROI,
     TL_GAIN,
     TL_JPEG_QUALITY,
@@ -833,6 +840,21 @@ class ThorlabsCamera:
             "vertical": [int(v) for v in view[:, x]],
         }
 
+    def measure_energy_circle(self) -> dict:
+        """原始帧上的 80% 能量圆（不扣背景，圆心用整幅质心）。
+
+        只读 `sess.live` 这一份原生快照，不碰 SDK、不额外触发、不动预览流；
+        与 `profile()` 一样：锁内取引用、锁外算，HTTP 线程慢一点也堵不住取帧线程。
+        返回传感器坐标；前端按预览朝向换算显示。
+        """
+        with self._lock:
+            sess = self._sess
+            frame = sess.live if sess else None
+            centroid = sess.centroid if sess else None
+        if frame is None:
+            raise CameraError("还没有帧：先开预览")
+        return energy_circle(frame, centroid)
+
     def set_rotation(self, deg: int) -> dict:
         """改**预览显示朝向**（顺时针 0/90/180/270），立刻生效。
 
@@ -938,6 +960,119 @@ def global_centroid(img) -> dict:
     cy = float((row * np.arange(h, dtype=np.int64)).sum() / total)
     return {"cx": cx, "cy": cy, "sum": total, "peak": peak,
             "saturated": saturated, "width": int(w), "height": int(h)}
+
+
+def energy_circle(img, centroid) -> dict:
+    """整幅质心为圆心、原始窗口内累积能量的 80% 圆（**不扣背景**）。
+
+    这是用户定的口径：直接拿相机原值，不扣背景、不做平面、不平滑、不拟合。
+    窗口只是限制积分范围（窗口外不参与），不是背景模型；背景弱时 80% 圆才接近光斑。
+    背景不弱时 r80 会贴到窗口/画面边，返回 ok=False —— 不拿背景圈冒充光斑直径。
+
+    返回的是**传感器坐标**（与保存的 PNG、质心同一套），前端只按预览朝向换算显示。
+    """
+    import numpy as np
+
+    arr = np.asarray(img)
+    h, w = arr.shape
+    out = {"ok": False, "width": int(w), "height": int(h),
+           "cx": None, "cy": None, "r80": None, "d80": None,
+           "window": None, "total": 0, "saturated": 0,
+           "bg_fraction": None, "bg_warning": False, "reason": ""}
+    if not centroid or centroid.get("cx") is None or centroid.get("cy") is None:
+        out["reason"] = "整幅没有信号（质心未记录）"
+        return out
+    cx = float(centroid["cx"])
+    cy = float(centroid["cy"])
+    out["cx"], out["cy"] = cx, cy
+
+    # 粗估半径：4x4 块平均找峰值（抗坏点），数峰值 10% 以上的像素。
+    # 这一步只用原始值；阈值低于背景时 N 会包住背景，后面的贴边检查会拒绝。
+    b = 4
+    hb, wb = h // b * b, w // b * b
+    if hb < b or wb < b:
+        out["reason"] = "画面太小"
+        return out
+    small = arr[:hb, :wb].reshape(hb // b, b, wb // b, b).mean(axis=(1, 3))
+    peak = float(small.max())
+    if peak <= 0:
+        out["reason"] = "整幅没有信号（峰值为 0）"
+        return out
+    thr = peak * TL_ENERGY_COARSE_FRACTION
+    # 背景弱不弱只看一眼（中位数，不扣）：10% 峰值线落到背景里就说明 80% 会圈住背景。
+    # 这不是扣背景，只是拒绝；用户定的口径是“默认背景弱”。
+    border = float(np.median(np.concatenate((arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]))))
+    if thr <= border:
+        out["reason"] = "背景不弱（10% 峰值线落到背景里），80% 能量圆不是光斑"
+        return out
+    # 粗估只在质心附近一个上限窗口里做，别让画面另一头的亮斑把半径撑大。
+    hw0 = min(TL_ENERGY_WINDOW_MAX, 256)
+    x0 = max(0, int(round(cx)) - hw0)
+    x1 = min(w, int(round(cx)) + hw0 + 1)
+    y0 = max(0, int(round(cy)) - hw0)
+    y1 = min(h, int(round(cy)) + hw0 + 1)
+    n = int((arr[y0:y1, x0:x1] > thr).sum())
+    if n <= 0:
+        out["reason"] = "阈值以上没有像素（信号太弱）"
+        return out
+    r_est = float(np.sqrt(n / np.pi))
+    hw = int(round(TL_ENERGY_WINDOW_FACTOR * r_est))
+    hw = max(TL_ENERGY_WINDOW_MIN, min(TL_ENERGY_WINDOW_MAX, hw))
+    x0 = max(0, int(round(cx)) - hw)
+    x1 = min(w, int(round(cx)) + hw + 1)
+    y0 = max(0, int(round(cy)) - hw)
+    y1 = min(h, int(round(cy)) + hw + 1)
+    win = arr[y0:y1, x0:x1].astype(np.int64)
+    total = int(win.sum())
+    out["window"] = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+    out["total"] = total
+    out["saturated"] = int((win >= TL_SATURATION_ADU).sum())
+    if total <= 0:
+        out["reason"] = "窗口内总能量为 0"
+        return out
+    # 背景占比也是“背景弱不弱”的一部分：每像素几个 ADU 乘上窗口面积可能就占几十个百分点。
+    # 只用边界中位数做检查，不扣；占比太大时 80% 圆会偏，宁可不给数。
+    # 5%~20% 照画但要让界面标“仅供参考”；超过 20% 才是“背景不弱”。
+    bg_total = border * float(win.size)
+    bg_fraction = bg_total / total if total else 0.0
+    out["bg_fraction"] = float(bg_fraction)
+    out["bg_warning"] = bool(bg_fraction > TL_ENERGY_BG_WARN_FRACTION)
+    if bg_fraction > TL_ENERGY_BG_MAX_FRACTION:
+        out["reason"] = (f"背景占窗口总能量 {100.0 * bg_fraction:.0f}%"
+                         f"（> {100.0 * TL_ENERGY_BG_MAX_FRACTION:.0f}%），80% 圆会偏；先让背景更弱")
+        return out
+    if x0 == 0 or y0 == 0 or x1 == w or y1 == h:
+        out["reason"] = "光斑贴边：80% 能量不完整，挪进画面再量"
+        return out
+
+    dx = np.arange(x0, x1, dtype=np.float64) - cx
+    dy = np.arange(y0, y1, dtype=np.float64) - cy
+    rr = np.sqrt(dx[None, :] ** 2 + dy[:, None] ** 2).ravel()
+    order = np.argsort(rr, kind="stable")
+    r_sorted = rr[order]
+    cum = np.cumsum(win.ravel()[order], dtype=np.int64)
+    target = TL_ENERGY_FRACTION * total
+    k = int(np.searchsorted(cum, target, side="left"))
+    if k >= cum.size:
+        out["reason"] = "80% 能量没在窗口内达到（窗口太小/背景太强）"
+        return out
+    if k == 0:
+        r80 = float(r_sorted[0])
+    else:
+        c0, c1 = int(cum[k - 1]), int(cum[k])
+        r0, r1 = float(r_sorted[k - 1]), float(r_sorted[k])
+        r80 = r0 if c1 == c0 else r0 + (target - c0) / (c1 - c0) * (r1 - r0)
+    if r80 < 0.5:
+        out["reason"] = "光斑小于 1 像素，量不了"
+        return out
+    if r80 > hw - 1:
+        out["reason"] = "80% 半径贴到窗口边（背景可能太强/窗口太小）"
+        return out
+    if cx - r80 < 0 or cx + r80 > w - 1 or cy - r80 < 0 or cy + r80 > h - 1:
+        out["reason"] = "80% 圆出画面：光斑贴边或太大"
+        return out
+    out.update(ok=True, r80=float(r80), d80=float(2.0 * r80), reason="")
+    return out
 
 
 # ---------------------------------------------------------------- 图像编码

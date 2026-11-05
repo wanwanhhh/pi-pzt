@@ -525,6 +525,17 @@ async def ccd_profile(
     return await _camera_call(cam.profile, x, y)
 
 
+@app.get("/api/ccd/energy-circle")
+async def ccd_energy_circle(cam: CameraDep = None) -> dict:
+    """原始帧上的 80% 能量圆：**不扣背景**，圆心用整幅质心。
+
+    与剖面同一条路：只读最近一帧原生 16 位快照，不额外取帧、不碰设备。
+    正常“算不了”（背景不弱、贴边、太小）返回 200 + ok=False + 原因；
+    没帧/掉线仍由 _camera_call 给 503，扫描中由 _camera 给 409。
+    """
+    return await _camera_call(cam.measure_energy_circle)
+
+
 @app.get("/api/image/profile")
 def image_profile(
     path: str = Query(..., description="相对 data/ 的路径"),
@@ -909,12 +920,15 @@ def _phase_meta(res: Optional[dict]) -> Optional[dict]:
     return {k: v for k, v in res.items() if k not in ("phase", "amp")}
 
 
-def _align_run(plan: dict, progress, lmin, lmax):
-    """强度对齐怎么算：一遍读盘得到两张与 n 无关的图（n 与门限全在界面上）。"""
+def _align_run(plan: dict, progress, lmin, lmax, unfiltered: bool = False):
+    """强度对齐怎么算：一遍读盘得到两张与 n 无关的图（n 与门限全在界面上）。
+
+    `unfiltered` 去掉带通：b 直接是 I − d，同一个三步公式；与「全通」是两个口径。
+    """
     from . import intensity_align
 
     return intensity_align.align_maps(plan["items"], crop=plan["rect"], lmin=lmin, lmax=lmax,
-                                      progress=progress)
+                                      progress=progress, unfiltered=unfiltered)
 
 
 def _align_meta(res: Optional[dict]) -> Optional[dict]:
@@ -934,11 +948,13 @@ _ALIGN = WholeMap("强度对齐", _align_run, _align_meta,
                   lambda res: [res["energy"], res["dc"]], "align")
 
 
-def _map_plan(scan_id: int, lmin: Optional[float], lmax: Optional[float]) -> dict:
+def _map_plan(scan_id: int, lmin: Optional[float], lmax: Optional[float],
+              *, need_band: bool = True) -> dict:
     """要读哪些帧、按哪个波段 —— 两条作业共用的一段（不合格当场拒，别让它跑到一半才报）。
 
     **只做共有的那几条**：404、正在裁剪 409、逐点校验、波段 → 谱线。
     "全通收不收"是各自的规矩（相位图不收、强度对齐照算），留在调用方。
+    **不滤波**那条不分波段：need_band=False 时只做逐点校验（它仍要读同一批帧）。
     """
     from . import bands, frames
 
@@ -954,8 +970,9 @@ def _map_plan(scan_id: int, lmin: Optional[float], lmax: Optional[float]) -> dic
     # 它顺带把「少于 3 个点」判掉 —— 那正是空扫描先炸 max() 的那一格。
     try:
         frames.usable(items, "整幅图")
-        t = [p * TIME_FS_PER_UM for (_, p, _) in items]
-        bands.band_lines(lmin, lmax, len(t), max(t) - min(t))
+        if need_band:
+            t = [p * TIME_FS_PER_UM for (_, p, _) in items]
+            bands.band_lines(lmin, lmax, len(t), max(t) - min(t))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     # 只留 plan 的读者要的两样：要读哪些帧、裁成哪一块。
@@ -1009,18 +1026,28 @@ def api_phase_bin(scan_id: int) -> Response:
 
 
 # 强度对齐：**n 不进后端**（这里只给 Σb² 与 d 两张与 n 无关的图，指数与门限全在界面上算），
-# **全通也能算**（与相位图的区别：这里不需要载波）。
+# **全通也能算**（与相位图的区别：这里不需要载波）；**不滤波**是另一个口径（不分波段，
+# b 直接取该像素的时间序列减均值），它同样只读一遍盘。
 
 @app.post("/api/scans/{scan_id}/align")
 def api_align_run(scan_id: int,
                   lmin: Optional[float] = Query(None, description="波长最小 (µm)"),
-                  lmax: Optional[float] = Query(None, description="波长最大 (µm)")) -> dict:
+                  lmax: Optional[float] = Query(None, description="波长最大 (µm)"),
+                  unfiltered: bool = Query(
+                      False, description="不滤波：不分波段，逐像素直接算时间序列的交流能量")) -> dict:
     """算这一条扫描的整幅强度对齐图（后台线程；进度看 GET /api/align）。
 
-    波段就是数据页〈滤波曲线〉那张卡的两个框（与相位图同一段波长）—— **两个都空 = 全通，
-    照算**（这里不需要载波，全通就是所有谱线的交流能量）。只读盘上的图、不碰设备。
+    默认按〈滤波曲线〉那两个框算带内能量；**两个都空 = 全通，照算**（这里不需要载波）。
+    `unfiltered=1` 时不分波段：b 直接取该像素的时间序列减均值，与全通是两个口径；
+    这时再给 lmin/lmax 就拒（别让界面以为波段参与了）。只读盘上的图、不碰设备。
     """
-    return _ALIGN.start(scan_id, _map_plan(scan_id, lmin, lmax), lmin=lmin, lmax=lmax)
+    if unfiltered:
+        if lmin is not None or lmax is not None:
+            raise HTTPException(400, "不滤波就不分波段：波长框要留空（或去掉 unfiltered）")
+        plan = _map_plan(scan_id, None, None, need_band=False)
+        return _ALIGN.start(scan_id, plan, lmin=None, lmax=None, unfiltered=True)
+    return _ALIGN.start(scan_id, _map_plan(scan_id, lmin, lmax),
+                        lmin=lmin, lmax=lmax, unfiltered=False)
 
 
 @app.get("/api/align")
@@ -1031,7 +1058,9 @@ def api_align_state() -> dict:
 
 @app.get("/api/scans/{scan_id}/align.bin")
 def api_align_bin(scan_id: int) -> Response:
-    """带内交流能量 Σb² 与直流 d：两个 float32 数组连着给（各 w×h、行优先），形状在结果里。
+    """交流能量 Σb² 与直流 d：两个 float32 数组连着给（各 w×h、行优先），形状在结果里。
+
+    默认是带内（按波段重建的 b）；不滤波时是整条时间序列的 Σ(I−d)²。
 
     数组按**盘上那张图**的顺序摆，`rect` 把它落回**原始坐标** —— 与取数、剖面、相位图同一套。
     """

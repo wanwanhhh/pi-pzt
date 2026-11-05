@@ -316,7 +316,10 @@ def _point_values(scan_id: int, rows: list) -> list:
     `readback_raw` 那一列**不进库**：它是拿 actual_um 与系数现算出来的展示列 ——
     actual_um 与 readback_to_um 都在库里，谁要看谁算（见 config.raw_readback_factor）。
     """
-    dir_name = IMAGE_DIR.relative_to(DATA_DIR)
+    # 与采图那边写进库的式样一致（`f"images/{name}"`）：**一律用 / **。
+    # 用 str(Path(...)) 在 Windows 上会写成反斜杠 —— 库里就出现两种路径式样，
+    # 往返对比（导入后与导出前一模一样）当场就红，取数/导出这边只是碰巧还能认。
+    dir_name = IMAGE_DIR.relative_to(DATA_DIR).as_posix()
     out = []
     for r in rows:
         name = (r["image"] or "").strip()
@@ -328,7 +331,7 @@ def _point_values(scan_id: int, rows: list) -> list:
             "settled_ms": _num(r["settle_ms"]),
             "on_target": _int(r["on_target"]),
             "settle_source": (r["settle_source"] or "").strip() or None,
-            "image_path": str(dir_name / name) if name else None,
+            "image_path": f"{dir_name}/{name}" if name else None,
             "exposure_us": _int(r["exposure_us"]),
             "taken_at": _num(r["taken_at"]),
         })

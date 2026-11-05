@@ -11,6 +11,8 @@
   5. **缺一个点整条不算**（与频谱、相位图同一条规矩）；裁剪只改读文件那一层。
   6. **累加内存上限在分配之前判**：没裁剪时幅面由第一帧说了算 —— 判定必须放在那之后、
      np.zeros 之前。放到「读完再判」就是先分配 2K 张图、再拒（全通全幅会先要 23 GiB）。
+  7. **不滤波**：去掉的只是带通，b = I − d；三步与公式不变（不是换成方差图/标准差图）。
+     它与「全通」（所有能解出的谱线）是两个口径；不建 2K 张图，所以不受谱线内存上限约束。
 
 **第 1 条钉的是「这条式子该给什么数」，不是「现状给什么数」**：直接算法走 lstsq（QR/SVD），
 被测的 `_prep` 走 2×2 正规方程 —— 两条不同代数路线。两边都写成正规方程时，
@@ -152,7 +154,7 @@ def test_cross_terms_matter_on_uneven_sampling():
 
 
 def test_all_pass_works_without_a_carrier():
-    """**全通也能算**：两个波长框都空 = 所有谱线的交流能量 —— 这里不需要载波（相位图才需要）。"""
+    """**全通也能算**：两个波长框都空 = 所有能解出的谱线的交流能量 —— 这里不需要载波（相位图才需要）。"""
     import tempfile
 
     lines = {7: 20.0, 10: 9.0}
@@ -164,6 +166,65 @@ def test_all_pass_works_without_a_carrier():
     assert (got["band"], got["k_lo"], got["k_hi"]) == ([None, None], 1, (32 - 1) // 2), \
         (got["band"], got["k_lo"], got["k_hi"])
     assert np.allclose(got["energy"].reshape(-1), want, rtol=1e-12)
+
+
+def test_unfiltered_keeps_the_same_three_steps_without_the_band():
+    """不滤波：去掉的只是带通，三步与公式不变 —— energy = Σ(I−d)²，dc = 均值。
+
+    b(t) = I(t) − d 是同一个式子在「不分波段」时的样子；这条钉住它没有偷偷换成
+    方差图/标准差图（那会把「除以 d^α」也一起改掉）。同时钉住：不滤波与波长互斥。
+    """
+    import tempfile
+
+    lines = {11: 30.0, 13: 12.0, 16: 6.0}
+    with tempfile.TemporaryDirectory() as d:
+        s = _scan(5, 4, 40, lines, Path(d))
+        got = align_maps(s["items"], unfiltered=True)
+        series = np.array([np.asarray(im).ravel() for im in s["images"]], dtype=np.float64)
+        mean = series.mean(axis=0)
+        want = ((series - mean) ** 2).sum(axis=0)
+        lmin, lmax = _band_of(min(lines), max(lines), s["df_thz"])
+        try:
+            align_maps(s["items"], lmin=lmin, lmax=lmax, unfiltered=True)
+        except ValueError as exc:
+            assert "不滤波就不分波段" in str(exc), exc
+        else:
+            raise AssertionError("不滤波同时还给波长，没有拒")
+
+    assert got["unfiltered"] is True and got["band"] == [None, None], got
+    assert "k_lo" not in got and "k_hi" not in got, sorted(got)
+    assert (got["w"], got["h"], got["n"]) == (5, 4, 40), (got["w"], got["h"], got["n"])
+    assert np.allclose(got["energy"].reshape(-1), want, rtol=1e-12), \
+        np.abs(got["energy"].reshape(-1) - want).max() / want.max()
+    assert np.allclose(got["dc"].reshape(-1), mean, rtol=1e-12), \
+        np.abs(got["dc"].reshape(-1) - mean).max()
+
+
+def test_unfiltered_is_not_limited_by_the_spectral_memory_budget():
+    """不滤波不建 2K 张图：把谱线内存上限压到 1 字节，它照样算得出来（与 K 无关）。
+
+    滤波那条在同一个上限下会在读第一帧后当场拒（见 test_memory_limit_refuses_before_allocating）；
+    两条一起说明「不滤波更省」不是一句口号，而是不同的累加规模。
+    """
+    import tempfile
+
+    from backend import intensity_align
+
+    lines = {8: 22.0, 12: 7.0}
+    with tempfile.TemporaryDirectory() as d:
+        s = _scan(3, 2, 24, lines, Path(d))
+        old = intensity_align.ALIGN_MAX_BYTES
+        intensity_align.ALIGN_MAX_BYTES = 1        # 1 字节：滤波那条的 5 根谱线怎么算都超
+        try:
+            got = align_maps(s["items"], unfiltered=True)
+        finally:
+            intensity_align.ALIGN_MAX_BYTES = old
+        series = np.array([np.asarray(im).ravel() for im in s["images"]], dtype=np.float64)
+        want = ((series - series.mean(axis=0)) ** 2).sum(axis=0)
+
+    assert got["unfiltered"] is True, got
+    assert np.allclose(got["energy"].reshape(-1), want, rtol=1e-12), \
+        np.abs(got["energy"].reshape(-1) - want).max() / want.max()
 
 
 def test_missing_point_refuses_the_whole_scan():
@@ -222,6 +283,8 @@ def test_crop_only_shifts_the_reading():
             _save_png16(p, sub)
             cut_items.append((i, float(s["items"][i][1]), p))
         cut = align_maps(cut_items, crop=(2, 1, 5, 4), lmin=lmin, lmax=lmax)
+        ufull = align_maps(s["items"], unfiltered=True)
+        ucut = align_maps(cut_items, crop=(2, 1, 5, 4), unfiltered=True)
         try:
             align_maps(s["items"], crop=(2, 1, 9, 9), lmin=lmin, lmax=lmax)
         except ValueError as exc:
@@ -234,6 +297,9 @@ def test_crop_only_shifts_the_reading():
     # 逐像素等于原图那块子图（裁剪只改读文件那一层：同一叠帧、同一套式子、换了个窗口）
     assert np.allclose(cut["energy"], full["energy"][1:5, 2:7], rtol=1e-12)
     assert np.allclose(cut["dc"], full["dc"][1:5, 2:7], rtol=1e-12)
+    # 不滤波也走同一条读盘路：裁剪同样只减一次偏移，两个口径各比一遍
+    assert np.allclose(ucut["energy"], ufull["energy"][1:5, 2:7], rtol=1e-12)
+    assert np.allclose(ucut["dc"], ufull["dc"][1:5, 2:7], rtol=1e-12)
 
 
 def test_memory_limit_refuses_before_allocating():

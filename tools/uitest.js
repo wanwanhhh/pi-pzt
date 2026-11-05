@@ -13,7 +13,8 @@
  *       位置口径：折算 µm ↔ 设备读回原值 / 频谱横轴：频率 ↔ 波长）；
  *       W–Z 数据页的频谱轴、滤波与解析信号（包络 / 相位残差 / 傅里叶极限）；
  *       AA 数据页相位图（波段来源、一遍读盘的起算与进度、绕圈配色、门限、换基准不重取数）；
- *       AB 数据页强度对齐（全通照算、n 只改显示、线性灰度、直流门限相对中位数、慢响应、字节数）；
+ *       AB 数据页强度对齐（全通照算、不滤波仍走同一个三步、n 只改显示、线性灰度、
+ *          直流门限相对中位数、慢响应、字节数）；
  *       AC 跨语言 golden：pixelSpectrum / filtKeepRange 与后端同一条式子（期望值在
  *          backend/tests/golden_spectrum.json，Python 那半边是 backend/tests/test_golden.py）。
  *       （相机预览那块只有"加载 app.js 不炸"这一层被覆盖，预览时序未测。）
@@ -818,6 +819,116 @@ const count = (m) => calls.filter((c) => c === m).length;
   await expectCross(0, '49.875%', '50.000%');
   route = (m, u) => (u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] });
   await run('ccdStatus()'); await tick();
+
+
+  console.log('\n[N2] 预览 80% 能量圆：原始帧、整幅质心、只显示');
+  const ringBody = (over) => Object.assign({
+    ok: true, cx: 718.2, cy: 540.0, r80: 10.7, d80: 21.4,
+    width: 1440, height: 1080, saturated: 0,
+    window: [590, 400, 256, 256], total: 12345,
+  }, over || {});
+  let ringResp = ringBody();
+  route = (m, u) => {
+    if (u.indexOf('/api/ccd/energy-circle') === 0) return { body: ringResp };
+    return u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] };
+  };
+  await run('ccdStatus()'); await tick();
+  ok('默认关：按钮写关、圆与标签都不画',
+     read("$('btn-ccd-ring').textContent") === '80% 能量圆：关' &&
+     read("$('ccd-ring').hidden") === true && read("$('ccd-ring-label').hidden") === true,
+     JSON.stringify([read("$('btn-ccd-ring').textContent"), read("$('ccd-ring').hidden"),
+                     read("$('ccd-ring-label').hidden"), read('ccdRingOn')]));
+  calls.length = 0;
+  await run("$('btn-ccd-ring').onclick()"); await tick(); await tick();
+  ok('打开后请求能量圆接口（只开一个轮询）',
+     calls.filter((c) => c.indexOf('GET /api/ccd/energy-circle?') === 0).length === 1 &&
+     read('ccdRingPoll.running()') === true,
+     JSON.stringify(calls.filter((c) => c.indexOf('energy-circle') >= 0)));
+  ok('圆按质心的百分比位置画出来（不量屏幕像素）',
+     read("$('ccd-ring').hidden") === false &&
+     Math.abs(parseFloat(read("$('ccd-ring').style.left")) - 49.875) < 1e-3 &&
+     Math.abs(parseFloat(read("$('ccd-ring').style.top")) - 50) < 1e-3,
+     read("$('ccd-ring').style.left") + ' / ' + read("$('ccd-ring').style.top"));
+  ok('圆的宽高按直径换算（像素是传感器像素）',
+     Math.abs(parseFloat(read("$('ccd-ring').style.width")) - (21.4 / 1440 * 100)) < 1e-3 &&
+     Math.abs(parseFloat(read("$('ccd-ring').style.height")) - (21.4 / 1080 * 100)) < 1e-3,
+     read("$('ccd-ring').style.width") + ' / ' + read("$('ccd-ring').style.height"));
+  ok('标签与统计条都写 D80', read("$('ccd-ring-label').textContent") === 'D80 = 21.4 px' &&
+     read("$('ccd-ring-d').textContent") === '21.4',
+     read("$('ccd-ring-label').textContent") + ' / ' + read("$('ccd-ring-d').textContent"));
+  ok('说明条写明未扣背景、只显示不入库',
+     read("$('ccd-ring-note').textContent").indexOf('未扣背景') >= 0 &&
+     read("$('ccd-ring-note').textContent").indexOf('只显示') >= 0,
+     read("$('ccd-ring-note').textContent"));
+
+  // 转预览只换算显示位置：圆心按 90° 那张表搬，半径不变（圆还是圆）
+  ccdBody = Object.assign(cenBody(cen()), { rotation: 90 });
+  await run('ccdStatus()'); await tick();
+  ok('转 90°：圆跟着质心搬到显示帧的正确位置，直径不变',
+     Math.abs(parseFloat(read("$('ccd-ring').style.left")) - (539 / 1080 * 100)) < 1e-3 &&
+     Math.abs(parseFloat(read("$('ccd-ring').style.top")) - (718.2 / 1440 * 100)) < 1e-3 &&
+     read("$('ccd-ring-label').textContent") === 'D80 = 21.4 px',
+     read("$('ccd-ring').style.left") + ' / ' + read("$('ccd-ring').style.top"));
+  ccdBody = Object.assign(cenBody(cen()), { rotation: 0 });
+  await run('ccdStatus()'); await tick();
+
+  // 后端说“算不了”：不画圈、把原因原样摆出来、直径留空
+  ringResp = { ok: false, reason: '80% 半径贴到窗口边（背景可能太强/窗口太小）',
+               width: 1440, height: 1080, saturated: 0 };
+  await run('ccdRingTick()'); await tick(); await tick();
+  ok('算不了时不画圈，原因照抄，直径不编',
+     read("$('ccd-ring').hidden") === true && read("$('ccd-ring-label').hidden") === true &&
+     read("$('ccd-ring-d').textContent") === '—' &&
+     read("$('ccd-ring-note').textContent").indexOf('背景可能太强') >= 0,
+     read("$('ccd-ring-note').textContent"));
+
+  // 饱和：照画但标“仅供参考”（后端给 saturated 计数）
+  ringResp = ringBody({ saturated: 42 });
+  await run('ccdRingTick()'); await tick(); await tick();
+  ok('饱和时照画，但标签与说明都标出来',
+     read("$('ccd-ring').hidden") === false &&
+     read("$('ccd-ring-label').textContent").indexOf('饱和') >= 0 &&
+     read("$('ccd-ring-note').textContent").indexOf('42') >= 0,
+     read("$('ccd-ring-label').textContent") + ' / ' + read("$('ccd-ring-note').textContent"));
+
+  // 背景占 5%~20%：照画，但说明条要写出占比并标“仅供参考”
+  ringResp = ringBody({ bg_fraction: 0.12, bg_warning: true });
+  await run('ccdRingTick()'); await tick(); await tick();
+  ok('背景占 12%：圆照画，但说明条写清“仅供参考”',
+     read("$('ccd-ring').hidden") === false &&
+     read("$('ccd-ring-note').textContent").indexOf('背景占窗口总能量 12%') >= 0 &&
+     read("$('ccd-ring-note').textContent").indexOf('仅供参考') >= 0,
+     read("$('ccd-ring-note').textContent"));
+
+  // 关掉开关：停请求、圈与标签收起
+  const ringCallsBeforeOff = calls.filter((c) => c.indexOf('energy-circle') >= 0).length;
+  await run("$('btn-ccd-ring').onclick()"); await tick();
+  ok('关掉开关：圆收起、按钮写关、轮询停下',
+     read("$('btn-ccd-ring').textContent") === '80% 能量圆：关' &&
+     read("$('ccd-ring').hidden") === true && read("$('ccd-ring-label').hidden") === true &&
+     read("$('ccd-ring-note').hidden") === true && read('ccdRingPoll.running()') === false,
+     read("$('btn-ccd-ring').textContent"));
+  await sleep(30); await tick();
+  ok('关掉后不再发测量请求',
+     calls.filter((c) => c.indexOf('energy-circle') >= 0).length === ringCallsBeforeOff,
+     JSON.stringify(calls.filter((c) => c.indexOf('energy-circle') >= 0)));
+  route = (m, u) => (u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] });
+
+  // 停预览也要收圈（不是只有关开关）：再开一次，让停预览来收
+  ringResp = ringBody();
+  route = (m, u) => {
+    if (u.indexOf('/api/ccd/energy-circle') === 0) return { body: ringResp };
+    return u.indexOf('/api/ccd/') === 0 ? { body: ccdBody } : { body: [] };
+  };
+  await run("$('btn-ccd-ring').onclick()"); await tick(); await tick();
+  ok('再打开一次：圆画出来', read("$('ccd-ring').hidden") === false &&
+     read('ccdRingPoll.running()') === true);
+  run('ccdLiveStop()');
+  ok('停预览：圆、标签、说明一起收起，轮询停下',
+     read("$('ccd-ring').hidden") === true && read("$('ccd-ring-label').hidden") === true &&
+     read("$('ccd-ring-d').textContent") === '—' &&
+     read("$('ccd-ring-note').hidden") === true && read('ccdRingPoll.running()') === false,
+     read("$('ccd-ring-note').hidden") + ' / ' + read('ccdRingPoll.running()'));
 
   run('ccdLiveStop()');
   ok('停预览后十字线收起（那个数是上一帧的残留，不该继续显示）',
@@ -3432,9 +3543,9 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('align-bar-hi').textContent") === '\u2014',
      read("$('align-bar-lo').textContent") + ' ~ ' + read("$('align-bar-hi').textContent"));
 
-  ok('全通（两个波长框都空）**照算**：按钮可用、说明写清这是所有谱线的交流能量（与相位图相反）',
+  ok('全通（两个波长框都空）**照算**：按钮可用、说明写清这是所有能解出的谱线的交流能量（与相位图相反）',
      read("$('btn-align-run').disabled") === false &&
-     read("$('align-band').textContent") === '波段：全通（两个波长框都空着）—— 所有谱线的交流能量',
+     read("$('align-band').textContent") === '波段：全通（两个波长框都空着）—— 所有能解出的谱线的交流能量',
      read("$('align-band').textContent") + ' | disabled=' + read("$('btn-align-run').disabled"));
 
   calls.length = 0;
@@ -3647,6 +3758,58 @@ const count = (m) => calls.filter((c) => c === m).length;
   ok('切回去：那份结果还在手里（切页只改显示）',
      read("$('card-align').hidden") === true && read('alignData.w') === 4);
   run("alignPolling.stop();");
+
+  // 不滤波：去掉的只是带通，每个像素还是那三步（减自己的直流 → 除 d^α → 平方积分）。
+  // 起算只带 unfiltered=1；后端回的仍是 energy / dc 两张与 n 无关的图。
+  console.log('\n[AB+] 数据页强度对齐：不滤波 = 同一个三步公式，b = I−d');
+  run("alignResult = " + JSON.stringify(alMeta) + "; alignData = {w: 4, h: 2, " +
+      "energy: Float32Array.from(" + JSON.stringify(AL_ENERGY) + "), " +
+      "dc: Float32Array.from(" + JSON.stringify(AL_DC) + ")}; " +
+      "alignLoadedKey = pairKey(alignResult); $('align-nofilter').checked = true; alignSyncUI();");
+  ok('勾上不滤波：波段行改口径、按钮说明改口径；手里那张滤波图立刻标「口径改过」',
+     read("$('align-band').textContent") === '口径：不滤波（不分波段；整条时间序列的交流能量）' &&
+     read("$('btn-align-run').title").indexOf('不按波段') > 0 &&
+     read("$('align-stale').hidden") === false &&
+     read("$('align-stale').textContent") === '口径改过，点重算',
+     read("$('align-band').textContent") + ' | ' + read("$('align-stale').textContent"));
+
+  calls.length = 0;
+  await run("$('btn-align-run').onclick()"); await tick();
+  ok('不滤波起算：请求只带 unfiltered=1，一个波长参数都不带',
+     calls.indexOf('POST /api/scans/82/align?unfiltered=1') >= 0 &&
+     !calls.some((c) => c.indexOf('lmin=') >= 0 || c.indexOf('lmax=') >= 0),
+     JSON.stringify(calls));
+
+  const alMetaU = { scan_id: 82, w: 4, h: 2, rect: [500, 400, 4, 2], n: 3,
+                    unfiltered: true, band: [null, null], dc_median: 1000 };
+  alJob = { running: false, scan_id: 82, done: 3, total: 3, error: null, result: alMetaU };
+  await run('alignPoll()'); await tick();
+  ok('不滤波结果：统计条写「口径 / 不滤波（整条时间序列）」、标题写不滤波、算式换成 Σ(I−d)²',
+     read("$('align-lines-label').textContent") === '口径' &&
+     read("$('align-lines').textContent") === '不滤波（整条时间序列）' &&
+     read("$('align-title').textContent").indexOf('强度对齐（不滤波）') > 0 &&
+     read('alignIdleText()').indexOf('S = Σ(I−d)²') > 0,
+     [read("$('align-lines-label').textContent"), read("$('align-lines').textContent"),
+      read("$('align-title').textContent"), read('alignIdleText()')].join(' | '));
+
+  ok('不滤波仍是同一个三步式子：S = Σ(I−d)² ÷ d^(5/6)（不是换成绩效图/标准差图）',
+     (function () {
+       const vals = JSON.parse(read('JSON.stringify(Array.from(alignSeries()))'));
+       const want = AL_ENERGY.map((e, i) => e / Math.pow(AL_DC[i], 5 / 6));
+       return vals.every((v, i) => Math.abs(v - want[i]) < 1e-6);
+     })(), read('JSON.stringify(Array.from(alignSeries()).slice(0,3))'));
+
+  run("$('filt-lmin').value = '1.1'; $('filt-lmax').value = '1.2'; alignSyncUI();");
+  ok('不滤波时改波段：不标「波段改过」（波段不参与），手里那张图仍算数',
+     read("$('align-stale').hidden") === true, read("$('align-stale').textContent"));
+
+  run("$('align-nofilter').checked = false; $('align-nofilter').onchange();");
+  ok('取消不滤波：手里那张不滤波图立刻标「口径改过，点重算」',
+     read("$('align-stale').hidden") === false &&
+     read("$('align-stale').textContent") === '口径改过，点重算',
+     read("$('align-stale').textContent"));
+  run("$('filt-lmin').value = ''; $('filt-lmax').value = ''; " +
+      "alignResult = null; alignData = null; alignLoadedKey = ''; alignSyncUI();");
 
 
   // ==================== 跨语言 golden：前端与后端解的是同一条式子 ====================

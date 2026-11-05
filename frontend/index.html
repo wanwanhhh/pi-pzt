@@ -276,13 +276,20 @@
         <div class="tools">
           <label class="mini" for="ccd-preview-ms">曝光 (ms)</label>
           <input id="ccd-preview-ms" class="mini" type="number" step="0.1" min="0.04">
+          <button id="btn-ccd-ring" aria-pressed="false"
+                  title="原始 16 位帧、不扣背景：以整幅质心为圆心，在光斑附近窗口里累积原始强度，画出包含 80% 能量的圆并标出直径。背景很弱时才是光斑直径；背景占窗口 5%～20% 照画但标『仅供参考』，超过 20% / 贴边 / 太小时只说明，不给假数。只显示，不改图、不入库。">80% 能量圆：关</button>
         </div>
         <p class="hint" id="ccd-exposure-hint">—</p>
+        <!-- 80% 能量圆的“为什么没画/背景占多少”放在画面上面：放在下面会被统计条挤到屏幕外 -->
+        <p class="hint" id="ccd-ring-note" hidden>—</p>
         <div class="ccdview">
           <div class="ccdstack" id="ccd-stack">
             <img id="ccd-img" alt="相机预览（原始灰度，未做任何处理）" hidden>
             <div id="ccd-cut" class="cut" hidden><i id="ccd-cut-v" class="cutv"></i><i id="ccd-cut-h" class="cuth"></i></div>
             <div id="ccd-cross" class="cross" hidden></div>
+            <!-- 80% 能量圆：只画在看到的这一帧上，半径/圆心是传感器坐标；不入库、不改图 -->
+            <div id="ccd-ring" class="ccdring" hidden></div>
+            <div id="ccd-ring-label" class="ccdringlabel" hidden></div>
           </div>
           <p class="hint" id="ccd-empty">点「开始预览」打开相机。画面是<b>原始灰度、不做任何处理</b>；
             扫描进行中相机会被扫描占用，预览一律被后端拒绝。</p>
@@ -296,6 +303,7 @@
           <div><dt>质心 (传感器 px)</dt><dd id="ccd-cen">—</dd></div>
           <div><dt>ΣI（整幅）</dt><dd id="ccd-sum">—</dd></div>
           <div><dt>峰值 / 饱和</dt><dd id="ccd-sat">—</dd></div>
+          <div><dt>80% 能量圆直径 (px)</dt><dd id="ccd-ring-d">—</dd></div>
           <div><dt>预览朝向</dt><dd id="ccd-rot">—</dd></div>
         </dl>
         <!-- 连上相机后这段由 app.js 按后端实际值重写（含质心口径与坐标说明）；
@@ -801,12 +809,16 @@
         </div>
         <div class="tools">
           <button id="btn-align-run" class="primary">算强度对齐</button>
+          <label class="mini chk-inline" for="align-nofilter"
+                 title="不滤波：不做带通，每个像素直接拿自己那条时间序列（减自己的均值）当 b(t)；后面的三步、n、门限都不变。它与「全通」不是一回事：全通仍是所有能解出的谱线的交流能量。">
+            <input id="align-nofilter" type="checkbox"> 不滤波
+          </label>
           <span class="hint" id="align-band">—</span>
           <span class="tsep"></span>
           <label class="mini" for="align-n">n</label>
           <input id="align-n" class="mini" type="number" step="any" min="0.5" value="3"
                  data-min="0.5"
-                 title="归一化的强度：每个像素除自己的直流，指数是 (2n−1)/(2n)。n 越大亮度差压得越狠 —— n→∞ 是「完全归一化」（只剩条纹对比度的平方），n=1/2 是「完全不归一化」（就是带内交流能量，亮的像素仍然更亮）。默认 3（指数 5/6）。**改它只重画**：后端给的两张图与 n 无关。">
+                 title="归一化的强度：每个像素除自己的直流，指数是 (2n−1)/(2n)。n 越大亮度差压得越狠 —— n→∞ 是「完全归一化」（只剩条纹对比度的平方），n=1/2 是「完全不归一化」（就是交流能量：滤波时是带内，不滤波时是整条；亮的像素仍然更亮）。默认 3（指数 5/6）。**改它只重画**：后端给的两张图与 n 无关。">
           <label class="mini" for="align-dcmin">直流门限 (dB)</label>
           <input id="align-dcmin" class="mini" type="number" step="any" value="-40"
                  title="相对**整幅图直流的中位数**多少 dB：直流比它更小的像素不画（涂深灰并计数）。那些像素的 d^((2n−1)/(2n)) 极小，一除就爆炸 —— 那是「算得出却不可复现」，不是当成 0。留空 = 不掐。">
@@ -822,22 +834,25 @@
         <dl class="stats inline">
           <div><dt>n</dt><dd id="align-n-note">—</dd></div>
           <div><dt>幅面</dt><dd id="align-size">—</dd></div>
-          <div><dt>留下谱线</dt><dd id="align-lines">—</dd></div>
+          <div><dt id="align-lines-label">留下谱线</dt><dd id="align-lines">—</dd></div>
           <div><dt>直流中位数 (ADU)</dt><dd id="align-dcmed">—</dd></div>
           <div><dt>门限以下</dt><dd id="align-blank">—</dd></div>
         </dl>
         <p class="hint" id="align-hover">鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。</p>
-        <p class="hint" id="align-empty">还没有算。左边选一条扫描，在〈滤波曲线〉那张卡里填好波长范围（就是条纹那一段；留空 = 全通，这里也能算），再点「算强度对齐」。</p>
+        <p class="hint" id="align-empty">还没有算。左边选一条扫描，在〈滤波曲线〉那张卡里填好波长范围（就是条纹那一段；留空 = 全通，这里也能算），或勾选「不滤波」（不分波段），再点「算强度对齐」。</p>
         <p class="hint" id="align-note" hidden><b>这张图答的是「整幅图里，哪个像素的条纹更深」</b>：
-          每个像素按〈滤波曲线〉那张卡选中的<b>同一段波长</b>重建它的带通信号 b(t)
-          （每个点用它自己那一刻的时间，与那条曲线同一份非均匀最小二乘），然后做三步：
-          <b>① 减掉它自己的直流</b>（这条扫描该像素所有帧的均值；b 本来就不含直流，这一步自动满足）；
+          每个像素做三步：<b>① 减掉它自己的直流</b>（这条扫描该像素所有帧的均值；
+          滤波时 b 本来就不含直流，这一步自动满足）；
           <b>② 除以它自己直流的 (2n−1)/(2n) 次方</b>；<b>③ 平方积分</b>（逐点平方再求和，<b>不除以点数</b>）。
           合成一句：<b>S = Σ b(t)² / d^((2n−1)/(2n))</b>。
+          <b>b(t) 从哪来</b>：默认按〈滤波曲线〉那张卡选中的<b>同一段波长</b>重建它的带通信号
+          （每个点用它自己那一刻的时间，与那条曲线同一份非均匀最小二乘）；
+          <b>勾选「不滤波」</b>时不做这一步，b(t) 直接取该像素自己的时间序列减自己的均值。
+          两种口径的三步与公式完全相同，只是 b 的来源不同。
           <b>为什么除以直流叫「对齐」</b>：亮的地方 b 大、暗的地方 b 小，直接比就是比亮度；
           每个像素除自己的 d，亮暗与照明不均就被除掉，剩下的是<b>条纹的相对深度</b>。
           <b>n 是什么意思</b>：指数 (2n−1)/(2n) 是归一化程度 —— n 越大压得越狠。
-          n=1/2 时指数 0（完全不归一化，就是带内交流能量）；n=1 时是 d¹（散粒噪声受限下的信噪比平方）；
+          n=1/2 时指数 0（完全不归一化，就是交流能量）；n=1 时是 d¹（散粒噪声受限下的信噪比平方）；
           n→∞ 时指数 2（完全归一化，只剩对比度的平方）。<b>改 n 只重画</b>：后端给的是 Σb² 与 d
           两张与 n 无关的图，n 只在显示这一层乘上去。
           <b>不除以点数</b>：所以数值随扫描长短线性增长，<b>跨扫描不能比绝对值</b>；同一张图里的明暗关系
@@ -846,9 +861,11 @@
           以下的像素涂深灰并计数，留空 = 不掐。
           <b>图是线性灰度</b>（不做对数）：最深 = 0、最白 = 这张图里最强的那一格，图下方色标写着这三格数；
           hover 报的是 S 的原值与它占最强的百分比。
-          <b>全通也能算</b>：与相位图不同，这里不需要载波，全通就是「所有谱线的交流能量」。
-          <b>代价</b>：一遍读盘，与相位图同档；但累加要 2K 张图（K = 带内谱线根数，相位图只要 2 张），
-          超上限会当场拒并说清怎么办。坐标是<b>保存的 PNG 自己的坐标</b>，裁过的也是这一套。</p>
+          <b>全通也能算</b>：与相位图不同，这里不需要载波，全通就是「所有能解出的谱线的交流能量」；
+          <b>不滤波是另一个口径</b>（整条时间序列，不再分波段），别把两者当成同一张图。
+          <b>代价</b>：一遍读盘，与相位图同档；滤波时累加 2K 张图（K = 带内谱线根数），
+          超上限会当场拒并说清怎么办；不滤波只累加三张与谱线根数无关的图，所以全幅也不受那个上限约束。
+          坐标是<b>保存的 PNG 自己的坐标</b>，裁过的也是这一套。</p>
       </section>
     </div>
 

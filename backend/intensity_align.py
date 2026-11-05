@@ -2,8 +2,8 @@
 
     S_xy = Σ_t b_xy(t)² / d_xy^((2n−1)/(2n))
 
-- **b** = 〈滤波曲线〉所选那段波长内的重建信号（带通结果，**本来就不含直流**）；
-  它的平方和就是「带内交流能量」。
+- **b** = 默认是〈滤波曲线〉所选那段波长内的重建信号（带通结果，**本来就不含直流**）；
+  **不滤波**时 b 直接取该像素自己的时间序列减自己的均值；它的平方和就是「交流能量」。
 - **d** = 该像素这条扫描的**直流**：所有帧的均值。每个像素除自己的 —— 这就是「对齐」：
   亮暗、照明不均、反射率差异都被自己的直流除掉，图上比的是**条纹的相对深度**。
 - **n** 由用户设（默认 3）：指数 1 − 1/(2n) 是归一化程度，n 越大亮度差压得越狠
@@ -21,7 +21,11 @@ cos/sin 在这 N 个点上并不正交，交叉项丢掉就是编数。
 **口径与相位图同源**：时间列、非均匀最小二乘、去均值、波段 → 谱线，与 frontend/app.js 的
 pixelSpectrum / filteredSignal / filtKeepRange 同式（那条口径的家在那边，这里照搬一次）；
 波段 → 谱线直接用 bands.band_lines（那条规矩的家在 bands.py：λ = c/ν、上限卡名义 Nyquist）。
-**全通也能算**（这是它与相位图的重要区别）：这里不需要载波，全通就是「所有谱线的交流能量」。
+**全通也能算**（这是它与相位图的重要区别）：这里不需要载波，全通就是「所有能解出的谱线的交流能量」。
+
+**不滤波**（`unfiltered=True`）：去掉带通这一步，b(t) = I(t) − d；三步与公式一字不改。
+这样 energy = Σ(I−d)²，一遍读盘只要三张图（第一帧基准、Σ偏差、Σ偏差²），与谱线根数无关。
+它答的是「整条时间序列的交流能量」，与「全通」（所有能解出的谱线的交流能量）是两个口径。
 """
 from __future__ import annotations
 
@@ -177,19 +181,74 @@ def _accumulate(items, crop, rows_a, rows_b, workers: int, progress):
     return shape, s_a, s_b, s_dc
 
 
+def _accumulate_unfiltered(items, crop, workers: int, progress):
+    """不滤波的一遍读盘：逐像素以第一帧为基准算偏差，返回 (shape, energy, dc)。
+
+    数学上就是 b(t) = I(t) − d 的平方和：
+
+        d = base + mean(I − base)
+        energy = Σ(I − base)² − n·mean(I − base)²
+
+    **为什么先减 base 再累加**：直接累加 ΣI² 再减 n·mean² 是两个大数相减
+    （直流 5 万 ADU、交流只有几 ADU 时有效位全丢）。先减掉第一帧，留下来的就是交流量，
+    加减都在同一个量级上；base 只是第一帧，正好也是 dc 的起点。
+
+    只要三张图（base、Σ偏差、Σ偏差²），与谱线根数无关；读盘窗口按 workers 帧收，
+    不再按 2K 张累加图那套留 32 帧 —— 峰值 ≈ (窗口 + 4) 帧 + 三张图，全幅也只要百 MB 级。
+    """
+    import numpy as np
+
+    from . import frames
+
+    n = len(items)
+    base = s1 = s2 = None
+    window = max(2, int(workers))
+    for _i, sh, f in frames.read_frames(items, crop=crop, workers=workers,
+                                        dtype=np.float64, progress=progress,
+                                        window=window):
+        if base is None:
+            base = f.copy()
+            s1 = np.zeros(sh, dtype=np.float64)
+            s2 = np.zeros(sh, dtype=np.float64)
+        d = f - base
+        s1 += d
+        s2 += d * d
+    s1 /= n
+    s2 -= s1 * s1 * n          # Σd² − n·mean(d)² = Σ(I−d)²
+    np.maximum(s2, 0.0, out=s2)   # 平方和不该为负；这里只压掉浮点减法的噪声
+    return base.shape, s2, base + s1
+
+
 def align_maps(items, crop=None, lmin=None, lmax=None, workers: int = 8,
-               progress: Optional[Callable[[int, int], None]] = None) -> dict:
-    """这条扫描的每一帧读一遍 → 两张与 n 无关的图：带内交流能量 Σb² 与直流 d。
+               progress: Optional[Callable[[int, int], None]] = None,
+               unfiltered: bool = False) -> dict:
+    """这条扫描的每一帧读一遍 → 两张与 n 无关的图：交流能量 Σb² 与直流 d。
+
+    **默认（滤波）**：b 是〈滤波曲线〉那段波长重建出来的带通信号，energy = Σb²。
+    **不滤波**：b 直接是 I − d，energy = Σ(I−d)²；三步与公式不变，见 `_accumulate_unfiltered`。
 
     items 是 [(序号, 读出位置 µm, PNG 路径 | None), ...]（与 png_pixel_series 同一形状）。
     crop 给了就是 (x0, y0, w, h)：帧已经被裁成**原始坐标**里的那一块。返回的 rect 是**原始坐标**，
     数组是**盘上那张图**的形状 —— 坐标口径不因裁剪改变（与取数、剖面、相位图同一套）。
 
-    返回 {energy, dc（float64 二维，h×w）, rect, w, h, n, k_lo, k_hi, k_max, df_thz, band}。
+    返回 {energy, dc（float64 二维，h×w）, rect, w, h, n, k_lo, k_hi, k_max, df_thz, band,
+    unfiltered}。不滤波时没有 k_* / df_thz（不分波段），band 是 [None, None]。
     """
     import numpy as np
 
     _check_items(items)
+    if unfiltered:
+        if lmin is not None or lmax is not None:
+            raise ValueError("不滤波就不分波段：别同时给波长")
+        shape, energy, dc = _accumulate_unfiltered(items, crop, workers, progress)
+        h, w = shape
+        x0, y0 = (crop[0], crop[1]) if crop else (0, 0)
+        return {
+            "energy": energy, "dc": dc,
+            "w": int(w), "h": int(h),
+            "rect": [int(x0), int(y0), int(w), int(h)] if crop else None,
+            "n": len(items), "unfiltered": True, "band": [None, None],
+        }
     t_fs = [p * TIME_FS_PER_UM for (_, p, _) in items]
     span = max(t_fs) - min(t_fs)
     k_lo, k_hi, k_max, df_thz = band_lines(lmin, lmax, len(items), span)
@@ -227,5 +286,5 @@ def align_maps(items, crop=None, lmin=None, lmax=None, workers: int = 8,
         "w": int(w), "h": int(h),
         "rect": [int(x0), int(y0), int(w), int(h)] if crop else None,
         "n": len(items), "k_lo": int(ks[0]), "k_hi": int(ks[-1]), "k_max": int(k_max),
-        "df_thz": df_thz, "band": [lmin, lmax],
+        "df_thz": df_thz, "band": [lmin, lmax], "unfiltered": False,
     }

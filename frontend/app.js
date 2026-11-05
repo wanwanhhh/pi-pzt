@@ -1036,6 +1036,132 @@ function ccdPaintCentroid(st) {
   sat.className = c.saturated ? 'on' : '';
 }
 
+
+/* ==================== 预览：80% 能量圆 ====================
+   用户定的口径：**原始数据、不扣背景**。圆心用整幅质心；在光斑附近窗口里把原始强度按
+   半径排序、累积到总能量的 80%，得到 r80，画圆并标直径 D80。
+   窗口只是限制积分范围（窗口外不参与），不是背景模型；背景弱时才是光斑直径。
+   后端算、前端只按当前朝向画；关掉、停预览、掉线、切页都立刻收起来。 */
+const CCD_RING_MS = 250;      // 4 Hz：不必跟着 10 fps 取帧，圈也不会抖成噪声
+const ccdRingPoll = poller(ccdRingTick, CCD_RING_MS);
+let ccdRingOn = false;
+let ccdRingBusy = false;
+let ccdRingLast = null;
+
+/* 取帧计时器与“要不要量”分开：这个只由 ccdLive && ccdRingOn 决定 */
+function syncCcdRingTimer() {
+  if (!ccdLive || !ccdRingOn) {
+    ccdRingPoll.stop();
+    if (!ccdLive) {
+      ccdRingLast = null;
+      $('ccd-ring').hidden = true;
+      $('ccd-ring-label').hidden = true;
+      setText('ccd-ring-d', '—');
+      $('ccd-ring-note').hidden = true;
+    }
+    return;
+  }
+  if (ccdRingPoll.running()) return;
+  ccdRingPoll.start();
+}
+
+/* 开关：默认关；关掉就停请求、清圈。设备不可用时按钮是灰的（ccdPaint 管） */
+function ccdRingToggle() {
+  ccdRingOn = !ccdRingOn;
+  const btn = $('btn-ccd-ring');
+  setText('btn-ccd-ring', ccdRingOn ? '80% 能量圆：开' : '80% 能量圆：关');
+  btn.setAttribute('aria-pressed', ccdRingOn ? 'true' : 'false');
+  if (!ccdRingOn) {
+    ccdRingPoll.stop();
+    ccdRingLast = null;
+    $('ccd-ring').hidden = true;
+    $('ccd-ring-label').hidden = true;
+    setText('ccd-ring-d', '—');
+    $('ccd-ring-note').hidden = true;
+    return;
+  }
+  $('ccd-ring-note').hidden = false;
+  setText('ccd-ring-note', ccdLive ? '测量中…' : '先开预览；开预览后自动测量。');
+  syncCcdRingTimer();
+}
+
+/* 原始 80% 能量圆：GET，不弹 toast（4 Hz 的错误不能刷屏）；相机状态由 ccdStatus 负责 */
+async function ccdRingTick() {
+  if (!ccdLive || !ccdRingOn || ccdRingBusy) return;
+  ccdRingBusy = true;
+  try {
+    const resp = await fetch('/api/ccd/energy-circle?t=' + Date.now(), { cache: 'no-store' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const r = await resp.json();
+    if (!ccdLive || !ccdRingOn) return;      // 请求在途时预览被停了：不要把旧结果画上去
+    ccdRingApply(r);
+  } catch (err) {
+    if (!ccdLive || !ccdRingOn) return;
+    ccdRingClear('取不到测量（相机状态看上面）');
+  } finally {
+    ccdRingBusy = false;
+  }
+}
+
+/* 后端说“算不了”（背景不弱/贴边/太小）是正常结果：不画圈，把原因照抄出来 */
+function ccdRingApply(r) {
+  if (!r || !r.ok) {
+    ccdRingClear(r && r.reason ? r.reason : '测量中…');
+    return;
+  }
+  ccdRingLast = r;
+  ccdPaintRing(r);
+}
+
+function ccdRingClear(note) {
+  ccdRingLast = null;
+  $('ccd-ring').hidden = true;
+  $('ccd-ring-label').hidden = true;
+  setText('ccd-ring-d', '—');
+  if (ccdRingOn && ccdLive) {
+    $('ccd-ring-note').hidden = false;
+    setText('ccd-ring-note', note || '测量中…');
+  } else {
+    $('ccd-ring-note').hidden = true;
+    setText('ccd-ring-note', '—');
+  }
+}
+
+/* 把传感器坐标的圆心/半径按预览朝向摆到显示帧上；圆半径不受 90° 旋转影响。
+   标签放在圆上方；贴顶时改放下方，避免跑出画面。 */
+function ccdPaintRing(r) {
+  if (!ccdLive || !ccdRingOn || !r || !r.ok) {
+    ccdRingClear(r && r.reason ? r.reason : '');
+    return;
+  }
+  const p = ccdDisplayPoint(r, ccdInfo ? ccdInfo.rotation : 0);
+  const R = Number(r.r80);
+  const ring = $('ccd-ring'), label = $('ccd-ring-label');
+  const left = p.x / p.w * 100, top = p.y / p.h * 100;
+  ring.hidden = false;
+  ring.style.left = left.toFixed(3) + '%';
+  ring.style.top = top.toFixed(3) + '%';
+  ring.style.width = (2 * R / p.w * 100).toFixed(3) + '%';
+  ring.style.height = (2 * R / p.h * 100).toFixed(3) + '%';
+  label.hidden = false;
+  label.textContent = 'D80 = ' + Number(r.d80).toFixed(1) + ' px' + (r.saturated ? '（饱和）' : '');
+  const lx = Math.min(92, Math.max(8, left));
+  let ly = (p.y - R) / p.h * 100;
+  let below = false;
+  if (ly < 12) { ly = (p.y + R) / p.h * 100; below = true; }
+  label.style.left = lx.toFixed(3) + '%';
+  label.style.top = Math.min(96, Math.max(4, ly)).toFixed(3) + '%';
+  label.style.transform = below ? 'translate(-50%, 0)' : 'translate(-50%, -100%)';
+  setText('ccd-ring-d', Number(r.d80).toFixed(1));
+  const bg = (r.bg_warning && r.bg_fraction)
+    ? ' · 背景占窗口总能量 ' + Math.round(r.bg_fraction * 100) + '%，80% 圆会偏，仅供参考'
+    : '';
+  setText('ccd-ring-note', '原始 80% 能量圆（未扣背景，窗口内累积）· 背景弱时才近似光斑' + bg +
+    ' · 只显示，不入库、不进导出' +
+    (r.saturated ? ' · ' + r.saturated + ' 个像素饱和，仅供参考' : ''));
+  $('ccd-ring-note').hidden = false;
+}
+
 /* 旋转：转的是**看的方向**。后端把预览帧转过来显示（90° 整数倍是精确置换，不重采样、不丢数），
    保存的原生帧永远是传感器朝向；质心读数跟着预览一起转（看到什么就读到什么）。
    连点四下一圈：0 → 90 → 180 → 270 → 0。 */
@@ -1082,6 +1208,14 @@ function ccdPaint(st) {
   ccdPaintForm(st);
   setText('ccd-rot', st.rotation ? st.rotation + '°（仅预览）' : '0°（传感器原始）');
   ccdPaintCentroid(st);
+  if (ccdLive) {
+    syncCcdRingTimer();
+    if (ccdRingOn && $('ccd-ring-note').hidden) {
+      $('ccd-ring-note').hidden = false;
+      setText('ccd-ring-note', '测量中…');
+    }
+    if (ccdRingLast) ccdPaintRing(ccdRingLast);   // 转预览时只重画，不重新量
+  }
   $('ccd-sub').textContent = (state === 'preview')
     ? ((st.model || '已连接') + (st.serial ? ' · ' + st.serial : ''))
     : (state === 'failed')
@@ -1099,6 +1233,13 @@ function ccdPaint(st) {
     $('ccd-img').hidden = true;
     $('ccd-empty').hidden = false;
     setText('ccd-fps', '—');
+    // 没有预览就没有“实时”的圈：旧结果一起收掉，别拿上一帧冒充
+    ccdRingPoll.stop();
+    ccdRingLast = null;
+    $('ccd-ring').hidden = true;
+    $('ccd-ring-label').hidden = true;
+    setText('ccd-ring-d', '—');
+    $('ccd-ring-note').hidden = true;
   }
   syncCcdTimer();
   const busy = scanActive || !ccdAvailable || state === 'opening';
@@ -1108,6 +1249,9 @@ function ccdPaint(st) {
   $('btn-ccd-grab').disabled = busy;
   $('btn-ccd-rot').disabled = busy;
   $('btn-ccd-reopen').disabled = busy;
+  $('btn-ccd-ring').disabled = busy || !ccdLive;
+  // 文案由状态来（HTML 的初值只给真浏览器；测试 DOM 不解析标签内文字）
+  setText('btn-ccd-ring', ccdRingOn ? '80% 能量圆：开' : '80% 能量圆：关');
 }
 
 /* 刷新用 img.src：浏览器直接解码显示，比 fetch+blob 省事，也不用管 URL 回收。
@@ -1180,6 +1324,12 @@ function ccdLiveStop() {
   setText('ccd-fps', '—');
   ccdPaintCentroid(null);      // 十字线和质心读数一起收起来（停预览后那个数是上一帧的残留）
   profClear('preview');        // 剖面同理：预览停了就没有"实时"，别留着上次的线
+  ccdRingPoll.stop();          // 80% 能量圆同理：没有帧就没有圈
+  ccdRingLast = null;
+  $('ccd-ring').hidden = true;
+  $('ccd-ring-label').hidden = true;
+  setText('ccd-ring-d', '—');
+  $('ccd-ring-note').hidden = true;
 }
 
 /* ==================== 轮廓图：过点的整行 / 整列 ====================
@@ -2887,7 +3037,7 @@ function mapRectOf(r) {
    两份流程都从它起头，多出来的那一格（相位图的"哪一刻"）由调用方接在后面。 */
 function pairKey(r) {
   if (!r) return '';
-  return [r.scan_id, r.k_lo, r.k_hi, r.n, r.w, r.h].join('|');
+  return [r.scan_id, r.unfiltered ? 'u' : 'f', r.k_lo, r.k_hi, r.n, r.w, r.h].join('|');
 }
 
 /* 现在选的是哪一条扫描（两条整幅图都要它来判断"手里这张是不是当前这一条"）。 */
@@ -3559,6 +3709,9 @@ function alignN() {
 
 function alignExponent(n) { return (2 * n - 1) / (2 * n); }
 
+/* 勾没勾「不滤波」。**只此一处读这个框**：起算、旧图标记、统计条都从这里拿。 */
+function alignUnfiltered() { return $('align-nofilter').checked === true; }
+
 /* 直流门限 (dB)：相对**整幅图直流的中位数**（不是最强像素 —— 直流常有零星热点）。
    留空 = 不掐。返回 ADU 阈值：0 与"直流本来就是 0"同一个结果 —— 那些像素本来就除不了。 */
 function alignGate() {
@@ -3608,25 +3761,31 @@ function alignSeriesCached() {
 
 /* 按钮与提示的现状：波段从哪来、n 填对没有、手里这张是不是当前这一条、正在算什么。
    波段与相位图是同一段波长（同一个来源、同一份读法），两个都空 = 全通 ——
-   这里**照算**（不需要载波），与相位图的区别只有 bandText 里那半句。 */
+   这里**照算**（不需要载波），与相位图的区别只有 bandText 里那半句。
+   勾了「不滤波」时波段不参与，统计条改说口径；它与全通不是一个口径。 */
 function alignSyncUI() {
-  const b = bandOf();
-  setText('align-band', bandText(b, '所有谱线的交流能量'));
+  const b = bandOf(), unf = alignUnfiltered();
+  setText('align-band', unf
+    ? '口径：不滤波（不分波段；整条时间序列的交流能量）'
+    : bandText(b, '所有能解出的谱线的交流能量'));
   const n = alignN(), running = alignPolling.running();
   const btn = $('btn-align-run');
   btn.disabled = !isFinite(n) || running;
+  const how = unf
+    ? '把这一条扫描的每一帧读一遍，逐像素直接算它自己时间序列的交流能量（不按波段；后台跑，进度在右边）。换扫描要重算；改 n、改门限、改波段都不用。'
+    : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；改 n、改门限不用。';
   btn.title = !isFinite(n)
     ? '算不了：n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)，n < 1/2 会变成负数、把暗点放大）'
-    : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；改 n、改门限不用。'
-      + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : '');
+    : how + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : '');
   // 扫描列表还没回来时 cur 是 null —— 不下判断（见 mapSyncUI 同一处说明）
   const r = alignResult, cur = scanIdOf();
   let why = '';
   if (r && cur === null) why = '';
   else if (r && r.scan_id !== cur) why = '图是 #' + r.scan_id + ' 的（现在选的是 #' + cur + '）';
-  else if (r && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
+  else if (r && !!r.unfiltered !== unf) why = '口径改过，点重算';
+  else if (!unf && r && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
   $('align-stale').hidden = !why;
-  if (why) setText('align-stale', running ? why + '（正在算新的…）' : why);
+  setText('align-stale', why ? (running ? why + '（正在算新的…）' : why) : '');
 }
 
 /* 起算：一遍读盘在后端后台跑（与相位图、裁剪同一套：POST 起、GET 跟进度）。 */
@@ -3636,7 +3795,9 @@ async function alignRun() {
   if (!isFinite(alignN())) { toast('n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)）', true); return; }
   if (alignPolling.running()) return;
   if (scanActive) toast('扫描进行中：这一遍要读全盘，会跟采图抢磁盘');
-  const d = await post('/api/scans/' + s.id + '/align' + bandQuery(bandOf(), null));
+  const unf = alignUnfiltered();
+  const d = await post('/api/scans/' + s.id + '/align' +
+                       (unf ? '?unfiltered=1' : bandQuery(bandOf(), null)));
   if (!d) return;
   setText('align-progress', JOB_TEXT.started(d.total));
   alignPolling.start();
@@ -3698,6 +3859,7 @@ function alignPaint() {
   const cached = alignSeriesCached();
   const vals = cached && cached.vals;
   if (!alignData || !alignResult || !vals) {
+    setText('align-lines-label', alignResult && alignResult.unfiltered ? '口径' : '留下谱线');
     for (let i = 0; i < ids.length; i++) setText(ids[i], '—');
     setText('align-n-note', isFinite(n) ? n + '（指数 ' + alignExponent(n).toFixed(4) + '）' : '—');
     setText('align-title', '未算');
@@ -3729,13 +3891,19 @@ function alignPaint() {
   ctx.putImageData(img, 0, 0);
 
   const rect = mapRectOf(r);
-  setText('align-title', '#' + r.scan_id + '　强度对齐' +
+  setText('align-title', '#' + r.scan_id + '　强度对齐' + (r.unfiltered ? '（不滤波）' : '') +
     '　' + (r.rect ? '裁剪块 ' + w + '×' + h + ' @ (' + rect[0] + ',' + rect[1] + ')' : w + '×' + h));
   setText('align-n-note', n + '（指数 ' + alignExponent(n).toFixed(4) + '）');
   setText('align-size', w + '×' + h + (r.rect ? '（原始坐标原点 ' + rect[0] + ',' + rect[1] + '）' : ''));
-  setText('align-lines', r.k_lo + ' ~ ' + r.k_hi + '（共 ' + (r.k_hi - r.k_lo + 1) +
-    ' 根 / Nyquist 到 ' + r.k_max + '）' +
-    (r.band[0] === null && r.band[1] === null ? '　全通' : ''));
+  if (r.unfiltered) {
+    setText('align-lines-label', '口径');
+    setText('align-lines', '不滤波（整条时间序列）');
+  } else {
+    setText('align-lines-label', '留下谱线');
+    setText('align-lines', r.k_lo + ' ~ ' + r.k_hi + '（共 ' + (r.k_hi - r.k_lo + 1) +
+      ' 根 / Nyquist 到 ' + r.k_max + '）' +
+      (r.band[0] === null && r.band[1] === null ? '　全通' : ''));
+  }
   setText('align-dcmed', fmt(r.dc_median, 1));
   setText('align-blank', blank ? blank + ' / ' + (w * h) + '（' + (blank * 100 / (w * h)).toFixed(1) + '%）' : '0');
   empty.hidden = true;
@@ -3773,7 +3941,8 @@ function alignBarPaint() {
 function alignIdleText() {
   const n = alignN();
   if (!alignData || !isFinite(n)) return '鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。';
-  return '每个像素：S = Σ b² ÷ d^' + alignExponent(n).toFixed(4) + '（n = ' + n + '）' +
+  const energy = alignResult && alignResult.unfiltered ? 'Σ(I−d)²' : 'Σ b²';
+  return '每个像素：S = ' + energy + ' ÷ d^' + alignExponent(n).toFixed(4) + '（n = ' + n + '）' +
     '　｜　线性灰度（最白 = 最强那一格）　｜　鼠标停在图上读任意一点';
 }
 
@@ -4474,6 +4643,8 @@ function wire() {
   // n 与直流门限都**只改显示**（后端给的两张图与 n 无关）：改了立刻重画，不重读盘
   $('align-n').oninput = function () { alignPaint(); alignSyncUI(); };
   $('align-dcmin').oninput = alignPaint;
+  // 不滤波只改口径：手里那张图不动，只把「该重算」标出来（与相位图换时刻同一类）
+  $('align-nofilter').onchange = alignSyncUI;
   $('align-canvas').onmousemove = alignHover;
   $('align-canvas').onmouseleave = function () { setText('align-hover', alignIdleText()); };
   wireNote('btn-align-note', 'align-note');
@@ -4523,6 +4694,7 @@ function wire() {
   $('btn-ccd-grab').onclick = ccdGrab;
   $('btn-ccd-rot').onclick = ccdRotate;
   $('btn-ccd-reopen').onclick = ccdReopen;
+  $('btn-ccd-ring').onclick = ccdRingToggle;
   $('btn-grabs-refresh').onclick = loadGrabs;
   // 曝光改完立刻生效（数字框用 change，回车或失焦才发，别每敲一个字符就打设备）
   $('ccd-preview-ms').onchange = ccdSetExposure;
