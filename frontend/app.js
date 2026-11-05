@@ -2636,6 +2636,93 @@ function specToggleDb() {
   if (specLast && !specLast.error) renderSpectrum(specSrc);
 }
 
+/* ==================== 导出这条谱 ====================
+
+   把屏幕上这一条**整条**存成 CSV。三条口径，动之前先想清楚：
+
+   1) **同一份数**：相位就是图上那条（同一个 specPhase()）—— 另算一条，文件与屏幕说的就不是一件事。
+      功率给 ADU² 原值，dB 另占一列（0 = 本谱最强那根）。
+   2) **整条导出**：可视范围框、纵轴 dB、横轴频率/波长、连线顺序都是「看的办法」，不参与 ——
+      文件里永远是整条（kMax × 密度 根，频率升序）。
+   3) **相位门限参与**：它决定哪几根画得出来（门限以下算得出却不可复现）。那些位置留空、不补 0 ——
+      与图上断开同一件事；文件头写明门限值与群延迟。
+
+   文件头用 `#` 起头：这是「导出物自己说得清」在这一处的落法 —— 拿到文件的人不看这个程序，
+   也得知道是哪条扫描、哪个像素、怎么算出来的。 */
+function specCsv(d, s, P) {
+  const c = specC();
+  const gate = specPhaseGate();
+  const t = new Date();
+  const when = t.getFullYear() + '-' + pad2(t.getMonth() + 1) + '-' + pad2(t.getDate()) + ' ' +
+               pad2(t.getHours()) + ':' + pad2(t.getMinutes()) + ':' + pad2(t.getSeconds());
+  const f6 = function (v) { return v.toFixed(6); };
+  const f4 = function (v) { return v.toFixed(4); };
+  const fp = function (v) { return v.toPrecision(9); };   // 功率跨好几个量级：按有效数字写
+
+  const head = [
+    '# 像素频谱 · PI P-621.1CD 位移台控制台',
+    '# 扫描: #' + d.scan_id + (d.name ? ' · ' + d.name : ''),
+    '# 像素: (' + d.x + ', ' + d.y + ') · 幅面 ' + d.width + '×' + d.height +
+      (d.bits ? ' · ' + d.bits + ' 位' : '') +
+      (d.crop ? ' · 裁剪过（原始坐标只留了 ' + d.crop.join(', ') + '）' : ' · 未裁剪') +
+      '；坐标是保存的 PNG 自己的坐标',
+    '# 口径: ' + (dataScale === 'raw' ? '设备读回原值' : '折算 µm') +
+      '；时间列 = 读出位置 × 2/c，相位以这条序列最早那一拍 t0 为基准',
+    '# 变换点数: ' + s.n + ' · 真实跨度: ' + s.span_fs.toFixed(1) + ' fs' +
+      ' · 已去均值（直流 ' + fp(s.mean) + ' ADU，不加回）',
+    '# 频率分辨率 1/T: ' + s.df_thz.toFixed(3) + ' THz · 谱线间距: ' + s.step_thz.toFixed(3) +
+      ' THz（谱线密度 ' + s.m + '×）· 上限（名义 Nyquist）: ' + s.fmax_thz.toFixed(3) + ' THz',
+    '# 功率 = (A²+B²)/2（该频率上正弦分量的均方功率）；dB 相对本谱最强那根（' +
+      s.peakF.toFixed(3) + ' THz，' + fp(s.peakP) + ' ADU²）',
+    '# 相位: 沿频率展开、已减线性相位、零在门限内最强那根；门限 ' +
+      (gate === -Infinity ? '不设' : gate + ' dB') +
+      '；群延迟 τ ' + (P.tau_fs === null ? '量不到' : P.tau_fs.toFixed(1) + ' fs') +
+      '；逐根最大步长 ' + (P.step === null ? '量不到' : P.step.toFixed(3) + ' rad'),
+    '# 相位门限以下留空（不补 0、不插值）；整条 ' + s.p.length +
+      ' 根，与可视范围、纵轴 dB、横轴读法无关',
+  ];
+  if (c) head.push('# 波长: λ[µm] = ' + c + ' ÷ ν[THz]（波长列随频率降序，与频率列一一对应）');
+  head.push('# 导出时间: ' + when);
+
+  const cols = ['频率 (THz)'];
+  if (c) cols.push('波长 (µm)');
+  cols.push('功率 (ADU²)', '功率 (dB)', '相位 (rad，去线性)');
+  const rows = head.concat([cols.join(',')]);
+  const ph = P.ph;
+  for (let i = 0; i < s.f.length; i++) {
+    const pw = s.p[i];
+    const cells = [f6(s.f[i])];
+    if (c) cells.push(f4(c / s.f[i]));
+    // 功率为 0 的地方没有 dB（log 0 发散）：留空 —— 与「没有数的地方不编数」同一条
+    cells.push(fp(pw), pw > 0 ? (10 * Math.log10(pw / s.peakP)).toFixed(4) : '',
+               ph[i] === null ? '' : f6(ph[i]));
+    rows.push(cells.join(','));
+  }
+  return rows.join('\r\n') + '\r\n';
+}
+
+/* 存成一个文件（浏览器下载）。文件名带上扫描号与像素：存进同一个目录也分得清是谁的谱。 */
+function specExport() {
+  const s = specLast;
+  if (!specSrc || !s || s.error) {
+    toast('还没有频谱可导出 —— 先选中一条扫描、把曲线画出来。', true);
+    return;
+  }
+  const d = specSrc;
+  const csv = specCsv(d, s, specPhase());
+  const name = 'spectrum-' + d.scan_id + '-x' + d.x + '-y' + d.y + '.csv';
+  // BOM：Excel 靠它认出 UTF-8，不然表头那行中文是乱码
+  const url = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);        // Firefox 要求链接在文档里才肯下载
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  toast('已导出 ' + name);
+}
+
 /* ==================== 滤波：只留下选中的那段波长，再加回时域 ====================
    谱已经把每根谱线的 A/B 分量解出来了（见 pixelSpectrum 的 return），滤波就是"挑出选中的
    那几根、按**每个点自己那一刻的时间**加回去" —— 与正向同一份非均匀最小二乘，所以
@@ -4673,6 +4760,7 @@ function wire() {
   $('btn-spec-db').onclick = specToggleDb;     // 纵轴：功率 ↔ dB（同一串数换刻度，不重算）
   $('spec-phmin').oninput = specPhaseApply;    // 相位门限：只改右边那一列（不重算谱、不取数）
   $('btn-spec-axis').onclick = specAxisToggle; // 横轴：频率 ↔ 波长（同一串数换刻度，不重算）
+  $('btn-spec-export').onclick = specExport;   // 整条谱存成 CSV（与图上同一份数，不另算）
   specAxisTitle = $('btn-spec-axis').title;    // 原样的说明（禁用时在后面补"为什么切不了"）
   specAxisApplyLabels();                       // 按钮与统计条标题的初值
   // 横轴范围框的接线（手填 = 钉住、「自动范围」= 松钉）由 rangeBox.wire 自己接好了

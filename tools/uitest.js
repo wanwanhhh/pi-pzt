@@ -57,6 +57,18 @@ Array.from(html.matchAll(/<[^>]*>/g)).forEach((m) => {
   if (v) VALUE_ATTRS.set(idm[1], v[1]);
 });
 
+/* ---------- 下载桩 ----------
+   「导出这条谱」走的是浏览器下载：Blob + URL.createObjectURL + <a download>.click()。
+   桩里把这三步都接住，把**真的存下去的那份文本**留在 downloads 里 —— 用例直接读 CSV 全文。 */
+const blobs = new Map();      // 'blob:N' → Blob 桩
+const downloads = [];         // [{ name, text }]
+let blobSeq = 0;
+function BlobStub(parts) { this.parts = parts; }
+const URLStub = {
+  createObjectURL(b) { const u = 'blob:' + (++blobSeq); blobs.set(u, b); return u; },
+  revokeObjectURL(u) { blobs.delete(u); },
+};
+
 /* ---------- 假 DOM ---------- */
 function mkEl(isFragment) {
   const e = {
@@ -73,6 +85,13 @@ function mkEl(isFragment) {
         e._children.push(c);
       }
       return c;
+    },
+    removeChild(c) { const i = e._children.indexOf(c); if (i >= 0) e._children.splice(i, 1); return c; },
+    // <a download>.click() = 「存成文件」：把文件名与文本记进 downloads
+    click() {
+      if (!e.download) return;
+      const b = blobs.get(e.href);
+      downloads.push({ name: e.download, text: b ? b.parts.join('') : '' });
     },
     addEventListener(t, fn) { (e._listeners[t] = e._listeners[t] || []).push(fn); },
     removeEventListener(t, fn) {
@@ -144,6 +163,7 @@ const doc = {
   },
   createElement() { return mkEl(); },
   createDocumentFragment() { return mkEl(true); },
+  body: mkEl(),      // 「导出这条谱」把 <a> 临时挂进文档（Firefox 要这样才肯下载）
   querySelectorAll() {
     if (!jogButtons) {
       jogButtons = [1, 2, 3, 4, 5, 6].map((n) => { const b = mkEl(); b.dataset.jog = String(n); return b; });
@@ -239,6 +259,7 @@ const winStub = { addEventListener() {}, removeEventListener() {} };
 const sandbox = {
   document: doc, window: winStub, location: { hash: '' }, fetch: fetchImpl,
   EventSource, ResizeObserver, uPlot, performance: { now: () => Date.now() },
+  Blob: BlobStub, URL: URLStub,
   setInterval: () => { intervalCount++; return intervalCount; }, clearInterval: () => {},
   setTimeout, clearTimeout, confirm: () => true, console,
   __stats: () => ({ intervals: intervalCount, observers: observerCount }),
@@ -2797,6 +2818,84 @@ const count = (m) => calls.filter((c) => c === m).length;
      Math.abs(read('specChart.data[0][107]') - read('specC() / specLast.f[19]')) < 1e-9,
      JSON.stringify(liveW) + ' | x=' + read('specChart.data[0][107]'));
   run("$('btn-spec-axis').onclick()");
+
+  // ==================== 导出这条谱 ====================
+  // 导的是**屏幕上这一条**（同一个 specPhase）、**整条**（不吃可视范围与读法），
+  // 文件头写清出处 —— 「导出物自己说得清」在这一处的落法。
+  console.log('\n[Y2] 导出这条谱：整条 CSV、文件头写出处、门限以下留空');
+
+  const C_UM = 299.792458;
+  const hadC = read('dataLast.wavelength_um_per_thz');   // 这条序列原本有没有波长系数（测完还回去）
+  const sid = read('specSrc.scan_id');
+  run("dataLast.wavelength_um_per_thz = " + C_UM + "; $('spec-phmin').value = '-20'; $('spec-phmin').oninput();");
+  let nDl = downloads.length;
+  run("$('btn-spec-export').onclick()");
+  ok('点「导出这条谱」就存一个文件（名字带扫描号与像素，存进同一个目录也分得清）',
+     downloads.length === nDl + 1 &&
+     downloads[nDl].name === 'spectrum-' + sid + '-x' + read('specSrc.x') + '-y' + read('specSrc.y') + '.csv',
+     JSON.stringify(downloads.slice(nDl).map((d) => d.name)));
+
+  const csv0 = downloads[nDl].text;
+  const lines0 = csv0.split('\r\n');
+  const col0 = lines0.findIndex((l) => l.indexOf('频率 (THz)') === 0);
+  const rows0 = lines0.slice(col0 + 1).filter((l) => l !== '');
+  ok('BOM + 文件头写清出处：哪条扫描、哪个像素、点数与跨度、分辨率与谱线间距',
+     csv0.charCodeAt(0) === 0xfeff && col0 > 0 &&
+     lines0.some((l) => l.indexOf('# 扫描: #' + sid) === 0) &&
+     lines0.some((l) => l.indexOf('# 像素: (700, 540)') === 0) &&
+     lines0.some((l) => l.indexOf('# 变换点数: ' + read('specLast.n')) === 0) &&
+     lines0.some((l) => l.indexOf('# 频率分辨率 1/T: ' + read('specLast.df_thz').toFixed(3)) === 0),
+     lines0.slice(0, col0).join(' | '));
+  ok('数据行 = 整条根数（密度 × kMax）：一行不多、一行不少',
+     rows0.length === read('specLast.p.length') && rows0.length === read('specLast.kMax * specLast.m'),
+     rows0.length + ' 行 / ' + read('specLast.p.length') + ' 根');
+  ok('第一行 = 第 1 根谱线（频率升序）：频率、波长（系数 ÷ ν）、功率（ADU² 原值）',
+     rows0[0].split(',')[0] === read('specLast.f[0].toFixed(6)') &&
+     rows0[0].split(',')[1] === read('(' + C_UM + ' / specLast.f[0]).toFixed(4)') &&
+     rows0[0].split(',')[2] === read('specLast.p[0].toPrecision(9)'),
+     rows0[0]);
+
+  // 相位只给门限以内那几根：与图上那条是同一个 specPhase()（另算一条，文件和屏幕就说的不是一件事）
+  const gateN = read('(function(){var P=specPhase(),n=0;' +
+    'for(var i=0;i<P.ph.length;i++) if(P.ph[i]!==null) n++; return n;})()');
+  const phCells = rows0.map((r) => r.split(',')[4]);
+  ok('相位只在门限以内给数：其余留空（不补 0、不插值，与图上断开同一件事）',
+     phCells.filter((v) => v !== '').length === gateN && gateN > 0,
+     phCells.filter((v) => v !== '').length + ' 根 / 门限内 ' + gateN);
+  ok('最强那一根是零点：导出的相位正好是 0',
+     phCells.some((v) => v !== '' && Math.abs(parseFloat(v)) < 1e-9),
+     JSON.stringify(phCells.filter((v) => v !== '')));
+
+  // 整条导出：可视范围、纵轴 dB、横轴读法都是「看的办法」，不参与
+  run("specX.set(1, 2); specY.set(0, 1000); $('btn-spec-db').onclick(); $('btn-spec-axis').onclick();");
+  nDl = downloads.length;
+  run("$('btn-spec-export').onclick()");
+  const lines1 = downloads[nDl].text.split('\r\n');
+  const bodyOf = (ls) => ls.slice(ls.findIndex((l) => l.indexOf('频率 (THz)') === 0)).join('\n');
+  ok('钉住可视范围 + 切 dB + 切波长轴之后导出：数据段一模一样（只有「导出时间」那行会变）',
+     bodyOf(lines1) === bodyOf(lines0),
+     read('specAxis') + ' / ' + read('specDb'));
+  run("$('btn-spec-db').onclick(); $('btn-spec-axis').onclick();");
+  run("specX.pinned = false; specX.apply(); specY.pinned = false; specY.apply();");
+
+  run("dataLast.wavelength_um_per_thz = null;");
+  nDl = downloads.length;
+  run("$('btn-spec-export').onclick()");
+  const lines2 = downloads[nDl].text.split('\r\n');
+  ok('拿不到波长系数：波长列与那行文件头都不写（不自己编一个系数顶上）',
+     !lines2.some((l) => l.indexOf('# 波长:') === 0) &&
+     lines2.some((l) => l.indexOf('频率 (THz),功率 (ADU²),功率 (dB),相位 (rad，去线性)') === 0),
+     JSON.stringify(lines2.slice(0, 3)));
+
+  const nBad = downloads.length;
+  run('var _keepSpec = specLast; specLast = { error: "这条扫描有 1 个点不合格，整条做不了谱" };' +
+      '$("btn-spec-export").onclick(); specLast = _keepSpec;');
+  run('dataLast.wavelength_um_per_thz = ' + JSON.stringify(hadC) + ';');   // 还回原样（下游用例还按它算）
+  ok('没有谱（这条不合格）：不生成文件，红字说一句',
+     downloads.length === nBad &&
+     read("$('toast').textContent").indexOf('还没有频谱可导出') === 0 &&
+     read("$('toast').className").indexOf('err') >= 0,
+     read("$('toast').textContent") + ' / ' + read("$('toast').className"));
 
   // ==================== 数据页：滤波后的相位与包络（解析信号） ====================
   // 一次累加给出三样东西：实部 = 时间曲线、|z| = 包络、arg z = 相位（z = Σ(A−iB)e^(iθ)，不做变换）。
