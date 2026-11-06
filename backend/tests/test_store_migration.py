@@ -220,6 +220,163 @@ def test_crop_table_is_rebuilt_one_row_per_scan():
         assert store.get_crop(sid)["saved_bytes"] is None, store.get_crop(sid)
 
 
+# 一版更早的 crop 表：有 group_name，**没有** saved_bytes（那个数是后来才记的）。
+OLD_CROP_NO_SAVED = """
+CREATE TABLE crop (
+    scan_id     INTEGER PRIMARY KEY REFERENCES scan(id) ON DELETE CASCADE,
+    group_name  TEXT    NOT NULL,
+    x0          INTEGER NOT NULL,
+    y0          INTEGER NOT NULL,
+    w           INTEGER NOT NULL,
+    h           INTEGER NOT NULL,
+    frames      INTEGER NOT NULL,
+    state       TEXT    NOT NULL,
+    created_at  REAL    NOT NULL
+);
+"""
+
+
+def test_a_crop_table_that_cannot_be_rebuilt_is_refused_without_damage():
+    """老 crop 表缺一列（saved_bytes）：明确拒绝，库**原样不动**，再跑一次还是同一句话。
+
+    实测过的样子：executescript 会先把已执行的语句提交，于是报错之后库里同时留着 crop 与
+    crop_new；再跑一次撞「table crop_new already exists」，这个库从此打不开。
+    """
+    with _TempStore() as t:
+        with closing(sqlite3.connect(t.db)) as con:
+            con.executescript(OLD_SCHEMA + OLD_CROP_NO_SAVED)
+            con.execute("INSERT INTO scan VALUES (7, '老扫描', 0, 1, 2, 100, 'done', '', 1.0, 2.0)")
+            con.execute("INSERT INTO crop VALUES (7, '同名那一组', 200, 300, 500, 700,"
+                        " 11, 'done', 1.0)")
+            con.commit()
+
+        said = []
+        for _ in range(2):                      # 再跑一次：要给出**同一句**可解释的错
+            try:
+                store.init()
+            except ValueError as exc:
+                said.append(str(exc))
+            else:
+                raise AssertionError("老表缺列，重建本该明确拒绝")
+        assert "saved_bytes" in said[0] and said[0] == said[1], said
+
+        # 库原样：crop 还是老样子、老行一个不少、没有半截的 crop_new
+        tables = {r[0] for r in _query(t.db, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "crop_new" not in tables, f"失败之后不许留半截的表：{sorted(tables)}"
+        cols = {r[1] for r in _query(t.db, "PRAGMA table_info(crop)")}
+        assert "group_name" in cols and "saved_bytes" not in cols, sorted(cols)
+        assert _query(t.db, "SELECT scan_id, x0, y0, w, h FROM crop") == [(7, 200, 300, 500, 700)]
+
+        # 把缺的那一列补上（人照着那句话办）：这一次要成功，老行原样搬过去
+        with closing(sqlite3.connect(t.db)) as con:
+            con.execute("ALTER TABLE crop ADD COLUMN saved_bytes INTEGER NOT NULL DEFAULT 0")
+            con.commit()
+        store.init()
+        got = store.get_crop(7)
+        assert got is not None and got["saved_bytes"] == 0, got
+        assert got["x0"] == 200 and got["h"] == 700, got
+
+
+def test_orphan_crop_rows_are_refused_by_name_not_by_a_half_built_table():
+    """老 crop 表里有孤儿行（指着的扫描已经不在了）：说清是哪几条，库不动。
+
+    外键开着，那几行搬不过去。悄悄丢掉就是丢数据；留半截的表就是把这个库弄坏。
+    """
+    with _TempStore() as t:
+        with closing(sqlite3.connect(t.db)) as con:
+            con.executescript(OLD_SCHEMA + OLD_CROP_SCHEMA)
+            con.execute("INSERT INTO scan VALUES (7, '还在的', 0, 1, 2, 100, 'done', '', 1.0, 2.0)")
+            con.execute("INSERT INTO crop VALUES (7, '还在的', 200, 300, 500, 700,"
+                        " 11, 6525350, 'done', 1.0)")
+            con.commit()
+            con.execute("PRAGMA foreign_keys = OFF")     # 造一条当年能写进去的孤儿行
+            con.execute("INSERT INTO crop VALUES (99, '没了的', 1, 2, 3, 4, 5, 6, 'done', 1.0)")
+            con.commit()
+
+        for _ in range(2):
+            try:
+                store.init()
+            except ValueError as exc:
+                assert "99" in str(exc), exc
+            else:
+                raise AssertionError("有孤儿行，重建本该明确拒绝")
+
+        tables = {r[0] for r in _query(t.db, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "crop_new" not in tables, f"失败之后不许留半截的表：{sorted(tables)}"
+        assert len(_query(t.db, "SELECT * FROM crop")) == 2, "老行一个都不许丢"
+
+        # 按那句话把孤儿行删掉：这一次要成功，剩下的那行原样搬过去
+        with closing(sqlite3.connect(t.db)) as con:
+            con.execute("DELETE FROM crop WHERE scan_id = 99")
+            con.commit()
+        store.init()
+        assert store.get_crop(7)["saved_bytes"] == 6525350, store.get_crop(7)
+
+
+def test_a_leftover_crop_new_from_an_old_failure_is_dropped_and_rebuilt():
+    """上一次半途而废留下的 crop_new：DROP IF EXISTS 掉重来（里面那半份不算数）。"""
+    with _TempStore() as t:
+        with closing(sqlite3.connect(t.db)) as con:
+            con.executescript(OLD_SCHEMA + OLD_CROP_SCHEMA)
+            con.execute("INSERT INTO scan VALUES (7, '同名那一组', 0, 1, 2, 100, 'done', '', 1.0, 2.0)")
+            con.execute("INSERT INTO crop VALUES (7, '同名那一组', 200, 300, 500, 700,"
+                        " 11, 6525350, 'done', 1.0)")
+            # 半截产物：形状对、里面只搬了一半
+            con.execute("CREATE TABLE crop_new (scan_id INTEGER PRIMARY KEY, x0 INTEGER, y0 INTEGER,"
+                        " w INTEGER, h INTEGER, frames INTEGER, saved_bytes INTEGER, state TEXT,"
+                        " created_at REAL)")
+            con.commit()
+        store.init()
+        assert store.get_crop(7)["w"] == 500 and store.get_crop(7)["saved_bytes"] == 6525350
+
+
+def test_a_rebuild_that_fails_midway_rolls_back_to_the_old_table():
+    """重建本身半路失败（这里让搬列那一步撞一个不存在的列）：库里还是老 crop 表，不留 crop_new。
+
+    走的是显式事务那一档（逐条 execute、失败 ROLLBACK）—— executescript 会先把已执行的语句
+    提交掉，于是失败之后库里同时留着 crop 与 crop_new，下一次启动就撞「表已存在」。
+    """
+    with _TempStore() as t:
+        with closing(sqlite3.connect(t.db)) as con:
+            con.executescript(OLD_SCHEMA + OLD_CROP_SCHEMA)
+            con.execute("INSERT INTO scan VALUES (7, '同名那一组', 0, 1, 2, 100, 'done', '', 1.0, 2.0)")
+            con.execute("INSERT INTO crop VALUES (7, '同名那一组', 200, 300, 500, 700,"
+                        " 11, 6525350, 'done', 1.0)")
+            con.commit()
+
+        class _Broken:
+            """搬列那一步失败：前三条（DROP/CREATE/INSERT）都执行过，第四条炸掉。
+
+            要的就是"已经执行了几条"这个现场 —— 那正是 executescript 会留下的半截。
+            """
+
+            def __init__(self, conn):
+                self._conn = conn
+                self.in_transaction = conn.in_transaction
+
+            def execute(self, sql, *args):
+                if sql.lstrip().startswith("DROP TABLE crop"):
+                    raise sqlite3.OperationalError("模拟：删老表这一步失败")
+                return self._conn.execute(sql, *args)
+
+        with closing(sqlite3.connect(t.db)) as con:
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA foreign_keys = ON")
+            try:
+                store._rebuild_crop(_Broken(con))
+            except ValueError as exc:
+                assert "库里还是原样" in str(exc), exc
+            else:
+                raise AssertionError("半路失败却没抛")
+
+        tables = {r[0] for r in _query(t.db, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "crop_new" not in tables, f"失败之后不许留半截的表：{sorted(tables)}"
+        assert _query(t.db, "SELECT scan_id, group_name, x0 FROM crop") == [(7, "同名那一组", 200)]
+        # 回到原样之后，正常那一遍仍然走得通
+        store.init()
+        assert store.get_crop(7)["saved_bytes"] == 6525350
+
+
 def main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

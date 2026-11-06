@@ -1085,10 +1085,12 @@ def _scan_id_of(filename: str) -> Optional[int]:
 
 
 def _sweep_imports() -> None:
-    """收尾上次进程被杀在半路的导入。
+    """收尾上次进程被杀在半路的导入：占着号的 scan 行、它已经落盘的图、暂存目录。
 
     与裁剪不同：那边暂存的是**挪出来的原图**（得按记录挪回去），这边暂存的全是刚抄进来、
     还没就位的副本 —— 源包在包那边好好的，清掉什么都不损失，所以无脑清。
+    **必须在 store.init() 之后**（server 模块导入时就跑了 init）：init 不再把
+    status='importing' 改写成 aborted，sweep 才认得出来那是导入占的号，而不是一次扫描。
     """
     from . import importer
 

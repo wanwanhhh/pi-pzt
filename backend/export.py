@@ -34,22 +34,44 @@ from .config import DATA_DIR, EXPORT_DIR, raw_readback_factor
 log = logging.getLogger(__name__)
 
 
-def _safe_name(name: str, scan_id: int) -> str:
-    """目标名里那一段人看得懂的名字。
+def _file_part(text: Optional[str], fallback: str) -> str:
+    """目标名里的一段：只留**能进文件名**的字符（Windows 不许 \\ / : * ? " < > |），
+    空的一段用 fallback，首尾的点与空格也去掉 —— Windows 上这样的名字存不下（资源管理器
+    会把它悄悄改掉，改名之后就对不上了）。
 
-    只留**能进文件名**的字符（Windows 不许 \\ / : * ? " < > |），空名字（有 19 条老扫描没名字）
-    就用 scan<号> —— 目标名里另有扫描号，撞不了。末尾的点与空格也去掉：Windows 上这样的
-    名字存不下（资源管理器会把它悄悄改掉，改名之后就对不上了）。
+    目标名三段里有两段是**外面来的**：扫描名是人填的，批次标记是面板带回来的。两段都走这一条。
     """
-    out = "".join(c for c in (name or "") if c.isprintable() and c not in '\\/:*?"<>|')
-    out = out.strip().strip(".")
-    return (out or f"scan{scan_id}")[:40]
+    out = "".join(c for c in (text or "") if c.isprintable() and c not in '\\/:*?"<>|')
+    out = out.strip(" .")
+    return (out or fallback)[:40]
 
 
-def _dest(scan: dict, stamp: str, zipped: bool) -> Path:
-    """这次导出落在哪儿：data/export/<名字>_<扫描号>_<批次>[.zip]。"""
-    base = f"{_safe_name(scan['name'], scan['id'])}_{scan['id']}_{stamp}"
-    return EXPORT_DIR / (base + ".zip" if zipped else base)
+def _safe_name(name: str, scan_id: int) -> str:
+    """目标名里那一段人看得懂的名字；空名字（有 19 条老扫描没名字）用 scan<号> ——
+    目标名里另有扫描号，撞不了。"""
+    return _file_part(name, f"scan{scan_id}")
+
+
+def _stamp(stamp: Optional[str]) -> str:
+    """批次标记：面板带回来的那一串（不带就现取一个，见 package.stamp）。
+
+    它也是外面来的、也占目标名里一段，所以过同一条规则；洗空了就现取一个 ——
+    这个数只是**名字**，不是身份，重取一个不会认错东西。
+    """
+    return _file_part(stamp, "") or package.stamp()
+
+
+def _dest(scan: dict, stamp: Optional[str], zipped: bool) -> Path:
+    """这次导出落在哪儿：data/export/<名字>_<扫描号>_<批次>[.zip]。
+
+    最后一道闸在**这一处**（别处不许再判一遍）：落点 resolve 之后必须在 EXPORT_DIR 之内。
+    名字里有外面来的段，洗过一遍不等于可以放心 —— 洗的规则与"不许写出去"是两件事。
+    """
+    base = f"{_safe_name(scan['name'], scan['id'])}_{scan['id']}_{_stamp(stamp)}"
+    dest = EXPORT_DIR / (base + ".zip" if zipped else base)
+    if not dest.resolve().is_relative_to(EXPORT_DIR.resolve()):
+        raise ValueError(f"导出的目标名跑出 {EXPORT_DIR} 了：{dest.name}")
+    return dest
 
 
 def _free(path: Path) -> Path:
@@ -75,7 +97,7 @@ def _collect(scan_id: int) -> tuple:
     rec = store.get_crop(scan_id)
     if rec and rec["state"] != "done":
         raise ValueError("这条扫描正在裁剪，等它跑完再导（那些文件此刻可能是缺的）")
-    points = store.get_points(scan_id)
+    points = store.get_points(scan_id, limit=None)      # 导出要的是**全部点**（见 store.get_points）
     items, missing, size = [], [], 0
     for p in points:
         if not p["image_path"]:
@@ -132,7 +154,8 @@ def plan(scan_id: int, zipped: bool = False, stamp: Optional[str] = None) -> dic
             f"库里的裁剪记录和文件对不上（库 {db_rect or '没记录'}，"
             f"文件 {file_rect or '没记录'}，查的是 {sample}）—— 先查清再导："
             "原点偏移错了不会报错，只会让导出去的坐标整体错位")
-    stamp = stamp or package.stamp()
+    # 回给面板的是**洗过之后**那个：POST 再带回来时拼出来的还是同一个路径
+    stamp = _stamp(stamp)
     factor = raw_readback_factor(scan.get("readback_to_um"))
     return {
         "scan_id": scan_id,
@@ -159,7 +182,9 @@ def _rows(points: list, factor: Optional[float], missing: list) -> list:
     """每点一行 —— **没图的点也占一行**（空着并写明为什么）：点了几个点就该有几行。
 
     两种"没图"要分开写：压根没采到图（image_path 是空的）、和库里记着盘上却没有。
-    后者在表里也留着原来的路径 —— 不然只看表的人不知道少的到底是哪一张。
+    后者**图名照写**（包里没有这张，清单的 missing_images 记着它原来那条路径）：
+    导入照这两个名字把它认回原样，往返一次路径不会丢 —— 写成空的话，导回来就成了
+    "这一点没采到图"，再导一次连原来那条路径都没了。
     """
     gone = set(missing)
     rows = []
@@ -183,7 +208,9 @@ def _rows(points: list, factor: Optional[float], missing: list) -> list:
             "taken_at": taken,
             "taken_at_local": (datetime.fromtimestamp(taken).astimezone()
                                .isoformat(sep=" ", timespec="seconds") if taken else ""),
-            "image": "",
+            # 盘上找不到的那些：名字照写，字节数/尺寸留空（包里没有这张，没什么可量的）
+            "image": (Path(p["image_path"]).name if p["image_path"] in gone
+                      else ""),
             "image_bytes": "",
             "width": "", "height": "", "bits": "",
             "note": why,
@@ -300,7 +327,7 @@ def run(scan_id: int, zipped: bool = False, stamp: Optional[str] = None,
         raise ValueError(
             f"库里的裁剪记录和文件对不上（库 {db_rect or '没记录'}，"
             f"文件 {file_rect or '没记录'}，查的是 {sample}）—— 先查清再导")
-    dest = _free(_dest(scan, stamp or package.stamp(), zipped))
+    dest = _free(_dest(scan, stamp, zipped))
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     info = {
         "scan": scan, "items": items, "missing": missing, "bytes": size,

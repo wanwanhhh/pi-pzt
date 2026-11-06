@@ -59,6 +59,8 @@ NOTES = (
     "（没记下是哪台设备采的，或这台设备报的本来就是 µm），不是 0。",
     "on_target 只是读数与命令值的比较，设备不拿它做任何判据（见 docs 里的设备认识账）。",
     "taken_at 是 Unix 秒（当时那台机器的钟），taken_at_local 是同一时刻的本地时间。",
+    "points.rows 是这张表**实际有几行**，scan.count 是这条扫描**计划**了几个点：一行一个点、"
+    "一行都不少，但中止 / 还在跑的扫描本来就采不满 —— 两个数不等是正常的，不是表缺了行。",
 )
 
 
@@ -130,6 +132,8 @@ def manifest(scan: dict, *, rows: int, images: int, total_bytes: int, missing: l
             "created_at": scan["created_at"], "finished_at": scan["finished_at"],
             "readback_to_um": scan["readback_to_um"],
         },
+        # rows = **表里实际有几行**（一行一个点，全都在）；scan.count 是计划了几个点。
+        # 中止的、还在跑的扫描本来就采不满 —— 两个数不等是正常的，见 NOTES 里那一句。
         "points": {"rows": rows, "images": images, "bytes": total_bytes,
                    "missing_images": list(missing)},
         # 库与文件两边的裁剪记录（导出时对不上就不让导，所以到这儿一定是相等的）
@@ -144,6 +148,25 @@ def manifest(scan: dict, *, rows: int, images: int, total_bytes: int, missing: l
     }
 
 
+def _frame(frame) -> Optional[dict]:
+    """清单里的 frame 一栏：{width, height, bits} 三个整数，或者没有。
+
+    它是"整条扫描的帧该多大"的依据（导入落盘后拿每一张的 IHDR 对）；形状不对就在这里拒 ——
+    读的人不该各自去猜这一栏里有什么。
+    """
+    if not frame:
+        return None
+    if not isinstance(frame, dict):
+        raise ValueError(f"清单里的 frame 不是一份对象：{frame!r} —— 这包对不上，不收")
+    out = {}
+    for key in ("width", "height", "bits"):
+        value = frame.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"清单里 frame 的 {key} 不是正整数：{value!r} —— 这包对不上，不收")
+        out[key] = value
+    return out
+
+
 def parse_manifest(data: dict) -> dict:
     """读一份清单：不是这包东西、或格式比本机新，都当场说清 —— 不猜、不"缺了就当没有"。"""
     if not isinstance(data, dict):
@@ -156,7 +179,7 @@ def parse_manifest(data: dict) -> dict:
         raise ValueError(f"这包是格式 {fmt} 导的，本机认到 {FORMAT} —— 先更新程序再导它")
     out = {"format": fmt, "exported_at": data.get("exported_at", ""),
            "exported_from": data.get("exported_from", ""),
-           "frame": data.get("frame") or None,
+           "frame": _frame(data.get("frame")),
            "crop": data.get("crop") or {}}
     for key in ("scan", "points"):
         if not isinstance(data.get(key), dict):

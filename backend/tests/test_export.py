@@ -155,9 +155,31 @@ def test_missing_file_is_reported_not_skipped():
             # 带上 plan 的批次标记：面板上写的就是这个路径，跑完得落在同一处
             rows = _table(Path(ex.run(sid, stamp=plan["stamp"])["path"]))
             assert Path(plan["dest"]).is_dir(), plan["dest"]
-            assert rows[1]["image"] == "" and "盘上找不到" in rows[1]["note"], rows[1]
+            # 图名照写（包里没有这张，清单记着它原来那条路径）：往返一次路径不会丢
+            assert rows[1]["image"] == f"scan{sid:04d}_00001.png", rows[1]
+            assert "盘上找不到" in rows[1]["note"] and rows[1]["image_bytes"] == "", rows[1]
             man = json.loads((Path(plan["dest"]) / pkg.MANIFEST_NAME).read_text("utf-8"))
             assert man["points"]["missing_images"] == plan["missing"], man
+
+
+def test_a_missing_frame_keeps_its_name_so_a_round_trip_keeps_the_path():
+    """库里记着、盘上没有的那张：表里**图名照写**（包里没有这张，清单记着原路径）。
+
+    这样往返一次之后 image_path 与第一次导出一模一样，再导一次 CSV 与清单逐行相同。
+    写成空的话，导回来就成了"这一点没采到图"，原来那条路径永久没了。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        with _workspace(root):
+            sid = _scan(root, images=(0, 1, 2))
+            (root / f"images/scan{sid:04d}_00001.png").unlink()
+            first = Path(ex.run(sid, stamp="20260101-000000")["path"])
+            rows = _table(first)
+            assert rows[1]["image"] == f"scan{sid:04d}_00001.png", rows[1]
+            assert rows[1]["image_bytes"] == "" and "盘上找不到" in rows[1]["note"], rows[1]
+            man = json.loads((first / pkg.MANIFEST_NAME).read_text("utf-8"))
+            assert man["points"]["missing_images"] == [f"images/scan{sid:04d}_00001.png"], man
+            assert man["points"]["images"] == 2, man
 
 
 def test_crop_records_must_agree():
@@ -215,6 +237,41 @@ def test_a_failed_copy_leaves_nothing_behind():
             assert bad.is_dir() and (root / f"images/scan{sid:04d}_00000.png").exists()
 
 
+def test_every_point_gets_a_row_even_past_the_display_limit():
+    """20 万点以上的扫描导出：CSV 行数 == 点数，清单里的 rows 也 == 点数。
+
+    以前 export._collect 用的是 store.get_points 的默认 limit=200_000：200001 点的扫描
+    导出来只有 200000 行，而清单的 scan.count 还写着 200001 —— 两个数自相矛盾却不报错。
+    这里只造一真图（导出要求至少有一张可导），其余点只有元数据。
+    """
+    n = 200_001
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        with _workspace(root):
+            row = {"id": 1, "name": "超长", "start_um": 0.0, "stop_um": 1.0, "count": n,
+                   "settle_ms": 100, "status": "done", "message": "", "created_at": 0.0,
+                   "finished_at": 1.0, "readback_to_um": 1.0}
+            store.reserve_scan(row)          # 号先占住（导入那条路就是这么走的）
+            sid = store.import_scan(
+                row,
+                [{"scan_id": 1, "idx": i, "target_um": float(i), "actual_um": float(i),
+                  "settled_ms": 1.0, "on_target": 1, "settle_source": SETTLE_DEVICE,
+                  "image_path": (f"images/scan0001_{i:05d}.png" if i == 0 else None),
+                  "exposure_us": None, "taken_at": 0.0} for i in range(n)],
+                None)
+            (root / "images").mkdir(parents=True, exist_ok=True)
+            (root / "images" / f"scan{sid:04d}_00000.png").write_bytes(_png())
+            out = ex.run(sid, stamp="20260101-000000")
+            dest = Path(out["path"])
+            assert out["points"] == n, out["points"]
+            with open(dest / pkg.CSV_NAME, encoding="utf-8-sig", newline="") as f:
+                rows = sum(1 for _ in csv.DictReader(f))
+            assert rows == n, (rows, n)
+            man = json.loads((dest / pkg.MANIFEST_NAME).read_text("utf-8"))
+            assert man["points"]["rows"] == n and man["scan"]["count"] == n, man["points"]
+            assert man["points"]["rows"] == man["scan"]["count"], "全采满的扫描两个数必须相等"
+
+
 def test_recent_lists_finished_exports_and_marks_half_ones():
     """面板上"上次导哪儿了"：成品和没导完的分得开（没导完 = 没有 manifest.json）。"""
     with tempfile.TemporaryDirectory() as d:
@@ -229,6 +286,57 @@ def test_recent_lists_finished_exports_and_marks_half_ones():
             assert got["半截目录"]["done"] is False, got
             assert got[dest.name]["done"] is True, got
             assert got[dest.name]["images"] == 1 and got[dest.name]["bytes"] > 0, got
+
+
+def test_a_hostile_stamp_cannot_write_outside_the_export_dir():
+    """批次标记也是外面来的：洗过之后拼出来的落点**必须在 data/export 之内**。
+
+    实测过的两条：stamp='x/../../../逃出去' 会写出 data/ 外面（文件真建出来了）；
+    stamp='../../images/scan0001_00000.png' 会让 run 抛 FileNotFoundError。
+    扫描名走的是同一条规则，这里一并验。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        with _workspace(root):
+            sid = _scan(root, images=(0,), name="../../逃出去")
+            export = (root / "export").resolve()
+            for stamp in ("x/../../../逃出去", "../../images/scan0001_00000.png", "..",
+                          "  ..  ", "...", "/etc/passwd", "C:\\Windows\\..\\x"):
+                info = ex.plan(sid, stamp=stamp)          # 预检给出的路径就得在 export 里
+                assert Path(info["dest"]).resolve().is_relative_to(export), (stamp, info)
+                out = ex.run(sid, stamp=info["stamp"])    # 面板带回来的那个：落到同一处
+                dest = Path(out["path"])
+                assert dest.resolve().is_relative_to(export), (stamp, dest)
+                assert dest.is_dir() and (dest / pkg.MANIFEST_NAME).exists(), dest
+            # 盘上只多了 export/：data/ 根下没有别的东西（SQLite 那三个文件是库自己的）
+            assert sorted(p.name for p in root.iterdir()
+                          if not p.name.startswith("scans.db")) == ["export", "images"], \
+                sorted(p.name for p in root.iterdir())
+            assert sorted(p.name for p in (root / "images").iterdir()) == [
+                f"scan{sid:04d}_00000.png"], sorted(p.name for p in (root / "images").iterdir())
+
+
+def test_the_destination_guard_is_the_last_word():
+    """洗名字与"不许写出去"是两件事：最后那道闸就在 _dest 一处（这里把它单独逼出来）。
+
+    洗的规则将来若被放宽（多留一个字符、多放一段名字），这道闸仍然拦得住。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        with _workspace(root):
+            sid = _scan(root, images=(0,))
+            scan = store.get_scan(sid)
+            saved = ex._file_part
+            ex._file_part = lambda text, fallback: "../逃出去"      # noqa: ARG005
+            try:
+                try:
+                    ex._dest(scan, "20260101-000000", False)
+                except ValueError as exc:
+                    assert "跑出" in str(exc), exc
+                else:
+                    raise AssertionError("落点跑出 export 了却没拒")
+            finally:
+                ex._file_part = saved
 
 
 def test_name_is_safe_for_windows_and_never_overwrites():

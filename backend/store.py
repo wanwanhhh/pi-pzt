@@ -102,6 +102,17 @@ MIGRATIONS = (
 # 终止态：进程启动时把这两个状态之外的残留扫描判为 aborted
 FINAL_STATUS = ("done", "aborted", "failed")
 
+# 导入占号时写的那一行的状态：号已经占了，图还没就位、点还没写。
+# 它**不是一次扫描**（一个点都没采过），所以不进 FINAL_STATUS，也不许被启动时的
+# aborted 回写改写成"一条中断的扫描"混进历史表 —— 那是给导入没完成、下次启动由
+# importer.sweep() 连图带行清掉的那一档（见 init 与 importer.sweep）。
+IMPORTING = "importing"
+
+
+# 重建时要从老 crop 表搬过去的列。列名只写这一处（下面的 INSERT ... SELECT 用同一串）——
+# 老表缺了其中一列就没法搬（那不是本程序这一版之前的形状），当场说清，不动库。
+_CROP_COLUMNS = ("scan_id", "x0", "y0", "w", "h", "frames", "saved_bytes", "state", "created_at")
+
 
 def _rebuild_crop(conn: sqlite3.Connection) -> None:
     """把老的 crop 表改成"一条扫描一行"：去掉 group_name、saved_bytes 允许空。
@@ -110,27 +121,57 @@ def _rebuild_crop(conn: sqlite3.Connection) -> None:
     导入进来的记录也没有"省了多少字节"这个实测值，留空比填 0 诚实。
     SQLite 既删不掉列、也改不了 NOT NULL，只能重建 —— 老行的数一个不落地搬过去，
     幂等（列没了就是已经重建过）。
+
+    **整段是一个事务**（逐条 execute，不用 executescript）：那个函数会先把已经执行的语句
+    提交掉，于是建了一半的表会留在库里，下一次启动撞上"table crop_new already exists"，
+    这个库从此打不开。失败要么回到原样、要么留一句能照着办的话 —— 不许留半截。
     """
     have = {r["name"] for r in conn.execute("PRAGMA table_info(crop)")}
     if not have or "group_name" not in have:
         return
-    conn.executescript("""
-        CREATE TABLE crop_new (
-            scan_id     INTEGER PRIMARY KEY REFERENCES scan(id) ON DELETE CASCADE,
-            x0          INTEGER NOT NULL,
-            y0          INTEGER NOT NULL,
-            w           INTEGER NOT NULL,
-            h           INTEGER NOT NULL,
-            frames      INTEGER NOT NULL,
-            saved_bytes INTEGER,
-            state       TEXT    NOT NULL,
-            created_at  REAL    NOT NULL
-        );
-        INSERT INTO crop_new (scan_id, x0, y0, w, h, frames, saved_bytes, state, created_at)
-            SELECT scan_id, x0, y0, w, h, frames, saved_bytes, state, created_at FROM crop;
-        DROP TABLE crop;
-        ALTER TABLE crop_new RENAME TO crop;
-    """)
+    lack = [c for c in _CROP_COLUMNS if c not in have]
+    if lack:
+        raise ValueError(
+            f"crop 表还是老的（有 group_name），却缺 {'、'.join(lack)} 这几列 —— 重建没法把"
+            "老记录搬过去。库没动：先弄清楚这个库是哪来的，或者把它备份掉再开程序")
+    # 孤儿行（指着的扫描已经不在了）搬不过去（外键开着）：不悄悄丢，当场说清是哪几条
+    orphans = [r["scan_id"] for r in conn.execute(
+        "SELECT scan_id FROM crop WHERE scan_id NOT IN (SELECT id FROM scan)")]
+    if orphans:
+        raise ValueError(
+            f"老 crop 表里有 {len(orphans)} 行指着的扫描已经不在了"
+            f"（scan_id {orphans[:5]}）—— 重建搬不过去。库没动：先把这些行删掉再来"
+            f"（DELETE FROM crop WHERE scan_id IN ({', '.join(str(int(i)) for i in orphans[:5])})）")
+    own = not conn.in_transaction
+    if own:
+        # 自己开一个：_db() 的隐式事务只认 INSERT/UPDATE/DELETE，DDL 会跑在自动提交里
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 上一次半途而废留下的那张：DROP 掉重来（它里面的数没搬完，crop 才是准的）
+        conn.execute("DROP TABLE IF EXISTS crop_new")
+        conn.execute("""
+            CREATE TABLE crop_new (
+                scan_id     INTEGER PRIMARY KEY REFERENCES scan(id) ON DELETE CASCADE,
+                x0          INTEGER NOT NULL,
+                y0          INTEGER NOT NULL,
+                w           INTEGER NOT NULL,
+                h           INTEGER NOT NULL,
+                frames      INTEGER NOT NULL,
+                saved_bytes INTEGER,
+                state       TEXT    NOT NULL,
+                created_at  REAL    NOT NULL
+            )
+        """)
+        cols = ", ".join(_CROP_COLUMNS)
+        conn.execute(f"INSERT INTO crop_new ({cols}) SELECT {cols} FROM crop")
+        conn.execute("DROP TABLE crop")
+        conn.execute("ALTER TABLE crop_new RENAME TO crop")
+    except sqlite3.Error as exc:
+        if own:
+            conn.execute("ROLLBACK")
+        raise ValueError(f"重建 crop 表失败（库里还是原样，修好再来）：{exc}") from exc
+    if own:
+        conn.execute("COMMIT")
     log.info("crop 表已重建：去掉 group_name、saved_bytes 允许空（老记录原样搬过去）")
 
 
@@ -162,11 +203,13 @@ def init() -> None:
                 f"UPDATE {table} SET {column} = ? WHERE {column} IS NULL", (backfill,)
             )
         _rebuild_crop(conn)
-        # 上次进程被杀时留下的 running/paused 任务不可能再继续了
+        # 上次进程被杀时留下的 running/paused 任务不可能再继续了。
+        # importing **不算**（见 IMPORTING）：那一行是导入占的号，一个点都没采过，
+        # 改成 aborted 就会在历史表里冒充一条"中断的扫描" —— 它归 importer.sweep() 删。
         conn.execute(
             "UPDATE scan SET status = 'aborted', message = '服务重启，任务中断',"
-            " finished_at = ? WHERE status NOT IN (?, ?, ?)",
-            (time.time(), *FINAL_STATUS),
+            " finished_at = ? WHERE status NOT IN (?, ?, ?, ?)",
+            (time.time(), *FINAL_STATUS, IMPORTING),
         )
 
 
@@ -237,27 +280,70 @@ def add_point(
         )
 
 
+def reserve_scan(scan: dict[str, Any]) -> int:
+    """**先把号占住**：写一行 status='importing'、0 个点的扫描，返回它。
+
+    导入要抄几秒到几分钟的图，号是那一刻现取的（AUTOINCREMENT）—— 预检时号还空着，
+    抄图期间 store.create_scan 正好把这个号发出去，导入随后 os.replace 就盖掉了
+    正在采的那张图，最后撞主键。所以**占号先于落图**：先占，再抄。
+
+    占不到（这个号已经在了）就当场拒 —— 导入不覆盖任何东西。
+    这一行由 import_scan 原地补成真扫描，或者由 drop_importing 删掉。
+    """
+    with _db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO scan (id, name, start_um, stop_um, count, settle_ms, status,"
+                " message, created_at, finished_at, readback_to_um)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)",
+                (scan["id"], scan["name"], scan["start_um"], scan["stop_um"], scan["count"],
+                 scan["settle_ms"], IMPORTING, scan["created_at"], scan["finished_at"],
+                 scan["readback_to_um"]),
+            )
+        except sqlite3.IntegrityError as exc:
+            if "UNIQUE" not in str(exc):
+                raise                     # 不是撞号：那是别的问题，别拿"号被占了"盖住它
+            raise ValueError(f"本机已经有扫描 #{scan['id']} 了 —— 导入不覆盖任何东西") from exc
+    return int(scan["id"])
+
+
+def drop_importing(scan_id: int) -> None:
+    """撤掉导入占的那一行（点由外键级联删；这条扫描一个点都没采过）。"""
+    with _db() as conn:
+        conn.execute("DELETE FROM scan WHERE id = ? AND status = ?", (scan_id, IMPORTING))
+
+
+def importing_scans() -> list[int]:
+    """上次进程被杀在导入半路时留下的那些号（启动时由 importer.sweep 清掉）。"""
+    with _db() as conn:
+        rows = conn.execute("SELECT id FROM scan WHERE status = ?", (IMPORTING,)).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
 def import_scan(scan: dict[str, Any], points: list[dict[str, Any]],
                 crop: Optional[dict[str, Any]]) -> int:
-    """把一份导入包恢复成库里的一条扫描：扫描行 + 全部点（+ 裁剪记录），**一个事务**。
+    """把一份导入包恢复成库里的一条扫描：占着的那一行 + 全部点（+ 裁剪记录），**一个事务**。
 
     与"边采边写"那条路（create_scan → add_point → finish_scan）分工不同：这里写的是
     **一次已经结束的扫描**，值全部来自包里的记录，一个都不重算：
 
     * `id` **沿用包里那个号** —— 图名是 scan<号>_<序号>.png，换号会让文件名与扫描号对不上。
-      本机已经有这个号由调用方拦下（这里直接撞主键，撞了要不进去）。
+      这个号由 reserve_scan 先占住（那一行此刻是 importing），这里把它**原地**补成真扫描：
+      不新插一行，因为"同一个号两行"根本插不进去。
     * `taken_at` 是**采图那一刻**（包里记的），不是"现在"：搬过来的是当时那一次扫描。
     * 裁剪记录里 `saved_bytes` 写 NULL：那一格答的是"**这台机器上**裁掉了多少字节"，
       这条扫描在这台机器上没裁过 —— 没有这个数就是没有，不拿 0 顶。
     """
     with _db() as conn:
-        conn.execute(
-            "INSERT INTO scan (id, name, start_um, stop_um, count, settle_ms, status, message,"
-            " created_at, finished_at, readback_to_um)"
-            " VALUES (:id, :name, :start_um, :stop_um, :count, :settle_ms, :status, :message,"
-            " :created_at, :finished_at, :readback_to_um)",
-            scan,
+        cur = conn.execute(
+            "UPDATE scan SET name = :name, start_um = :start_um, stop_um = :stop_um,"
+            " count = :count, settle_ms = :settle_ms, status = :status, message = :message,"
+            " created_at = :created_at, finished_at = :finished_at,"
+            " readback_to_um = :readback_to_um WHERE id = :id AND status = :importing",
+            {**scan, "importing": IMPORTING},
         )
+        if cur.rowcount != 1:
+            raise ValueError(f"扫描 #{scan['id']} 没有占着（应该先 reserve_scan）")
         conn.executemany(
             "INSERT INTO point (scan_id, idx, target_um, actual_um, settled_ms, on_target,"
             " settle_source, image_path, exposure_us, taken_at)"
@@ -312,11 +398,17 @@ def delete_grabs(filenames: list[str]) -> None:
 
 
 def list_scans(limit: int = 50) -> list[dict[str, Any]]:
+    """历史扫描表：最近的那几条（新在前）。
+
+    **导入占着号的那些不列**（status='importing'，见 IMPORTING）：那一行不是一次扫描
+    （一个点都没采过），列出来就会在历史表里冒充一条 —— 而它几秒后要么变成真扫描、
+    要么被删掉。
+    """
     with _db() as conn:
         rows = conn.execute(
             "SELECT s.*, (SELECT COUNT(*) FROM point p WHERE p.scan_id = s.id) AS done"
-            " FROM scan s ORDER BY s.id DESC LIMIT ?",
-            (limit,),
+            " FROM scan s WHERE s.status != ? ORDER BY s.id DESC LIMIT ?",
+            (IMPORTING, limit),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -327,11 +419,20 @@ def get_scan(scan_id: int) -> Optional[dict[str, Any]]:
     return dict(row) if row else None
 
 
-def get_points(scan_id: int, limit: int = 200_000) -> list[dict[str, Any]]:
+def get_points(scan_id: int, limit: Optional[int] = 200_000) -> list[dict[str, Any]]:
+    """这条扫描的点，按序号升序。
+
+    limit 是**防呆**（界面上的表用不着更多），不是"一条扫描就这么长"：要全部点的
+    （导出：一行一个点，少一行就是少一个点）传 None —— 拿默认值去导会静默截断，
+    表比扫描的点数短、清单里两个数还自相矛盾。
+    """
+    sql = "SELECT * FROM point WHERE scan_id = ? ORDER BY idx"
+    args: tuple = (scan_id,)
+    if limit is not None:
+        sql += " LIMIT ?"
+        args += (limit,)
     with _db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM point WHERE scan_id = ? ORDER BY idx LIMIT ?", (scan_id, limit)
-        ).fetchall()
+        rows = conn.execute(sql, args).fetchall()
     return [dict(r) for r in rows]
 
 
