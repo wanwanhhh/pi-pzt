@@ -83,10 +83,58 @@ def test_moderate_background_is_drawn_but_marked_as_a_warning():
 
 
 def test_spot_near_the_frame_edge_is_refused():
-    img = _gauss(cx=20.0, cy=20.0, wx=10.0, amp=100.0, bg=0.0)
+    """光斑真贴边（80% 圆出画面）仍然要拒 —— 修假阳性不许放过这一类。
+
+    圆心 (5,5)、r80≈9：圆有一大半在画面外，那个 r80 是"被切掉一块之后"的数，不是光斑的直径。
+    """
+    img = _gauss(cx=5.0, cy=5.0, wx=10.0, amp=100.0, bg=0.0)
     r = _measure(img)
     assert r["ok"] is False, r
     assert "贴边" in r["reason"], r
+
+
+def test_window_cut_by_the_frame_is_not_a_spot_at_the_edge():
+    """**窗口被画面裁掉 ≠ 光斑贴边**：小光斑靠近边时窗口一定被裁，那不该拒。
+
+    240×240 上 r80≈9 的高斯放在 (33,33)：窗口半宽 32 px 顶到画面左上角（x0=y0=0），
+    可 80% 圆离边还有 24 px。从前这里拿"窗口贴到画面边"当光斑贴边拒掉了 —— 假阳性；
+    同一个光斑放到 440×440 的 (133,133) 却是好的，r80 一模一样。
+    """
+    r = _measure(_gauss(cx=33.0, cy=33.0, wx=10.0, amp=100.0, bg=0.0))
+    assert r["ok"] is True, r
+    assert r["window"][0] == 0 and r["window"][1] == 0, r["window"]   # 窗口真的被裁了
+    far = _measure(_gauss(h=440, w=440, cx=133.0, cy=133.0, wx=10.0, amp=100.0, bg=0.0))
+    assert far["ok"] is True, far
+    assert far["window"][0] > 0 and far["window"][1] > 0, far["window"]
+    # 同一个光斑、同一条口径：裁没裁窗口，r80 是同一个数
+    assert abs(r["r80"] - far["r80"]) < 1e-9, (r["r80"], far["r80"])
+
+
+def test_a_spot_well_inside_the_frame_is_measured_the_same_wherever_it_sits():
+    """(40,40) 与画面正中量出来必须是同一个 r80 —— 位置不该影响这个数。"""
+    near = _measure(_gauss(cx=40.0, cy=40.0, wx=10.0, amp=100.0, bg=0.0))
+    mid = _measure(_gauss(cx=120.0, cy=120.0, wx=10.0, amp=100.0, bg=0.0))
+    assert near["ok"] is True and mid["ok"] is True, (near, mid)
+    assert abs(near["r80"] - mid["r80"]) < 1e-9, (near["r80"], mid["r80"])
+
+
+def test_the_80_percent_circle_never_reaches_outside_the_frame():
+    """留下的那条判据（80% 圆出画面）要真能拦住：光斑一路往角上挪，过了界就拒。
+
+    这是修假阳性之后的护栏 —— 窗口被裁不再拒之后，"圆出画面"是唯一还拦着贴边的判据。
+    两种数都对着真值看：光斑往里 → 必须 ok；光斑探到边 → 必须拒，且给出来的圆确实整整齐齐
+    在画面里（圆心到边的距离 ≥ r80）。
+    """
+    for c, ok_want in ((40.0, True), (20.0, True), (12.0, True), (5.0, False), (3.0, False)):
+        img = _gauss(cx=c, cy=c, wx=10.0, amp=100.0, bg=0.0)
+        r = energy_circle(img, global_centroid(img))
+        assert r["ok"] is ok_want, (c, r)
+        if r["ok"]:
+            cx, cy = r["cx"], r["cy"]
+            assert cx - r["r80"] >= 0 and cy - r["r80"] >= 0, (c, r)
+            assert cx + r["r80"] <= r["width"] - 1 and cy + r["r80"] <= r["height"] - 1, (c, r)
+        else:
+            assert "贴边" in r["reason"], (c, r)
 
 
 def test_zero_frame_has_no_energy_circle():

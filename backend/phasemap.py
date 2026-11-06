@@ -22,7 +22,8 @@
   `filteredSignal` / `filtKeepRange` **同式**。这条口径的家在那边（那是它出生与使用的地方），
   这里只是照搬一次 —— **改那边的式子，这里必须跟着改**：跨语言的同一份知识，
   两边各有一个测试钉住同一组期望数（`backend/tests/test_phase_map.py` 里的自证那一条）。
-- 载波 = **留下那一段的正中间那一根**（k_c = (k_lo+k_hi)/2）。它只是**全图共用的一个参考频率**：
+- 载波 = **留下那一段的正中间那一根**（k_c = (k_lo+k_hi)/2，两个端点都是**实际留下**的那几根，
+  解不出的已经丢掉了 —— 见 `_carrier_of`）。它只是**全图共用的一个参考频率**：
   像素之间的差与它同源，所以**差值与它无关**（同一串 W_k）；取在带内是为了
   W_k = Σ_t e^(i2π(k−k_c)·df·Δt) 还在带内成形 —— 取到带外时各根几乎互相抵消，出来的是噪声。
   **与滤波曲线里那种「每像素各自的带内功率重心」不是一回事**：那个是减掉线性相位用的（显示口径），
@@ -44,11 +45,16 @@ from .config import TIME_FS_PER_UM, WAVELENGTH_UM_PER_THZ
 
 
 def _grid(t_fs, k_lo: int, k_hi: int, span_fs: float):
-    """公共的一段：时间列 → (th, t0, df, [(k, g_k), ...])。
+    """公共的一段：时间列 → (t, t0, df, th, [(k, g_k), ...])。
 
     g_k 是第 k 根谱线「由样本解出 c_k = A_k − iB_k」的那一行（2×2 那套，与 app.js 同式）；
     th 是第 1 格的相位（弧度，k 倍就是第 k 格）。解不出（2×2 退化）的那根直接跳过 ——
     与前端不把它当系数同一个道理。
+
+    **一根都不剩就当场拒**：两个口径（整条 / 某一时刻）与两条权重函数都从这里拿谱线，
+    所以这条判断只在这里判一次。不拒的话权重是**恒等于 0**的一条（去均值之后还是 0），
+    出来的是一整幅"相位 0、强度 0"的图 —— 看着像算完了，其实一根谱线都没用上。
+    话术与强度对齐（intensity_align._prep）同一句：同一件事，两处不该有两套说法。
     """
     import numpy as np
 
@@ -68,7 +74,19 @@ def _grid(t_fs, k_lo: int, k_hi: int, span_fs: float):
             continue
         det = scc * sss - scs * scs
         rows.append((k, ((sss * c - scs * s) - 1j * (scc * s - scs * c)) / det))
+    if not rows:
+        raise ValueError("这一段波长里没有一根能解出来的谱线")
     return t, t0, df, th, rows
+
+
+def _carrier_of(ks) -> float:
+    """公共载波：**实际留下**的那几根的中点数（ks 已排好序，解不出的不在里面）。
+
+    整条那张的权重 W_k = Σ_t e^(i2π(k−k_c)·df·Δt) 要用它；结果里报的 k_c 也是它 ——
+    两处同一个数。按波段两端的原值取中点会把丢掉的那几根也算进来（201 点、990~1000 那段
+    实际留下 990~999，中点是 994.5，不是 995.0）。
+    """
+    return (ks[0] + ks[-1]) / 2.0
 
 
 def _demean(u, n: int):
@@ -76,20 +94,26 @@ def _demean(u, n: int):
     return u - u.sum() / n
 
 
-def weight_vector(t_fs, k_lo: int, k_hi: int, k_c: float, span_fs: float):
+def weight_vector(t_fs, k_lo: int, k_hi: int, span_fs: float):
     """**整条**一场扫描一条：把「每个点的样本」直接变成复数的权重 u'(t)（已含去均值）。
 
     u'(t) = Σ_k W_k·g_k(t) − (Σ_t u(t))/N
 
     W_k = Σ_t e^(i2π(k−k_c)·df·(t−t0))：与公共载波相关的那一串（全是 W 的模在带内成形）。
+    **k_c 不传进来**：它就是「留下那几根的中点」（`_carrier_of`），在这里由**实际参与**的
+    那几根定 —— 结果里报的 k_c 也是同一个数，两处不会各说一套。
+
+    返回 (u', ks, k_c)：ks 是实际参与的那几根（解不出的已经丢掉），k_c 是它们的中点。
     """
     import numpy as np
 
     t, t0, df, th, rows = _grid(t_fs, k_lo, k_hi, span_fs)
+    ks = [k for k, _ in rows]
+    k_c = _carrier_of(ks)
     u = np.zeros(t.size, dtype=np.complex128)
     for k, g in rows:
         u += np.exp(1j * (k - k_c) * th).sum() * g
-    return _demean(u, t.size), df
+    return _demean(u, t.size), ks, k_c
 
 
 def moment_weight_vector(t_fs, k_lo: int, k_hi: int, span_fs: float, at_fs: float):
@@ -100,6 +124,8 @@ def moment_weight_vector(t_fs, k_lo: int, k_hi: int, span_fs: float, at_fs: floa
     **没有公共载波**：时刻本身就定死了相位基准（θ_k(t_j) 是绝对的那一拍），所以不取 k_c。
     单根谱线时它给出来的相位图与 `weight_vector` 那张**逐像素相同**（ωt_j 全图共用、减基准就抵消）；
     带内多根时相位才随 t_j 走 —— 那时它画的才是"这一刻的相位分布"。
+
+    返回 (u', ks)，ks 的含义与 `weight_vector` 那一份相同（实际参与的那几根）。
     """
     import numpy as np
 
@@ -108,7 +134,7 @@ def moment_weight_vector(t_fs, k_lo: int, k_hi: int, span_fs: float, at_fs: floa
     u = np.zeros(t.size, dtype=np.complex128)
     for k, g in rows:
         u += g * np.exp(1j * 2.0 * math.pi * k * df * tj)
-    return _demean(u, t.size), df
+    return _demean(u, t.size), [k for k, _ in rows]
 
 
 def _nearest_frame(t_fs, at_fs: float) -> int:
@@ -151,22 +177,30 @@ def _check_items(items) -> None:
     frames.usable(items, "相位图")
 
 
-def _result(items, crop, shape, re, im, lmin, lmax, k_lo, k_hi, k_max, df_thz, k_c, **extra):
-    """两个口径共用的一份结果：相位、条纹强度、形状、波段元数据。"""
+def _result(items, crop, shape, re, im, lmin, lmax, ks, k_c, k_max, df_thz, **extra):
+    """两个口径共用的一份结果：相位、条纹强度、形状、波段元数据。
+
+    `ks` 是**实际参与**的那几根（解不出的已经丢掉），`k_c` 是它们的中点（`_carrier_of`）——
+    报的是这张图真正用上的那一段，不是波段框两端的原值：按原值报会把丢掉的根也算进去
+    （界面据此写「共 N 根」就会多报一根，载波也会偏半格）。
+
+    `k_c` 给 None 就是「这一份没有公共载波」（某一时刻那张：相位基准就是那一拍本身）：
+    载波那三格（k_c / f_c_thz / lam_c_um）一起给 None —— 有数就得有含义。
+    """
     import numpy as np
 
     x0, y0 = (crop[0], crop[1]) if crop else (0, 0)
     h, w = shape
     phase = np.arctan2(im, re).astype(np.float32)
     amp = np.hypot(re, im).astype(np.float32)
-    f_c_thz = k_c * df_thz
+    f_c_thz = None if k_c is None else k_c * df_thz
     out = {
         "phase": phase, "amp": amp,
         "w": int(w), "h": int(h),
         "rect": [int(x0), int(y0), int(w), int(h)] if crop else None,
-        "n": len(items), "k_lo": k_lo, "k_hi": k_hi, "k_c": k_c, "k_max": int(k_max),
-        "df_thz": df_thz, "f_c_thz": f_c_thz,
-        "lam_c_um": (WAVELENGTH_UM_PER_THZ / f_c_thz) if f_c_thz > 0 else None,
+        "n": len(items), "k_lo": int(ks[0]), "k_hi": int(ks[-1]), "k_c": k_c,
+        "k_max": int(k_max), "df_thz": df_thz, "f_c_thz": f_c_thz,
+        "lam_c_um": (WAVELENGTH_UM_PER_THZ / f_c_thz) if f_c_thz else None,
         "band": [lmin, lmax],
     }
     out.update(extra)
@@ -182,16 +216,16 @@ def phase_map(items, crop=None, lmin=None, lmax=None, workers: int = 8,
     数组是**盘上那张图**的形状 —— 坐标口径不因裁剪改变（与取数、剖面同一套）。
 
     返回 {phase, amp（float32 二维，h×w）, rect, w, h, n, k_lo, k_hi, k_c, k_max,
-          df_thz, f_c_thz, lam_c_um, band}。
+          df_thz, f_c_thz, lam_c_um, band}。k_lo / k_hi / k_c 都是**实际留下**的那几根
+    （解不出的已经丢掉）。这一段一根都解不出 → ValueError，不交一张全零的图。
     """
     _check_items(items)
     t_fs = [p * TIME_FS_PER_UM for (_, p, _) in items]
     span = max(t_fs) - min(t_fs)
     k_lo, k_hi, k_max, df_thz = band_lines(lmin, lmax, len(items), span)
-    k_c = (k_lo + k_hi) / 2.0
-    u, _ = weight_vector(t_fs, k_lo, k_hi, k_c, span)
+    u, ks, k_c = weight_vector(t_fs, k_lo, k_hi, span)
     shape, re, im = _accumulate(items, crop, u, workers, progress)
-    return _result(items, crop, shape, re, im, lmin, lmax, k_lo, k_hi, k_max, df_thz, k_c)
+    return _result(items, crop, shape, re, im, lmin, lmax, ks, k_c, k_max, df_thz)
 
 
 def phase_map_at(items, at_um: float, crop=None, lmin=None, lmax=None, workers: int = 8,
@@ -203,16 +237,17 @@ def phase_map_at(items, at_um: float, crop=None, lmin=None, lmax=None, workers: 
 
     返回在 `phase_map` 那一份之上多三个：`at_um`（你要的那一刻）、`at_idx`（离它最近的点序号）、
     `at_um_actual`（那一帧真实记下的读出位置 —— 界面要照实说"落在哪一拍上"）。
+    **载波那三格（k_c / f_c_thz / lam_c_um）是 None**：这一刻没有公共载波可比，
+    相位基准就是那一拍本身（界面上那一格写「—（某一时刻不取载波）」）。
     """
     _check_items(items)
     t_fs = [p * TIME_FS_PER_UM for (_, p, _) in items]
     span = max(t_fs) - min(t_fs)
     k_lo, k_hi, k_max, df_thz = band_lines(lmin, lmax, len(items), span)
     j = _nearest_frame(t_fs, float(at_um) * TIME_FS_PER_UM)
-    u, _ = moment_weight_vector(t_fs, k_lo, k_hi, span, float(at_um) * TIME_FS_PER_UM)
+    u, ks = moment_weight_vector(t_fs, k_lo, k_hi, span, float(at_um) * TIME_FS_PER_UM)
     shape, re, im = _accumulate(items, crop, u, workers, progress)
-    # 这一刻**没有公共载波**（相位基准就是那一拍本身）：k_c 只在结果里占位，界面按 at_* 说话
-    k_c = (k_lo + k_hi) / 2.0
-    return _result(items, crop, shape, re, im, lmin, lmax, k_lo, k_hi, k_max, df_thz, k_c,
+    # 这一刻**没有公共载波**（相位基准就是那一拍本身）：k_c 给 None，载波那三格一起空着
+    return _result(items, crop, shape, re, im, lmin, lmax, ks, None, k_max, df_thz,
                    at_um=float(at_um), at_idx=items[j][0], at_j=int(j),
                    at_um_actual=items[j][1])

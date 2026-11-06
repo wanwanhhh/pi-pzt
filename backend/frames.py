@@ -5,8 +5,20 @@
 
 1. 读不出来（被删 / 被占用 / 不是图片）→ 说清是**第几个点**（idx 几）、哪条路径；
 2. 不是二维灰度图 → 说清；
-3. 裁剪记录与文件尺寸对不上 → **"库和文件对不上，先查清"**。这一条最要紧：
-   它不会抛异常，只会让整幅图整体错一块 —— 所以只在这里判一次，别在调用方各写一遍。
+3. 裁剪记录与文件对不上 → **"库和文件对不上，先查清"**。这一条最要紧：
+   它不会抛异常，只会让整幅图整体错一块 —— 整幅图这条路（相位图 / 强度对齐）只在这里判
+   一次，别在调用方各写一遍。取数那条路（png_pixel_series）不经过这里，它自己核
+   尺寸那一半（它只读第一张图定几何）。
+   「对不上」有**两半**，都是同一件事（库里那一份 vs 文件那一份）：
+   - **尺寸**：库写着 w×h，文件自己解出来不是这个大小；
+   - **矩形**：文件自己的 tEXt（`CropRect`）写着 x0,y0,w,h，与库里那一份不一致。
+     只比尺寸是不够的 —— 同一个尺寸、原点挪了两格，尺寸那一半一点都看不出来，
+     整幅图却会整体错位（用户实测：文件写 2,1,6,6、库写 3,1,6,6，energy 差 0.0）。
+   历史上每一次裁剪都写这块 tEXt（crop_frames 从有裁剪那一天起就写 CropRect），
+   所以「库里有 crop 而文件里没有」同样算对不上，不当成老图放过；反过来（文件写着裁过、
+   库里没记）也一样 —— 两份记录说的不是一件事就停下来查，别猜哪份对。
+   **代价**：这一份只读 PNG 块头（read_png_meta 逐块走到 IEND，IDAT 整块 seek 过去），
+   2000 帧全幅实测 0.02 s；按整幅读就是几 GB。
 
 **为什么不把累加也放进来**：各家的累加不一样（相位图 2 张复图、强度对齐 2K+1 张），
 那是它们自己的事；这里只负责"按顺序、一帧一帧地交出去"。
@@ -37,8 +49,12 @@ def where_of(i: int, idx) -> str:
     return f"第 {i + 1} 个点（idx {idx}）"
 
 
-def check_frame(arr, crop, where: str):
+def check_frame(arr, crop, where: str, file_crop=None):
     """三条不变式。arr 是读出来的数组（读不出来时调用方先判 None）。
+
+    `file_crop` 是**文件自己** tEXt 里那一份 `CropRect`（没有就是 None），`crop` 是库里那一份。
+    两份必须说的是同一件事：**矩形逐个数相同**（没有就对没有）。只比尺寸是不够的 ——
+    同一个尺寸、原点挪两格，尺寸那一半一点都看不出来。
 
     返回 arr 本身（方便链式调用）；不合格就抛 ValueError，话说清是哪个点。
     """
@@ -50,6 +66,12 @@ def check_frame(arr, crop, where: str):
         raise ValueError(
             f"{where}的图是 {arr.shape[1]}×{arr.shape[0]}，裁剪记录写着 "
             f"{crop[2]}×{crop[3]} —— 库和文件对不上，先查清"
+        )
+    db_rect = [int(v) for v in crop] if crop else None
+    if db_rect != file_crop:
+        raise ValueError(
+            f"{where}的图上写着裁剪矩形 {file_crop or '没有'}，库里记着 "
+            f"{db_rect or '没有'} —— 库和文件对不上，先查清"
         )
     return arr
 
@@ -72,16 +94,23 @@ def usable(items, what: str) -> None:
 
 
 def _read_one(it, crop, dtype):
-    """读一帧（线程里跑）：读不出来 → None 由 check_frame 说清；成功就交回 float 数组。"""
+    """读一帧（线程里跑）：读不出来 → None 由 check_frame 说清；成功就交回 float 数组。
+
+    裁剪记录那一份**先读**：`read_png_meta` 只扫块头、不解码、不读像素（tEXt 在 IDAT 之前，
+    一帧只有几百字节），所以"解整幅之前就能拒"不花什么钱 —— 对不上的那种文件不必为它把
+    几 MB 像素解一遍。**有没有 crop 都读**：库里没记、文件自己写着裁过，同样是"两份说的
+    不是一件事"。
+    """
     import numpy as np
 
-    from .thorlabs_ccd import _png_gray
+    from .thorlabs_ccd import _png_gray, read_png_meta
 
     i, (idx, _, path) = it
+    file_crop = read_png_meta(path)["crop"]
     arr = _png_gray(path)
     if arr is None:
         raise ValueError(f"{where_of(i, idx)}的图读不出来：{path}")
-    check_frame(arr, crop, where_of(i, idx))
+    check_frame(arr, crop, where_of(i, idx), file_crop=file_crop)
     return i, arr.shape, np.asarray(arr, dtype=dtype)
 
 
@@ -94,7 +123,8 @@ def read_frames(items, crop=None, workers: int = 8, dtype=None,
     这批才让位给下一批。峰值内存 ≈ window × 单帧字节，与扫描多长无关。
 
     **尺寸不齐**在这里判（第一帧定 shape）：这是"整条做不了"的那一类，说清第几个点。
-    裁剪记录对不上的判定在 check_frame（逐帧，因为它比的是文件本身）。
+    裁剪记录对不上的判定在 check_frame（逐帧，因为它比的是文件本身：解出来的尺寸与
+    文件自带的那块 `CropRect`）。
     """
     import numpy as np
 

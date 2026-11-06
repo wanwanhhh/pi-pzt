@@ -280,7 +280,9 @@ def test_crop_only_shifts_the_reading():
         for i, im in enumerate(s["images"]):
             sub = np.ascontiguousarray(im[1:5, 2:7])
             p = cutdir / f"scan0001_{i:05d}.png"
-            _save_png16(p, sub)
+            # 真裁过的图**自带** CropRect（裁剪那天起就是这么写的）：库里那一份必须与它一致，
+            # 不然读帧那一侧按"库和文件对不上"拒（frames.check_frame）。
+            _save_png16(p, sub, extra_text=[(b"CropRect", b"2,1,5,4")])
             cut_items.append((i, float(s["items"][i][1]), p))
         cut = align_maps(cut_items, crop=(2, 1, 5, 4), lmin=lmin, lmax=lmax)
         ufull = align_maps(s["items"], unfiltered=True)

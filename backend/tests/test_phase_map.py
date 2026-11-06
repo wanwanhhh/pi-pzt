@@ -90,6 +90,23 @@ def _band_of(k_sig, df_thz):
     return lmin, lmax
 
 
+def _recut(images, items, out: Path, rect) -> list:
+    """另存一份**真裁过**的帧：`rect` = (x0, y0, w, h) 原始坐标，文件自带 `CropRect`。
+
+    盘上的图因此真的小了一块（两次读的是不同字节），库里那份裁剪记录与文件自己写的那份
+    说的是同一件事 —— 读帧那一侧（frames.check_frame）核的就是这个。
+    """
+    x0, y0, w, h = rect
+    out.mkdir(parents=True, exist_ok=True)
+    got = []
+    for i, (im, (idx, um, _)) in enumerate(zip(images, items)):
+        p = out / f"cut_{i:05d}.png"
+        _save_png16(p, np.ascontiguousarray(np.asarray(im)[y0:y0 + h, x0:x0 + w]),
+                    extra_text=[(b"CropRect", f"{x0},{y0},{w},{h}".encode())])
+        got.append((idx, um, p))
+    return got
+
+
 def _series(images, y, x):
     """一个像素在每一帧上的值（**原始坐标**里的 (x, y)）。"""
     return np.array([float(np.asarray(im)[y, x]) for im in images])
@@ -287,6 +304,144 @@ def test_unsolvable_line_is_dropped_by_the_condition_number():
     assert SOLVABLE_KAPPA == 1e12, "这条线本身是决定（见 bands.py 那一段实测）"
 
 
+def _equally_spaced(n, span_fs=600.0):
+    """等间隔的一串采样（读数一点噪声都没有）—— 这种采样的 Nyquist 那根解不出来。
+
+    跨度固定 600 fs，所以**频率格 df 与点数无关**：n=201 与 n=2001 都落在同一套格上，
+    「第 990~1000 根」在两条扫描里是同一段频率。
+    """
+    t = np.linspace(0.0, span_fs, int(n))
+    return list(t), float(t[-1] - t[0])
+
+
+def test_a_band_with_no_solvable_line_is_refused_not_drawn_as_zeros():
+    """**这一段一根都解不出 → 当场拒**，不交一张"相位 0、强度 0"的图。
+
+    201 点等间隔扫描的 Nyquist（第 100 根）解不出来；波段只框住它时，留下的谱线是空的。
+    从前的行为：k_lo=k_hi=100、phase 全 0、amp 全 0，不报错 —— 看着像算完了，其实一根
+    谱线都没用上。强度对齐那一侧一直会拒（intensity_align._prep），话术是同一句。
+    两个口径都要拒：整条与某一时刻各走一条权重函数，判断在它们共用的 `_grid` 里。
+    """
+    import tempfile
+
+    n, span_fs = 201, 600.0
+    t, span = _equally_spaced(n, span_fs)
+    df_thz = 1e3 / span
+    # 只框住第 100 根（Nyquist）：两端各半格
+    lmin = WAVELENGTH_UM_PER_THZ / ((100 + 0.5) * df_thz)
+    lmax = WAVELENGTH_UM_PER_THZ / ((100 - 0.5) * df_thz)
+    k_lo, k_hi, k_max, _ = band_lines(lmin, lmax, n, span)
+    assert (k_lo, k_hi, k_max) == (100, 100, 100), (k_lo, k_hi, k_max)   # 波段本身是合法的
+    assert not solvable(*_gram(t, 100, span)), "这条用例要的正是「这一段里一根都解不出」"
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        paths = []
+        for i in range(n):
+            p = tmp / f"flat_{i:05d}.png"
+            _save_png16(p, np.full((2, 2), 500, dtype=np.uint16))
+            paths.append(p)
+        items = [(i, t[i] / TIME_FS_PER_UM, paths[i]) for i in range(n)]
+        for call in (lambda: phase_map(items, lmin=lmin, lmax=lmax),
+                     lambda: phase_map_at(items, items[n // 2][1], lmin=lmin, lmax=lmax)):
+            try:
+                call()
+            except ValueError as exc:
+                assert "没有一根能解出来的谱线" in str(exc), exc
+            else:
+                raise AssertionError("一根都解不出却给了一张全零的图")
+
+
+def test_a_nan_readback_is_refused_by_the_same_judgement():
+    """读数里有一个 NaN：同样落到"一根都解不出"那一格 —— 也走同一句话。
+
+    NaN 一进 cos/sin，Gram 矩阵那三个数就是 NaN：`solvable` 判它解不出（条件数不是个数），
+    于是留下的谱线为空。这条防的是"NaN 悄悄把整幅图变成全 0"那条等价触发路径。
+    """
+    import tempfile
+
+    n, span_fs = 64, 600.0
+    t, span = _equally_spaced(n, span_fs)
+    um = [x / TIME_FS_PER_UM for x in t]
+    um[n // 2] = float("nan")
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        paths = []
+        for i in range(n):
+            p = tmp / f"nan_{i:05d}.png"
+            _save_png16(p, np.full((2, 2), 500, dtype=np.uint16))
+            paths.append(p)
+        items = [(i, um[i], paths[i]) for i in range(n)]
+        for call in (lambda: phase_map(items),
+                     lambda: phase_map_at(items, 0.0)):
+            try:
+                call()
+            except ValueError as exc:
+                assert "没有一根能解出来的谱线" in str(exc), exc
+            else:
+                raise AssertionError("读数里有一个 NaN 却给出了一张图")
+
+
+def _gram(t, k, span):
+    """第 k 根在 (scc, sss, scs) 上的三个数（与 `_grid` 里那三行同一式）。"""
+    import numpy as np
+
+    t = np.asarray(t, dtype=np.float64)
+    th = 2.0 * np.pi * (1.0 / span) * (t - t.min())
+    c, s = np.cos(k * th), np.sin(k * th)
+    return float(c @ c), float(s @ s), float(c @ s)
+
+
+def test_the_result_reports_only_the_lines_that_were_kept():
+    """结果里的 k_lo / k_hi / k_c 说的是**实际留下**的那几根，不是波段框两端的原值。
+
+    2001 点等间隔、波段 990~1000：`_grid` 实际给 990~999（Nyquist 那根解不出、丢掉了），
+    所以 k_hi 必须是 999、k_c 是 994.5（990 与 999 的中点），不是 1000 与 995.0。
+    界面（app.js）拿 k_lo~k_hi 写「共 N 根」，按原值报就会多报一根、载波也偏半格。
+    强度对齐那边用的是 `_prep` 交回的那一串，本来就是对的 —— 两边现在同一个口径。
+    """
+    import tempfile
+
+    n, span_fs = 2001, 600.0
+    t, span = _equally_spaced(n, span_fs)
+    df_thz = 1e3 / span
+    lmin = WAVELENGTH_UM_PER_THZ / ((1000 + 0.5) * df_thz)
+    lmax = WAVELENGTH_UM_PER_THZ / ((990 - 0.5) * df_thz)
+    k_lo, k_hi, k_max, _ = band_lines(lmin, lmax, n, span)
+    assert (k_lo, k_hi) == (990, 1000), (k_lo, k_hi)
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        paths = []
+        for i in range(n):
+            p = tmp / f"flat_{i:05d}.png"
+            _save_png16(p, np.full((2, 2), 500, dtype=np.uint16))
+            paths.append(p)
+        items = [(i, t[i] / TIME_FS_PER_UM, paths[i]) for i in range(n)]
+        got = phase_map(items, lmin=lmin, lmax=lmax)
+        snap = phase_map_at(items, items[n // 2][1], lmin=lmin, lmax=lmax)
+    assert (got["k_lo"], got["k_hi"]) == (990, 999), (got["k_lo"], got["k_hi"])
+    assert got["k_c"] == 994.5, got["k_c"]
+    assert abs(got["f_c_thz"] - 994.5 * got["df_thz"]) < 1e-12, got["f_c_thz"]
+    assert (snap["k_lo"], snap["k_hi"]) == (990, 999), (snap["k_lo"], snap["k_hi"])
+
+
+def test_the_moment_result_carries_no_carrier():
+    """「某一时刻」那张**没有公共载波**（相位基准就是那一拍本身）：载波三格一律 None。
+
+    界面上那一格写的是「—（某一时刻不取载波）」，接口里就不该带着数 —— 有数就得有含义。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        s = _scan(6, 5, 48, 9, tmp=Path(d))
+        lmin, lmax = _band_of(s["k_sig"], s["df_thz"])
+        snap = phase_map_at(s["items"], s["items"][11][1], lmin=lmin, lmax=lmax)
+        whole = phase_map(s["items"], lmin=lmin, lmax=lmax)
+    assert snap["k_c"] is None and snap["f_c_thz"] is None and snap["lam_c_um"] is None, snap
+    assert whole["k_c"] == 9.0 and whole["f_c_thz"] is not None, whole
+    assert (snap["k_lo"], snap["k_hi"]) == (9, 9), (snap["k_lo"], snap["k_hi"])
+
+
 def test_only_none_counts_as_all_pass():
     """**「全通」只有一个判据：没填（None）**。填了 0 / 负数 / nan 是填错了，当场拒。
 
@@ -354,26 +509,31 @@ def test_missing_point_refuses_the_whole_scan():
 def test_crop_only_shifts_the_reading():
     """裁过的扫描：数组是**盘上那张图**的形状，rect 是**原始坐标** —— 偏移只在读文件那一层减一次。
 
-    同一叠图，裁着读和不裁着读必须给出逐像素一样的数（差的只是 rect 那个原点）。
+    同一叠图，裁着读与整幅读必须给出**逐像素一样**的数（差的只是 rect 那个原点）。
+    **必须真裁**：盘上的图要是整幅、crop 只写个矩形，两次读的是同一批字节，那两条 allclose
+    永远不会失败（从前就是这样）。这里另存一份真小了一块的帧，文件自带 `CropRect`。
     """
     import tempfile
 
+    rect = (7, 5, 5, 4)
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
-        s = _scan(5, 4, 32, 6, tmp=tmp)
+        s = _scan(12, 10, 32, 6, tmp=tmp)
         lmin, lmax = _band_of(s["k_sig"], s["df_thz"])
+        cut_items = _recut(s["images"], s["items"], tmp / "cut", rect)
         full = phase_map(s["items"], lmin=lmin, lmax=lmax)
-        cut = phase_map(s["items"], crop=(7, 9, 5, 4), lmin=lmin, lmax=lmax)
+        cut = phase_map(cut_items, crop=rect, lmin=lmin, lmax=lmax)
         try:
-            phase_map(s["items"], crop=(7, 9, 9, 9), lmin=lmin, lmax=lmax)
+            phase_map(cut_items, crop=(7, 5, 9, 9), lmin=lmin, lmax=lmax)
         except ValueError as exc:
             assert "库和文件对不上" in str(exc), exc
         else:
             raise AssertionError("裁剪尺寸对不上没有报错")
-    assert cut["rect"] == [7, 9, 5, 4] and (cut["w"], cut["h"]) == (5, 4), cut["rect"]
-    assert full["rect"] is None and (full["w"], full["h"]) == (5, 4)
-    assert np.allclose(cut["phase"], full["phase"], atol=1e-6)
-    assert np.allclose(cut["amp"], full["amp"], rtol=1e-6)
+    assert cut["rect"] == list(rect) and (cut["w"], cut["h"]) == (5, 4), cut["rect"]
+    assert full["rect"] is None and (full["w"], full["h"]) == (12, 10)
+    x0, y0, w, h = rect
+    assert np.allclose(cut["phase"], full["phase"][y0:y0 + h, x0:x0 + w], atol=1e-6)
+    assert np.allclose(cut["amp"], full["amp"][y0:y0 + h, x0:x0 + w], rtol=1e-6)
 
 
 def test_progress_and_workers_do_not_change_the_numbers():
@@ -405,9 +565,9 @@ def test_weight_vector_is_really_one_pass():
     t0 = float(t.min())
     df = 1.0 / span
     th = 2 * np.pi * df * (t - t0)
-    k_lo, k_hi, k_c = 20, 24, 22.0
-    u, df2 = weight_vector(list(t), k_lo, k_hi, k_c, span)
-    assert abs(df2 - df) < 1e-12, (df2, df)
+    k_lo, k_hi = 20, 24
+    u, ks, k_c = weight_vector(list(t), k_lo, k_hi, span)
+    assert ks == list(range(k_lo, k_hi + 1)) and k_c == 22.0, (ks, k_c)
     W = np.array([np.exp(1j * (k - k_c) * th).sum() for k in range(k_lo, k_hi + 1)])
     for _ in range(5):
         x = rng.normal(0, 40, n) + 500

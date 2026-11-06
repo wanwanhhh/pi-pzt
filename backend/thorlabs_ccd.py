@@ -967,7 +967,9 @@ def energy_circle(img, centroid) -> dict:
 
     这是用户定的口径：直接拿相机原值，不扣背景、不做平面、不平滑、不拟合。
     窗口只是限制积分范围（窗口外不参与），不是背景模型；背景弱时 80% 圆才接近光斑。
-    背景不弱时 r80 会贴到窗口/画面边，返回 ok=False —— 不拿背景圈冒充光斑直径。
+    背景不弱时 r80 会贴到窗口边、或者 80% 圆出了画面，返回 ok=False —— 不拿背景圈冒充光斑直径。
+    **窗口被画面裁掉不算"贴边"**：小光斑靠近边时窗口（半宽 32~512 px）一定有一边被裁，
+    那只是积分范围到头了；真正要拒的是 80% 圆本身出画面（圆心到边的距离小于 r80）。
 
     返回的是**传感器坐标**（与保存的 PNG、质心同一套），前端只按预览朝向换算显示。
     """
@@ -1041,9 +1043,10 @@ def energy_circle(img, centroid) -> dict:
         out["reason"] = (f"背景占窗口总能量 {100.0 * bg_fraction:.0f}%"
                          f"（> {100.0 * TL_ENERGY_BG_MAX_FRACTION:.0f}%），80% 圆会偏；先让背景更弱")
         return out
-    if x0 == 0 or y0 == 0 or x1 == w or y1 == h:
-        out["reason"] = "光斑贴边：80% 能量不完整，挪进画面再量"
-        return out
+    # **窗口被画面裁掉不算"贴边"**：窗口只是积分范围（半宽 32~512 px），光斑小、靠近边时
+    # 它一定有一边被裁 —— 那与"80% 圆出画面"是两件事，后者在下面单独判（r80 真出了画面才拒）。
+    # 从前这里拿"窗口贴到画面边"当光斑贴边，240×240 上 r80≈9 的光斑放在 (33,33) 就被拒，
+    # 而同一个光斑放到 440×440 的 (133,133) 却是好的 —— 那是假阳性。
 
     dx = np.arange(x0, x1, dtype=np.float64) - cx
     dy = np.arange(y0, y1, dtype=np.float64) - cy
@@ -1557,27 +1560,40 @@ def _png_chunk(tag: bytes, data: bytes) -> bytes:
 
 
 def read_png_meta(path: Path) -> dict:
-    """从 PNG 的 tEXt 块里读回这一帧自带的元数据：曝光（µs）与质心（像素）。
+    """从 PNG 的 tEXt 块里读回这一帧自带的元数据：曝光（µs）、质心（像素）、裁剪矩形。
 
     写在文件**自己**身上：把 PNG 拷到别处、换个软件打开、甚至十年后翻出来，都还问得出来
-    —— 不依赖本仓库的数据库。老图（加这个之前存的）没有这些块，两个字段都是 None
+    —— 不依赖本仓库的数据库。老图（加这个之前存的）没有这些块，字段都是 None
     （调用方按字段取，**不要拿 None 当 0**）。
 
-    **只扫块头、不解码 IDAT**：1~2 MB 的文件读一遍就够，图库列几十张也不慢。
+    **只扫块头、不解码、也不读像素**：逐块走到 IEND，tEXt 以外的块（IDAT 那一大坨）整块 seek
+    过去，一个字节都不读。自家 `_save_png16` 与 PIL 都把 tEXt 写在 IDAT 之前，所以一帧实际
+    只读几百字节（实测 2000 帧全幅 0.02 s）—— 整幅图那条路每帧都要核一遍裁剪记录
+    （见 frames.check_frame），按整幅读就是几 GB。
     """
     import struct
 
     out = {"exposure_us": None, "centroid": None, "crop": None}
     try:
-        data = path.read_bytes()
+        f = open(path, "rb")
     except OSError:
         return out
-    pos = 8
-    while pos + 12 <= len(data):
-        (length,) = struct.unpack(">I", data[pos:pos + 4])
-        tag = data[pos + 4:pos + 8]
-        body = data[pos + 8:pos + 8 + length]
-        if tag == b"tEXt":
+    with f:
+        if f.read(8) != b"\x89PNG\r\n\x1a\n":
+            return out
+        while True:
+            head = f.read(8)
+            if len(head) < 8:               # 文件短了 / 坏了：能读到的就到这儿
+                break
+            (length,) = struct.unpack(">I", head[:4])
+            tag = head[4:8]
+            if tag == b"IEND":
+                break
+            if tag != b"tEXt":
+                f.seek(length + 4, 1)       # 块体 + CRC 整块跳过（IDAT 也在这里）
+                continue
+            body = f.read(length)
+            f.seek(4, 1)
             key, _, value = body.partition(b"\x00")
             if key == EXPOSURE_KEY:
                 try:
@@ -1596,9 +1612,6 @@ def read_png_meta(path: Path) -> dict:
                     out["crop"] = [x0, y0, w, h]
                 except ValueError:
                     pass
-        elif tag == b"IEND":
-            break
-        pos += 12 + length
     return out
 
 

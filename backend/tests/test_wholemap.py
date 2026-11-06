@@ -156,6 +156,40 @@ def test_bin_response_shape_and_order():
     assert resp.headers["cache-control"] == "no-store", dict(resp.headers)
 
 
+def test_start_drops_the_previous_result_so_bin_never_hands_out_the_old_one():
+    """起算那一刻，手里那一份结果就没了 —— `.bin` 不会在起算瞬间照常交出上一份。
+
+    同一个 scan_id 换波段重算是最容易撞上的一格：扫描号没变，`bin_response` 只按扫描号认，
+    上一份（16 字节的旧数组）会一直给到新的算完为止。界面拿到的是"新元数据 + 旧数组"。
+    """
+    gate = {"go": False}
+
+    def slow_run(plan, progress, **kw):
+        while not gate["go"]:
+            time.sleep(0.005)
+        return {"scan_id": None, "n": 1, "a": np.zeros((2, 2)), "b": np.ones((2, 2)),
+                "w": 2, "h": 2}
+
+    w = _mk(run=slow_run)
+    plan = {"items": [(0, 1.0, None)], "rect": None}
+    w.start(7, plan)
+    gate["go"] = True
+    _wait(w)
+    assert len(w.bin_response(7).body) == 2 * 2 * 2 * 4, "算完之后该给得出 .bin"
+
+    gate["go"] = False
+    w.start(7, plan)                       # 同一个扫描号，换一份重算
+    try:
+        w.bin_response(7)
+    except HTTPException as exc:
+        assert exc.status_code == 404, exc
+    else:
+        raise AssertionError("起算之后仍然交出了上一份 .bin")
+    gate["go"] = True
+    _wait(w)
+    assert len(w.bin_response(7).body) == 2 * 2 * 2 * 4, "算完之后要重新给得出来"
+
+
 def test_bin_response_404_before_any_result_and_for_other_scan():
     w = _mk()
     try:

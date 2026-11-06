@@ -47,7 +47,13 @@ class WholeMap:
     # ---- 下面四件事就是那六条路由各自的一行 ----
 
     def start(self, scan_id: int, plan: dict, **kw) -> dict:
-        """起算（后台线程）。上一张还在算就 409 —— 与裁剪同一个规矩。"""
+        """起算（后台线程）。上一张还在算就 409 —— 与裁剪同一个规矩。
+
+        **起算就把手里那一份结果清掉**：换波段/换扫描号重算时，新的一张还没算完，
+        旧的那一份既不是这条扫描的、也不是这个波段的 —— 留着它，`.bin` 会在起算那一瞬间
+        照常交出上一份（旧数组配新的元数据）。"手里这一份"只有 self.result 说了算：
+        算着的时候它是 None，算完才落账（见 _worker）。
+        """
         if self.job["running"]:
             raise HTTPException(
                 409,
@@ -56,6 +62,7 @@ class WholeMap:
             )
         self.job.update(running=True, scan_id=scan_id, done=0, total=len(plan["items"]),
                         error=None, result=None)
+        self.result = None
         threading.Thread(target=self._worker, args=(scan_id, plan, kw),
                          daemon=True, name=self._thread_name).start()
         return {"ok": True, "scan_id": scan_id, "total": len(plan["items"])}
@@ -70,7 +77,11 @@ class WholeMap:
         return {"job": dict(self.job)}
 
     def bin_response(self, scan_id: int) -> Response:
-        """那几列 float32 连着给（各 w×h、行优先），形状在结果里。"""
+        """那几列 float32 连着给（各 w×h、行优先），形状在结果里。
+
+        **只认 self.result**：算着的时候它是 None（起算那一刻就清掉了，见 start），
+        所以"还在算"与"没算过"都从这里出 404 —— 手里这一份只有一处说了算。
+        """
         import numpy as np
 
         if self.result is None or self.result["scan_id"] != scan_id:
