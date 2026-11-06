@@ -11,6 +11,8 @@ HTTP 处理函数本身不碰设备。
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import io
 import json
 import logging
@@ -33,7 +35,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
-from . import store
+from . import spectrum_file, store
 from .ccd import make_capture
 from .wholemap import WholeMap
 from .config import (
@@ -64,6 +66,7 @@ from .models import (
     ScanControl,
     ScanRequest,
     ServoRequest,
+    SpectrumImportRequest,
     VelocityRequest,
 )
 from .scanner import ScanError, Scanner
@@ -878,6 +881,27 @@ def api_scan_pixel(
         "readback_to_um": scan.get("readback_to_um"),
         **series,
     }
+
+
+# ------------------------------------------------------------------ 数据页：导入原光谱
+# 这条谱是**另一台仪器拍的**，只拿来看：不参与当前这条谱的计算、不进库、不进导出物。
+# 解析与减背景住在 backend/spectrum_file.py（那是文件格式的事，不是设备的事）。
+@app.post("/api/spectrum/import")
+def api_spectrum_import(req: SpectrumImportRequest) -> dict:
+    """收一个文件（base64）→ 认波长与计数 → 减背景 → 把数交回界面叠图。
+
+    走 JSON 不走 multipart：这台机器上没装 python-multipart，而一份光谱导出只有几百 KB。
+    减完背景的计数原样交出去，**归一化留给界面** —— 峰值对齐要同时知道导入这条与像素谱的峰值，
+    后一个只有前端手里有（谱是前端算的）。
+    """
+    try:
+        raw = base64.b64decode(req.data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(400, "文件内容不是合法的 base64 —— 界面读文件那一步没走通。") from exc
+    try:
+        return spectrum_file.parse(req.name, raw)
+    except ValueError as exc:                  # 文件不对：原样把人话交回去，界面直接显示
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.delete("/api/scans/{scan_id}")

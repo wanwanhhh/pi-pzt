@@ -14,7 +14,7 @@
  *       W–Z 数据页的频谱轴、滤波与解析信号（包络 / 相位残差 / 傅里叶极限）；
  *       AA 数据页相位图（波段来源、一遍读盘的起算与进度、绕圈配色、门限、换基准不重取数）；
  *       AB 数据页强度对齐（全通照算、不滤波仍走同一个三步、n 只改显示、线性灰度、
- *          直流门限相对中位数、慢响应、字节数）；
+ *          显示上限只改画法、直流门限相对中位数、慢响应、字节数）；
  *       AC 跨语言 golden：pixelSpectrum / filtKeepRange 与后端同一条式子（期望值在
  *          backend/tests/golden_spectrum.json，Python 那半边是 backend/tests/test_golden.py）。
  *       （相机预览那块只有"加载 app.js 不炸"这一层被覆盖，预览时序未测。）
@@ -3790,7 +3790,7 @@ const count = (m) => calls.filter((c) => c === m).length;
   // **后端只给两张与 n 无关的图**（Σb² 与 d）→ 改 n、改门限只重画，不重读盘；
   // 波段只有〈滤波曲线〉那两个框一个来源，**两个都空（全通）也照算**（不需要载波）。
   // 直流门限相对**整幅图直流的中位数**，以下的像素涂深灰并计数。
-  console.log('\n[AB] 数据页强度对齐：n 只改显示 / 全通照算 / 直流门限相对中位数');
+  console.log('\n[AB] 数据页强度对齐：n 只改显示 / 全通照算 / 直流门限相对中位数 / 显示上限只改画法');
 
   // 4×2 的一小张图（原始坐标 rect = 500,400,4,2）：
   //   直流：1000 1000 10 800 1000 1000 1000 1000 —— 中位数 1000，第 3 格的 10 正好在 −40 dB 上
@@ -3825,7 +3825,7 @@ const count = (m) => calls.filter((c) => c === m).length;
   run("alignPolling.stop(); alignResult=null; alignData=null; alignLoadedKey=''; alignSeq=0;" +
       "dataLast=null; specLast=null; dataChart=null; filtChart=null; dataScans=[];" +
       "$('filt-lmin').value=''; $('filt-lmax').value=''; $('align-n').value='3';" +
-      "$('align-dcmin').value='-40'; alignBarPaint(); alignSyncUI();");
+      "$('align-dcmin').value='-40'; $('align-cap').value=''; alignBarPaint(); alignSyncUI();");
   await run('loadDataScans()'); await tick();
   run("$('data-x').value = '500'; $('data-y').value = '400';");
 
@@ -3909,6 +3909,38 @@ const count = (m) => calls.filter((c) => c === m).length;
      JSON.stringify(alPx(2)) !== JSON.stringify([30, 41, 59]) &&
      read("$('align-blank').textContent") === '0',
      read("$('align-blank').textContent"));
+
+  // 显示上限：一两个坏点把色标顶死时把顶压下来 —— **只改画法**，数据与请求都不动。
+  calls.length = 0;
+  run("$('align-cap').value = '20'; $('align-cap').oninput()");
+  ok('显示上限填 20：超过的涂白、色标右端变成 20、统计条报超出几格 —— 一个请求都不发',
+     read("$('align-bar-hi').textContent") === '20.0' &&
+     read("$('align-bar-mid').textContent") === '10.0' &&
+     read("$('align-over').textContent") === '1 / 8（12.5%）' &&
+     alPx(7)[0] === 255 && alPx(0)[0] === 161 && calls.length === 0,
+     [read("$('align-bar-hi').textContent"), read("$('align-over').textContent"),
+      JSON.stringify([alPx(7)[0], alPx(0)[0]]), JSON.stringify(calls)].join(' | '));
+
+  run("$('align-canvas').onmousemove({ clientX: 330, clientY: 150 })");
+  ok('hover 落在超过上限的那一格：照旧读**真值**，并注明已涂白',
+     read("$('align-hover').textContent") ===
+       '像素 (503, 401)　S = 50.6　直流 1000.0 ADU（最强的 100.0%；超过显示上限，涂白）',
+     read("$('align-hover').textContent"));
+
+  run("$('align-canvas').onmouseleave(); $('align-cap').value = ''; $('align-cap').oninput()");
+  ok('上限留空 = 不掐：颜色、色标与统计都回到按最强那一格（一个像素都不变）',
+     read("$('align-bar-hi').textContent") === '50.6' &&
+     read("$('align-over').textContent") === '0' &&
+     alPx(0)[0] === 64 && JSON.stringify(alPx(7)) === JSON.stringify([255, 255, 255]),
+     [read("$('align-bar-hi').textContent"), read("$('align-over').textContent"),
+      JSON.stringify([alPx(0)[0], alPx(7)[0]])].join(' | '));
+
+  // 分位那一路：全幅 1.5 M 格排序不值，量化到 4096 段再数（门限以下的 NaN 不算）。
+  const qExpr = '(function(){var a=new Float64Array(1000);' +
+    'for(var i=0;i<1000;i++)a[i]=i*0.001;a[500]=NaN;return alignQuantile(a,0.999,99);})()';
+  ok('按分位填（99%）：上限落在第 99 百分位附近（量化误差 ≤ 满量程/4096，NaN 不算）',
+     (function () { const q = read(qExpr); return q >= 0.989 && q <= 0.9915; })(),
+     String(read(qExpr)));
 
   // 门限的**基准是中位数**，不是均值、也不是最强像素。上面那 8 个直流里
   // 中位数 = 最大值 = 1000、均值 851.25，三种基准给出同一个数（−40 dB 都掐 0 格、
@@ -4160,6 +4192,126 @@ const count = (m) => calls.filter((c) => c === m).length;
        'kLo/kHi = ' + r.kLo + ' ~ ' + r.kHi + '（golden ' + b.k_lo + ' ~ ' + b.k_hi + '）');
   }
   run("$('filt-lmin').value = ''; $('filt-lmax').value = ''; dataLast = null;");
+
+  // ==================== 数据页：导入原光谱（减完背景，按峰值对齐叠图） ====================
+  // 减背景那一步在后端（backend/tests/test_spectrum_file.py 管），这里测**叠图这一层**三件事：
+  //   1) 峰值对齐 —— 导入那条乘一个系数，峰正好落在像素谱的峰高上（单位不同才比得了形状）；
+  //   2) 落到当前横轴上 —— 折线在每一格取值、范围以外留空；像素谱那一列一个数不动；
+  //   3) 它不参与计算 —— 切 dB、换读法、移除之后，这条谱一个数都不变。
+  console.log('\n[AD] 数据页频谱：导入原光谱（减完背景按峰值对齐叠图）');
+
+  // 一条落在 289.6 THz 附近（≈1035 nm）的取数结果：把 [U] 那条的**时间列整体缩小**，
+  // 频率按 1/T 一起抬上去 —— 这样导入的 0.99~1.05 µm 才与它落在同一段轴上。
+  const nearIr = seriesOf(64, 6, 100, 500, 0);
+  nearIr.time_fs = nearIr.time_fs.map((t) => t * 0.0032888);
+  nearIr.position_um = nearIr.position_um.map((p) => p * 0.0032888);
+  nearIr.wavelength_um_per_thz = 299.792458;
+  route = (m, url) => (url.indexOf('/pixel') > 0 ? { body: nearIr } : dataRoute(m, url));
+  run("dataLast=null; dataChart=null; dataChartAxis=null; specChart=null; specChartDb=null;" +
+      "specChartImp=null; specLast=null; specSrc=null; specDb=false; specAxis='freq'; specImport=null;" +
+      "specDensity=1; $('spec-density').value='1'; specX.pinned=false; specY.pinned=false;" +
+      "$('spec-xmin').value=''; $('spec-xmax').value=''; $('spec-ymin').value=''; $('spec-ymax').value='';");
+  // 不走取数那一路（这一段测的是叠图，不是取数）：直接把一份取数结果摆进 dataLast
+  run('dataLast = ' + JSON.stringify(nearIr) + '; renderSpectrum(dataLast);'); await tick();
+
+  const pixelCol = read('JSON.stringify(specChart.data[1])');
+  // 后端交回来的那份（已减背景的计数 + 峰位/峰高），形状与 /api/spectrum/import 的回包一致
+  const impSpec = {
+    name: 't.xlsx', origin: '列 B「Sample」', n: 13, background: 4000,
+    lam_nm: [990, 995, 1000, 1005, 1010, 1015, 1020, 1025, 1030, 1035, 1040, 1045, 1050],
+    counts: [-50, -40, -30, -20, -10, 0, 10, 50, 200, 21000, 300, 60, -20],
+    peak_nm: 1035, peak_counts: 21000, range_nm: [990, 1050],
+  };
+  run('specImport = ' + JSON.stringify(impSpec) + ';');
+  run('renderSpectrum(dataLast);'); await tick();
+
+  ok('导入之后图上多一列、图例多一条（像素谱 / 导入的原光谱 / 相位）',
+     read('specChart.data.length') === 4 && read('specChart.opts.series.length') === 4 &&
+     read("specChart.opts.series[2].label").indexOf('导入 t.xlsx') === 0,
+     read('JSON.stringify(specChart.opts.series.map(function (x) { return x.label; }))'));
+  ok('像素谱那一列一个数都不动（导入的只是多画一条对照线，不参与计算）',
+     read('JSON.stringify(specChart.data[1])') === pixelCol);
+  ok('导入的线只画在它自己的波长范围内：范围以外留空（曲线断开，不往外延伸）',
+     (function () {
+       const xs = JSON.parse(read('JSON.stringify(specChart.data[0])'));
+       const ys = JSON.parse(read('JSON.stringify(specChart.data[2])'));
+       let inside = 0, outside = 0, leak = 0;
+       for (let i = 0; i < xs.length; i++) {
+         const nm = 299.792458 / xs[i] * 1000;         // 频率轴上换算回 nm
+         if (nm >= 990 && nm <= 1050) { inside++; if (ys[i] === null) leak++; }
+         else if (ys[i] !== null) outside++;
+       }
+       return inside > 0 && leak === 0 && outside === 0;
+     })(), '列 ' + read('specChart.data[2].length'));
+
+  // 换读法：波长轴上还是同一列数、同一根折线，只是横坐标换成 µm
+  calls.length = 0;
+  run("$('btn-spec-axis').onclick()"); await tick();
+  ok('切到波长轴：导入那条跟着换横坐标，峰仍落在 1.035 µm 上（不重算谱、不重新取数）',
+     read('specChart.data.length') === 4 && read('specAxis') === 'wave' &&
+     (function () {
+       const xs = JSON.parse(read('JSON.stringify(specChart.data[0])'));
+       const ys = JSON.parse(read('JSON.stringify(specChart.data[2])'));
+       let best = 0;
+       for (let i = 0; i < xs.length; i++) if (ys[i] !== null && Math.abs(xs[i] - 1.035) < Math.abs(xs[best] - 1.035)) best = i;
+       return Math.abs(xs[best] - 1.035) < 0.02 && ys[best] !== null && calls.length === 0;
+     })(), read("$('btn-spec-axis').textContent") + ' / ' + JSON.stringify(calls));
+
+  run("$('btn-spec-axis').onclick()"); await tick();     // 波长轴上该测的都测完了，切回频率轴
+
+  // 切 dB：导入那条同样按它自己的峰算 0 dB（与像素谱同一个口径）
+  run("$('btn-spec-db').onclick()"); await tick();
+  run("specDb=false; __impPow = specImportColumn(specChart.data[0]); specDb=true;");
+  ok('切 dB：导入那条的每一格都是 10·log10(功率 ÷ 像素谱峰值) —— 与像素谱同一个 0 dB，负功率留空',
+     (function () {
+       const pow = JSON.parse(read('JSON.stringify(__impPow)'));
+       const db = JSON.parse(read('JSON.stringify(specChart.data[2])'));
+       const peakP = read('specLast.peakP');
+       if (db.length !== pow.length || read('specChart.data.length') !== 4) return false;
+       for (let i = 0; i < db.length; i++) {
+         if (pow[i] === null) { if (db[i] !== null) return false; continue; }
+         if (pow[i] <= 0) { if (db[i] !== null) return false; continue; }
+         if (db[i] === null || Math.abs(db[i] - 10 * Math.log10(pow[i] / peakP)) > 1e-9) return false;
+       }
+       return true;
+     })(), read("$('specChart.opts.series[2].label')"));
+
+  run("$('btn-spec-db').onclick()"); await tick();     // 切回功率轴再看"移除之后一个数没动"
+
+  // 移除：少一列，这条谱一个数不变
+  run("$('btn-spec-imp-clear').onclick()"); await tick();
+  ok('移除导入：图上回到三列，像素谱一个数不变（它本来就不参与计算）',
+     read('specChart.data.length') === 3 && read('specImport') === null &&
+     read('JSON.stringify(specChart.data[1])') === pixelCol &&
+     read("$('spec-imp-note').hidden") === true,
+     read('specChart.data.length'));
+
+  // 这条谱先算失败了：导入的那条不许硬画（没有对齐的目标），列数仍要跟着**手上这张图**走
+  const broken = seriesOf(64, 6, 100, 500, 0);
+  broken.value[3] = null;
+  run("specImport = " + JSON.stringify(impSpec) + "; renderSpectrum(" + JSON.stringify(broken) + ");");
+  await tick();
+  ok('这条谱不合格（缺一个点）：图清空成同样多的列，说明行说清是哪一条 —— 不拿上一张图冒充',
+     read('specChart.data.length') === read('specChart.opts.series.length') &&
+     read("$('spec-empty').hidden") === false &&
+     read("$('spec-empty').textContent").indexOf('第 4 个点') > 0,
+     read('specChart.data.length') + ' 列 / ' + read("$('spec-empty').textContent").slice(0, 40));
+
+  // 对齐这件事本身：拿一根手写的横轴，看系数、插值与留空（上一段已经把导入那条移除了，这里再摆回来）
+  run("specAxis='wave'; specDb=false; specLast={peakP:5000}; specImport=" + JSON.stringify(impSpec) + ";");
+  const colA = JSON.parse(read("JSON.stringify(specImportColumn([0.9, 1.0, 1.035, 1.0375, 1.05, 1.1]))"));
+  ok('峰值对齐：系数 = 像素谱峰高 ÷ 导入峰高，峰顶恰好落在 5000 ADU²；范围外留空',
+     colA[0] === null && colA[5] === null && Math.abs(colA[2] - 5000) < 1e-9,
+     JSON.stringify(colA));
+  ok('两点之间按折线取值（不改导入的数，只是画到共用网格上）：1.0375 µm = (21000+300)/2',
+     Math.abs(colA[3] - (21000 + 300) / 2 * 5000 / 21000) < 1e-6, colA[3]);
+  ok('减完背景是负数的那几格照实交出去（功率轴从 0 起，自己就落在轴下）',
+     Math.abs(colA[1] - (-30 * 5000 / 21000)) < 1e-6, colA[1]);
+  run("specDb=true;");
+  const colB = JSON.parse(read("JSON.stringify(specImportColumn([1.0, 1.035, 1.05]))"));
+  ok('dB 口径：峰 = 0 dB；计数为负的地方留空（log 负值没有这个数，与解不出的谱线同一条）',
+     colB[0] === null && Math.abs(colB[1]) < 1e-12 && colB[2] === null, JSON.stringify(colB));
+  run("specDb=false; specAxis='freq'; specLast=null; specSrc=null;");
 
   route = () => ({ body: [] });
   console.log(failed ? '\n===== ' + failed + ' 项失败 =====' : '\n===== 全部通过 =====');

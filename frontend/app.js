@@ -2181,6 +2181,8 @@ let specChartAxis = null;       // 上面那张图是按哪种横轴画的（同
 let specAxis = 'freq';          // 频谱横轴：freq = 频率 (THz) | wave = 波长 (µm)
 let specDb = false;             // 纵轴：false = 功率 (ADU²)，true = dB（0 = 最强那根）
 let specDensity = 4;            // 谱线密度：频率格 = k/(密度·T)。只管画，算的一律在整数格上（见上面第 9 条）
+let specImport = null;          // 导入的那条原光谱（后端解析好的：波长 / 减完背景的计数 / 背景 / 峰）
+let specChartImp = null;        // 建图时图上有没有那条导入的线：换了要重建（列数与图例都跟着变）
 
 /* 这条序列的功率谱；不合格就返回 {error}（说清哪一点、为什么）。
    非均匀 DFT：频率格 k/T，每个频率上解一次 cos/sin 的最小二乘（2×2 正规方程），功率 = (A²+B²)/2。
@@ -2410,7 +2412,7 @@ function phasePointsBelow(max) {
 function specPhaseApply() {
   if (!specChart || !specLast || specLast.error) return;
   const P = specPhase();
-  specChart.setData(specCols(P));
+  specChart.setData(specChartData(P));    // 导入的那条也在里面：相位门限改了它不该跟着掉
   applySpecRange();
   specPhaseStats(P);
 }
@@ -2453,6 +2455,125 @@ function specCols(P) {
   return [xs, ys, ps];
 }
 
+/* ---- 导入的原光谱：叠在图上比形状，不参与取数、不参与计算 ----
+
+   它不是这里算出来的谱：另一台仪器的「计数 vs 波长」，单位、点数、采样位置都不一样。叠图只做三件事，
+   一件比一件朴素：
+
+   1) **减背景**在后端做（远离主峰的平段取中位数，见 backend/spectrum_file.py）—— 平底留着的话
+      两条线的零点对不上，峰的**宽度**也会被抬高了的半高线量宽（实测 7.1 → 8.2 nm）。
+   2) **最大值对齐**在这里做：乘一个系数，让导入这条的峰正好落在**像素频谱的峰高**上。
+      两条线单位不同（ADU² vs counts），不对齐就只能比谁长得高，比不了形状。
+      切到 dB 之后这一步就变成"各按各的峰算 0 dB"，同一个系数的事。
+   3) **落到同一根横轴上**：导入的点比这根横轴密也可能疏，按折线在当前横轴的每一格上取值
+      （两点之间线性插值）—— 不改导入的数，也不改像素谱的数，只是把同一条折线画到一个共用网格上；
+      折线本身与只连它自己的点画出来的一模一样。落在导入范围以外的格子留空（曲线断开）。
+
+   那条线**不参与**这条谱的计算、不进库、不进「导出这条谱」。换扫描、换像素不丢（比的就是同一个光源）。 */
+
+/* 当前横轴读法下的 (x, y)：x 升序，y 是减完背景的计数 */
+function specImportXY() {
+  const imp = specImport, lam = imp.lam_nm, cnt = imp.counts, n = lam.length;
+  const xs = new Array(n), ys = new Array(n);
+  if (specAxis === 'wave') {
+    for (let i = 0; i < n; i++) { xs[i] = lam[i] / 1000; ys[i] = cnt[i]; }
+    return [xs, ys];
+  }
+  const c = specC();
+  if (!c) return null;              // 没有波长系数就换不过去（老后端才会这样）
+  for (let i = 0; i < n; i++) {
+    const j = n - 1 - i;            // 波长升 → 频率降，倒过来才是升序
+    xs[i] = c / (lam[j] / 1000);
+    ys[i] = cnt[j];
+  }
+  return [xs, ys];
+}
+
+/* 把导入那条折线取到当前横轴 grid 上，并按峰值对齐到像素谱的峰高（dB 口径下就是各按各的峰算 0 dB） */
+function specImportColumn(grid) {
+  const xy = specImportXY();
+  if (!xy) return null;
+  const xs = xy[0], ys = xy[1], n = xs.length, peakP = specLast.peakP;
+  const k = peakP / specImport.peak_counts;      // 让导入的峰落在 pixelPeak 上
+  const out = new Array(grid.length);
+  let j = 0;
+  for (let i = 0; i < grid.length; i++) {
+    const x = grid[i];
+    if (!(x >= xs[0] && x <= xs[n - 1])) { out[i] = null; continue; }
+    while (j < n - 2 && xs[j + 1] < x) j++;
+    const dx = xs[j + 1] - xs[j];
+    const v = (ys[j] + (ys[j + 1] - ys[j]) * (dx > 0 ? (x - xs[j]) / dx : 0)) * k;
+    // 减完背景的计数可以是负的（平段噪声）：功率轴照实画（轴从 0 起，自己就看不见），
+    // dB 轴上没有这个数（log 负值发散）—— 留空，与"解不出的谱线在 dB 轴上留空"同一条
+    out[i] = specDb ? (v > 0 ? 10 * Math.log10(v / peakP) : null) : v;
+  }
+  return out;
+}
+
+/* 图上那几列：像素谱、[导入的那条]、相位。**列数与 series 必须一起变**，所以都从这里出 */
+function specChartData(P) {
+  const c = specCols(P);
+  if (!specImport) return c;
+  const imp = specImportColumn(c[0]);
+  return [c[0], c[1], imp || new Array(c[0].length).fill(null), c[2]];
+}
+
+/* 清空这张图时也要按列数来：多一列少一列 uPlot 会当场炸，而不是画一张空图。
+   列数认的是**手上这张图建的时候**有没有导入那条（specChartImp），不是此刻的状态 ——
+   可能刚导入、图还没重建，这条谱就先算失败了。 */
+function specChartEmpty() { return specChartImp ? [[], [], [], []] : [[], [], []]; }
+
+function specImportLabel() {
+  return '导入 ' + specImport.name + '（已减背景，峰 ' +
+    (specImport.peak_nm / 1000).toFixed(4) + ' µm）';
+}
+
+/* 谱那张卡下面那一行小字：说清它是哪个文件、动了哪些数、以及"它不参与计算" */
+function specImportNote() {
+  const note = $('spec-imp-note');
+  if (!specImport) { note.hidden = true; return; }
+  const imp = specImport;
+  const aligned = specLast && !specLast.error;
+  setText('spec-imp-text', '已导入 ' + imp.name + '（' + imp.origin + '）：' + imp.n + ' 点，' +
+    imp.range_nm[0].toFixed(1) + '–' + imp.range_nm[1].toFixed(1) + ' nm；背景 ' +
+    imp.background.toFixed(0) + ' counts 已逐点减掉（远离主峰的平段中位数）；峰 ' +
+    (imp.peak_nm / 1000).toFixed(4) + ' µm。' +
+    (aligned ? '峰顶已对齐到这条谱的峰高，画在同一张图上。' : '画出一条谱之后就会叠上去。') +
+    '它只是一条对照线：不参与这条谱的计算，也不进导出。');
+  note.hidden = false;
+}
+
+/* 选一个文件：浏览器读成 dataURL → 后端认格式并减背景 → 存下来重画。
+   **解析不在前端**：xlsx 是个 zip，零构建的原生 JS 里没有解压器；后端标准库一句话的事。 */
+function specImportPick(ev) {
+  const input = ev.target;
+  const file = input.files && input.files[0];
+  input.value = '';                    // 同一个文件再选一次也要能触发 change
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onerror = function () {
+    toast('读不了这个文件：' + ((reader.error && reader.error.message) || '浏览器没给出原因'), true);
+  };
+  reader.onload = function () {
+    const url = String(reader.result || '');
+    const data = url.slice(url.indexOf(',') + 1);   // dataURL 前半段是 MIME，后端只要 base64
+    post('/api/spectrum/import', { name: file.name, data: data }).then(function (res) {
+      if (!res) return;                              // 失败原因 fetchChecked 已经用提示条说过了
+      specImport = res;
+      if (dataLast) renderSpectrum(dataLast); else specImportNote();
+      toast('已导入 ' + file.name + '：背景 ' + res.background.toFixed(0) + ' counts 已减');
+    });
+  };
+  reader.readAsDataURL(file);
+}
+
+/* 移除只把这条对照线拿掉：它本来就不参与计算，这条谱一个数都不变 */
+function specImportClear() {
+  specImport = null;
+  if (dataLast) renderSpectrum(dataLast); else specImportNote();
+  toast('已移除导入的光谱');
+}
+
 /* 横轴读法换一个：按钮、统计条标题、范围框单位一起换 */
 function specAxisApplyLabels() {
   const ax = SPEC_AXIS[specAxis];
@@ -2487,7 +2608,8 @@ function renderSpectrum(d) {
     empty.hidden = false;
     empty.className = 'hint warn';       // 不合格是"这条做不了"，不是"还没取数"
     empty.textContent = spec.error;
-    if (specChart) specChart.setData([[], [], []]);   // 别把上一条的谱留在屏幕上冒充这一条
+    if (specChart) specChart.setData(specChartEmpty());   // 别把上一条的谱留在屏幕上冒充这一条
+    specImportNote();
     return;
   }
   empty.hidden = true;
@@ -2495,23 +2617,31 @@ function renderSpectrum(d) {
 
   // 横轴或纵轴读法换了就得**重建这张图**：图例那一格是建图时写死的
   // （与像素曲线换横轴读法同一个原因）
-  if (specChart && (specChartDb !== specDb || specChartAxis !== specAxis)) {
+  // 横轴 / 纵轴读法换了、或者导入的那条线来了/走了，都得**重建这张图**：
+  // 图例那一格是建图时写死的，列数也跟着变
+  if (specChart && (specChartDb !== specDb || specChartAxis !== specAxis ||
+                    specChartImp !== specImport)) {
     specChart.destroy();
     specChart = null;
   }
-  const P = specPhase();          // 一次算完：图上的第三列与统计条用的是**同一份**
-  const data = specCols(P);
+  const P = specPhase();          // 一次算完：图上那几列与统计条用的是**同一份**
+  const data = specChartData(P);
   if (!specChart) {
     specChartDb = specDb;
     specChartAxis = specAxis;
+    specChartImp = specImport;
+    const series = [{ label: specYLabel(), stroke: '#7c3aed', width: 1.2,
+                      points: { show: showPointsBelow(400), size: 4 } }];
+    // 导入的那条原光谱：没有就是不出现 —— 不在图例里留一个空条目
+    if (specImport) series.push({ label: specImportLabel(), stroke: '#0f766e', width: 1.4 });
+    series.push(
+      // 相位（右边那条轴）：已展开、已减去线性相位、零在最强那根上；门限以外留空
+      { label: SPEC_PH_LABEL, stroke: '#b45309', width: 1, scale: 'y2',
+        points: { show: phasePointsBelow(400), size: 4, fill: '#b45309' } });
     specChart = makeChart('spec-chart', {
       xlabel: SPEC_AXIS[specAxis].legend,
       height: 180,
-      series: [{ label: specYLabel(), stroke: '#7c3aed', width: 1.2,
-                 points: { show: showPointsBelow(400), size: 4 } },
-               // 相位（右边那条轴）：已展开、已减去线性相位、零在最强那根上；门限以外留空
-               { label: SPEC_PH_LABEL, stroke: '#b45309', width: 1, scale: 'y2',
-                 points: { show: phasePointsBelow(400), size: 4, fill: '#b45309' } }],
+      series: series,
       yaxis2: { scale: 'y2', side: 1, stroke: '#b45309', grid: { show: false },
                 ticks: { stroke: '#f0c48a' }, size: 58, label: SPEC_PH_LABEL },
       data: data,
@@ -2549,6 +2679,7 @@ function renderSpectrum(d) {
   }
   setText('spec-peakval', specNum(spec.peakP));
   specPhaseStats(P);                      // 同一个 P：图上画的那条与统计条说的必须是同一次算出来的
+  specImportNote();                       // 下面那行小字跟着导入的那条线走
 }
 
 /* 频率轴（X）与纵轴（Y）**各是一个范围框**（同一套规矩，见 rangeBox），各钉各的标记、各一个「自动范围」。 */
@@ -3822,7 +3953,8 @@ function mapRingFit() {
    除以它自己的直流就是「对齐」：亮暗与照明不均被除掉，图上比的是条纹的相对深度。
    **后端只给两张与 n 无关的图**（Σb² 与 d，走 align.bin），所以改 n、改门限都只重画 ——
    不重读盘、不重算带通。换波段、换扫描才要重算。全通也能算（这里不需要载波）。
-   配色是**线性**灰度：0 → 最深，最强那一格 → 最白（不做对数 —— 图上直接读的是 S 的比例）。
+   配色是**线性**灰度：0 → 最深、上限 → 最白（不做对数 —— 图上直接读的是 S 的比例）；
+   上限默认是最强那一格，填了「显示上限」就按它画（超过的涂白并计数），几个坏点压不黑整幅图。
    门限以下（直流太小）的像素涂深灰，不当成 0。 */
 
 let alignResult = null;         // 后端那一份结果的 meta（扫描号 / 波段 / rect / 幅面 / 谱线 / 直流中位数）
@@ -3879,18 +4011,67 @@ function alignTop(vals) {
   return top;
 }
 
-/* 手里那一列算好的数与它的峰值：**一次重画算一遍**，hover 直接用。
+/* 显示上限：**留空 = 不掐**（最白 = 最强那一格，与以前逐像素一样）；填 `99.9%` = 按分位
+   （只有最亮的 0.1% 涂白）；填一个数 = 绝对上限（S 的单位，色标右端就是它）。
+   **它只改画法**：不改数据、不进请求、不算错一行；比最强那一格还大 = 没掐。
+   填了认不出的东西也按不掐画（与门限留空同一个脾气）—— 图上与色标都照实说话。 */
+function alignCapInput() {
+  const raw = String($('align-cap').value || '').trim();
+  if (!raw) return null;
+  if (raw.charAt(raw.length - 1) === '%') {
+    const p = parseFloat(raw.slice(0, -1));
+    return isFinite(p) && p > 0 && p < 100 ? { pct: p } : null;   // 100% 就是不掐，见上
+  }
+  const v = parseFloat(raw);
+  return isFinite(v) && v > 0 ? { abs: v } : null;
+}
+
+/* 第 p 分位那一格的值（0 < p < 100）：算的是**这一列里画得出来的那些**（门限以下是 NaN，不算）。
+   全幅 1.5 M 个点排序是 200 ms 级，而改上限是改一下看一眼的操作 —— 线性量化到 4096 段再数，
+   误差 ≤ 满量程 / 4096（最强那一格的 0.024%），画面上看不出来。 */
+const ALIGN_Q_BINS = 4096;
+function alignQuantile(vals, top, p) {
+  if (!(top > 0)) return 0;
+  const step = top / ALIGN_Q_BINS, bins = new Int32Array(ALIGN_Q_BINS);
+  let n = 0;
+  for (let i = 0; i < vals.length; i++) {
+    const v = vals[i];
+    if (!(v === v)) continue;
+    n++;
+    const b = Math.floor(v / step);
+    bins[b < 0 ? 0 : (b >= ALIGN_Q_BINS ? ALIGN_Q_BINS - 1 : b)]++;
+  }
+  if (!n) return 0;
+  // 从高往低数到 (100−p)% 那一格；取那一段的**上沿**，所以涂白的只会比这个比例少一点、不会多
+  let acc = 0;
+  const want = n * (100 - p) / 100;
+  for (let b = ALIGN_Q_BINS - 1; b >= 0; b--) {
+    acc += bins[b];
+    if (acc >= want) return (b + 1) * step;
+  }
+  return top;
+}
+
+/* 手里那一列算好的数、它的峰值与**上色的顶**：一次重画算一遍，hover 直接用。
    每次 mousemove 现算一遍（全幅 1440×1080 是 12 MB 的 Float64Array + 逐像素 Math.pow，实测约 29 ms）
-   会让 hover 掉帧。作废的条件就是那三个输入：换了数据、改了 n、改了门限。 */
-let alignCache = null;          // {key, vals, top}
+   会让 hover 掉帧。作废的条件就是那四个输入：换了数据、改了 n、改了门限、改了显示上限。
+   分位那一支要扫一遍这一列，所以合成在**算这一列的地方**、与它一起缓存。 */
+let alignCache = null;          // {key, vals, top, cap}
 
 function alignSeriesCached() {
   if (!alignData || !alignResult) return null;
-  const key = alignLoadedKey + '|' + alignN() + '|' + alignGate();
+  const capIn = alignCapInput();
+  const key = alignLoadedKey + '|' + alignN() + '|' + alignGate() + '|' +
+    (capIn ? (capIn.pct || capIn.abs) : '');
   if (alignCache && alignCache.key === key) return alignCache;
   const vals = alignSeries();
   if (!vals) return null;
-  alignCache = { key: key, vals: vals, top: alignTop(vals) };
+  const top = alignTop(vals);
+  // 上限比最强那一格还大 = 没掐（色标右端仍是那一个数，图不会因为填大了反而变暗）
+  const cap = capIn
+    ? Math.min(top, capIn.pct ? alignQuantile(vals, top, capIn.pct) : capIn.abs)
+    : top;
+  alignCache = { key: key, vals: vals, top: top, cap: cap };
   return alignCache;
 }
 
@@ -3910,8 +4091,8 @@ function alignSyncUI() {
   $('align-band').className = 'hint' + (bad ? ' warn' : '');
   btn.disabled = !isFinite(n) || !!bad || running;
   const how = unf
-    ? '把这一条扫描的每一帧读一遍，逐像素直接算它自己时间序列的交流能量（不按波段；后台跑，进度在右边）。换扫描要重算；改 n、改门限、改波段都不用。'
-    : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；改 n、改门限不用。';
+    ? '把这一条扫描的每一帧读一遍，逐像素直接算它自己时间序列的交流能量（不按波段；后台跑，进度在右边）。换扫描要重算；改 n、改门限、改上限、改波段都不用。'
+    : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；改 n、改门限、改上限不用。';
   btn.title = !isFinite(n)
     ? '算不了：n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)，n < 1/2 会变成负数、把暗点放大）'
     : bad
@@ -3992,11 +4173,13 @@ function alignNum(v) {
   return Number(v.toPrecision(3)).toString();
 }
 
-/* 画：一张 ImageData，逐像素上色。**线性**灰度：k = v / 最强 × 255（0 最深、最强最白），
+/* 画：一张 ImageData，逐像素上色。**线性**灰度：k = v / 上限 × 255（0 最深、上限最白）。
+   上限默认就是最强那一格；填了「显示上限」时超过它的一律按它画，并计数 ——
+   几个坏点不该决定整幅图的对比度。
    门限以下的直流涂深灰并计数（那是「算得出却不可复现」，不是 0）。 */
 function alignPaint() {
   alignBarPaint();               // 色标那条灰度条本身：与有没有图无关，空态也要摆着
-  const ids = ['align-size', 'align-lines', 'align-dcmed', 'align-blank'];
+  const ids = ['align-size', 'align-lines', 'align-dcmed', 'align-blank', 'align-over'];
   const empty = $('align-empty');
   const n = alignN();
   const cached = alignSeriesCached();
@@ -4006,14 +4189,14 @@ function alignPaint() {
     for (let i = 0; i < ids.length; i++) setText(ids[i], '—');
     setText('align-n-note', isFinite(n) ? n + '（指数 ' + alignExponent(n).toFixed(4) + '）' : '—');
     setText('align-title', '未算');
-    alignScaleText(null);
+    alignScaleText(null, null);
     setText('align-hover', '鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。');
     empty.hidden = false;
     return;
   }
   const r = alignResult, w = alignData.w, h = alignData.h;
-  const top = cached.top;
-  let blank = 0;
+  const top = cached.top, cap = cached.cap;
+  let blank = 0, over = 0;
   for (let i = 0; i < w * h; i++) if (vals[i] !== vals[i]) blank++;
   const cv = $('align-canvas');
   if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }   // 内部 1:1，CSS 负责缩放
@@ -4026,9 +4209,10 @@ function alignPaint() {
       px[j] = 30; px[j + 1] = 41; px[j + 2] = 59; px[j + 3] = 255;
       continue;
     }
-    // **线性**：k = v / 最强 × 255（0 最深、最强最白）。v 可能是负的（数据本该非负，
+    // **线性**：k = v / 上限 × 255（0 最深、上限最白）。v 可能是负的（数据本该非负，
     // 但两个 float32 相减/缩放后可能有 −0），一律夹到 0 这一头。
-    const k = Math.round(Math.max(0, Math.min(1, top > 0 ? v / top : 0)) * 255);
+    if (v > cap) over++;
+    const k = Math.round(Math.max(0, Math.min(1, cap > 0 ? v / cap : 0)) * 255);
     px[j] = k; px[j + 1] = k; px[j + 2] = k; px[j + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
@@ -4049,23 +4233,26 @@ function alignPaint() {
   }
   setText('align-dcmed', fmt(r.dc_median, 1));
   setText('align-blank', blank ? blank + ' / ' + (w * h) + '（' + (blank * 100 / (w * h)).toFixed(1) + '%）' : '0');
+  setText('align-over', over ? over + ' / ' + (w * h) + '（' + (over * 100 / (w * h)).toFixed(1) + '%）' : '0');
   empty.hidden = true;
-  alignScaleText(top);
+  alignScaleText(top, cap);
   setText('align-hover', alignIdleText());
 }
 
-/* 色标的三格刻度：讲的是**这一张图的数**（0 → 最深、最强 → 最白），与图上那条线性式子同源。
+/* 色标的三格刻度：讲的是**这一张图的数**（0 → 最深、上限 → 最白），与图上那条线性式子同源。
    没有图时中间与右端写「—」—— 不拿一个跟手里这张无关的数顶着；
-   左端恒为 0（最深那一端与有没有图无关）。 */
-function alignScaleText(top) {
+   左端恒为 0（最深那一端与有没有图无关）。上限默认是这张图里最强的那一格；
+   填了「显示上限」时右端就是那个数（超过它的都涂白，统计条报多少格）。 */
+function alignScaleText(top, cap) {
   const cv = $('align-bar');
   cv.title = top === null
     ? '强度对齐：线性灰度（0 → 最深、最强那一格 → 最白）；深灰 = 直流在门限以下（不是 0）'
-    : '强度对齐：线性灰度 —— 最深 = 0、最白 = ' + alignNum(top) +
-      '（这张图里最强的那一格）；深灰 = 直流在门限以下（不是 0）';
+    : '强度对齐：线性灰度 —— 最深 = 0、最白 = ' + alignNum(cap) +
+      (cap < top ? '（显示上限：超过它的都涂白）' : '（这张图里最强的那一格）') +
+      '；深灰 = 直流在门限以下（不是 0）';
   setText('align-bar-lo', '0');      // 左端永远是 0（最深），与有没有图无关
-  setText('align-bar-mid', top === null ? '—' : alignNum(top / 2));
-  setText('align-bar-hi', top === null ? '—' : alignNum(top));
+  setText('align-bar-mid', top === null ? '—' : alignNum(cap / 2));
+  setText('align-bar-hi', top === null ? '—' : alignNum(cap));
 }
 
 /* 色标那条灰度条本身：第 0 格 = 最深、第 255 格 = 最白 —— 与图上同一条线性式子。 */
@@ -4084,9 +4271,13 @@ function alignBarPaint() {
 function alignIdleText() {
   const n = alignN();
   if (!alignData || !isFinite(n)) return '鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。';
+  const c = alignSeriesCached();
   const energy = alignResult && alignResult.unfiltered ? 'Σ(I−d)²' : 'Σ b²';
+  const scale = c && c.cap < c.top
+    ? '线性灰度（最白 = 显示上限 ' + alignNum(c.cap) + '，超过的涂白）'
+    : '线性灰度（最白 = 最强那一格）';
   return '每个像素：S = ' + energy + ' ÷ d^' + alignExponent(n).toFixed(4) + '（n = ' + n + '）' +
-    '　｜　线性灰度（最白 = 最强那一格）　｜　鼠标停在图上读任意一点';
+    '　｜　' + scale + '　｜　鼠标停在图上读任意一点';
 }
 
 function alignHover(ev) {
@@ -4102,10 +4293,12 @@ function alignHover(ev) {
       ' ADU 在门限以下 —— 没算（不是 0）');
     return;
   }
-  const top = cached.top;
+  const top = cached.top, cap = cached.cap;
   const share = top > 0 ? v / top : 0;
+  // 涂白只是画法：这里照旧读**真值**，并注明它已经在色标顶上了
   setText('align-hover', '像素 (' + p.x + ', ' + p.y + ')　S = ' + alignNum(v) +
-    '　直流 ' + fmt(d, 1) + ' ADU（最强的 ' + (share * 100).toFixed(1) + '%）');
+    '　直流 ' + fmt(d, 1) + ' ADU（最强的 ' + (share * 100).toFixed(1) + '%' +
+    (v > cap ? '；超过显示上限，涂白' : '') + '）');
 }
 
 /* ==================== 分栏拖动 ==================== */
@@ -4786,13 +4979,14 @@ function wire() {
   // n 与直流门限都**只改显示**（后端给的两张图与 n 无关）：改了立刻重画，不重读盘
   $('align-n').oninput = function () { alignPaint(); alignSyncUI(); };
   $('align-dcmin').oninput = alignPaint;
+  $('align-cap').oninput = alignPaint;            // 显示上限：与门限同一个脾气，只重画
   // 不滤波只改口径：手里那张图不动，只把「该重算」标出来（与相位图换时刻同一类）
   $('align-nofilter').onchange = alignSyncUI;
   $('align-canvas').onmousemove = alignHover;
   $('align-canvas').onmouseleave = function () { setText('align-hover', alignIdleText()); };
   wireNote('btn-align-note', 'align-note');
   alignBarPaint();                                // 色标与有没有图无关：出生就摆着
-  alignScaleText(null);                           // 还没有图：三格刻度写「—」，不拿一个无关的数顶着
+  alignScaleText(null, null);                     // 还没有图：三格刻度写「—」，不拿一个无关的数顶着
   alignSyncUI();
   mapViewTitle = $('btn-map-view').title;         // 原样的说明（切到强度视图时换成那一句）
   mapBarPaint();                                  // 色标（图例）与有没有图无关：出生就摆着
@@ -4817,6 +5011,10 @@ function wire() {
   $('spec-phmin').oninput = specPhaseApply;    // 相位门限：只改右边那一列（不重算谱、不取数）
   $('btn-spec-axis').onclick = specAxisToggle; // 横轴：频率 ↔ 波长（同一串数换刻度，不重算）
   $('btn-spec-export').onclick = specExport;   // 整条谱存成 CSV（与图上同一份数，不另算）
+  // 导入原光谱：选文件 → 后端认格式、减背景 → 叠在这张图上比形状（不参与取数与计算）
+  $('btn-spec-import').onclick = function () { $('spec-file').click(); };
+  $('spec-file').onchange = specImportPick;
+  $('btn-spec-imp-clear').onclick = specImportClear;
   specAxisTitle = $('btn-spec-axis').title;    // 原样的说明（禁用时在后面补"为什么切不了"）
   specAxisApplyLabels();                       // 按钮与统计条标题的初值
   // 横轴范围框的接线（手填 = 钉住、「自动范围」= 松钉）由 rangeBox.wire 自己接好了

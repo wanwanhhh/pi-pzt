@@ -75,6 +75,17 @@ class ImportRequest(_Model):
     path: str = Field(min_length=1, max_length=4096)
 
 
+class SpectrumImportRequest(_Model):
+    """导入一条光谱仪导出的谱：叠在频谱图上比形状，不参与取数、不参与计算。
+
+    data 是文件内容的 base64（浏览器用 FileReader 读成 dataURL，切掉前缀就是它）。
+    走 JSON 不走 multipart —— 这台机器上没装 python-multipart，而一份光谱导出只有几百 KB。
+    """
+
+    name: str = Field(min_length=1, max_length=200)
+    data: str = Field(min_length=1, max_length=16_000_000)
+
+
 class ScanControl(_Model):
     """暂停 / 继续 / 中止三个独立动作，一次只做一个。"""
 
