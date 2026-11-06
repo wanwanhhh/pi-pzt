@@ -73,6 +73,9 @@ const URLStub = {
 function mkEl(isFragment) {
   const e = {
     textContent: '', className: '', value: '', disabled: false, hidden: false,
+    // 输入框的 validity：真浏览器里 type=number 填了不是数的内容时 value 是空串、
+    // badInput 才是真 —— app.js 的波长框靠它把"填错了"与"留空"分开（见 filtBoxes）。
+    validity: { badInput: false },
     style: {}, dataset: {}, clientWidth: 600, onclick: null, src: '',
     isFragment: !!isFragment, _children: [], _html: '',
     _listeners: {},          // 记下来：测试能自己派事件（横轴的滚轮缩放与拖动平移）
@@ -2178,6 +2181,18 @@ const count = (m) => calls.filter((c) => c === m).length;
      pkHi >= read('specLast.peakF') && pkHi < read('specLast.fmax_thz') &&
      read('specChart.scales.x.min') === pkLo && read('specChart.scales.x.max') === pkHi,
      pkLo + ' ~ ' + pkHi + '（峰 ' + read('specLast.peakF') + '）');
+  // 宽度是**全宽**（文档与按钮上写的都是"至少 20 根谱线宽"），半宽那一半在 app.js 里减一次：
+  // 从前写成 20·df 当半宽，实际框出 40 根，文档与界面差一倍。
+  // 窗口 = 峰频 ± 半宽，两端再夹在 0 与 Nyquist 之间（峰靠 0 的别框到负频率去）。
+  // 半宽 = max(10 个分辨率格, 峰频的 10%) ⇒ **全宽** = max(20 个分辨率格, 峰频的 20%)。
+  const pkF = read('specLast.peakF'), pkDf = read('specLast.df_thz');
+  const pkHalf = Math.max(10 * pkDf, pkF * 0.1);
+  const pkLoW = Math.max(0, pkF - pkHalf), pkHiW = Math.min(read('specLast.fmax_thz'), pkF + pkHalf);
+  ok('「聚焦最强峰」的窗口宽度 = max(20 个分辨率格, 峰频的 20%) —— 是**全宽**，与文档那句一致',
+     Math.abs(pkLo - pkLoW) < 2e-3 && Math.abs(pkHi - pkHiW) < 2e-3 &&
+     Math.abs(2 * pkHalf - 20 * pkDf) < 1e-9,      // 这条谱：20 格那一支说了算（峰频的 20% 更窄）
+     '框出 ' + pkLo + ' ~ ' + pkHi + '（' + (pkHi - pkLo).toFixed(3) + ' THz = ' +
+     ((pkHi - pkLo) / pkDf).toFixed(1) + ' 个分辨率格；半宽该是 ' + pkHalf.toFixed(4) + '）');
   run("$('btn-spec-fit').onclick()"); await tick();
   ok('聚焦之后「自动范围」照旧能松开它（聚焦没有自己的一套钉法）',
      read("$('spec-xpin').hidden") === true && read("$('spec-xmax').value") === '5.159');
@@ -2298,7 +2313,7 @@ const count = (m) => calls.filter((c) => c === m).length;
   // 接线：换密度只重算、不取数；滤波曲线一个数都不变
   route = (m, url) => (url.indexOf('/pixel') > 0 ? { body: denseBody } : dataRoute(m, url));
   run("specDensity=1; $('spec-density').value='1'; specChart=null; specLast=null;" +
-      "specSrc=null; specScale=null; filtChart=null; dataChart=null; dataLast=null;");
+      "specSrc=null; filtChart=null; dataChart=null; dataLast=null;");
   calls.length = 0;
   await run("$('btn-data-draw').onclick()"); await tick(); await tick();
   const nBins1 = read('specChart.data[0].length');
@@ -2385,7 +2400,7 @@ const count = (m) => calls.filter((c) => c === m).length;
   };
   const resetData = () => run("dataAxis='pos'; dataScale='um'; dataOrder='seq'; dataLast=null;" +
     "dataChart=null; dataChartKey=null; specChart=null; specChartDb=null; specLast=null;" +
-    "specSrc=null; specScale=null; specDb=false; dataSources=[];" +
+    "specSrc=null; specDb=false; dataSources=[];" +
     "dataX.pinned=false; dataXs=[]; specX.pinned=false; specY.pinned=false;" +
     "$('data-xmin').value=''; $('data-xmax').value=''; $('spec-xmin').value=''; $('spec-xmax').value='';");
 
@@ -2426,11 +2441,61 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('data-xmin').value") === (20 / RAW_FACTOR).toFixed(3) &&
      read("$('data-xmax').value") === (80 / RAW_FACTOR).toFixed(3),
      read("$('data-xmin').value") + ' ~ ' + read("$('data-xmax').value"));
+  // **换口径不改变谱的频率刻度**：谱算的是物理时间列 time_fs（时间 = 位移 × 2/c 不随口径变），
+  // 口径只换像素曲线 / 滤波曲线的横轴刻度与范围框。从前这里跟着 dataScale 取时间列，
+  // 原值口径下整张谱的频率被缩 1/系数 —— 物理峰没动，界面报的频率、按波长框选出的谱线全错，
+  // 而后端 bands.band_lines 永远按物理时间算，两边就此对不上。
+  const C_UM_V = 299.792458;                       // 后端给的波长系数（前端不许写常数）
+  const hadCV = read('dataLast.wavelength_um_per_thz');
+  run("dataLast.wavelength_um_per_thz = " + C_UM_V + ";");
+  run("$('filt-lmin').value = '120'; $('filt-lmax').value = '200'; $('filt-lmin').oninput()");
+  // 快照：**从当前口径重算一遍**再取（清掉缓存）—— 否则切口径时谱压根不重算、比的是同一份旧值，
+  // 这条用例对"谱认哪一列时间"就一点都不敏感。
+  const specNow = () => {
+    run('specLast = null; specSrc = null; renderSpectrum(dataLast);');
+    const n = downloads.length;
+    run("$('btn-spec-export').onclick()");        // 导一次 CSV，取波长那一列（与屏幕同一条谱）
+    const ls = downloads[n].text.split('\r\n');
+    const i0 = ls.findIndex((l) => l.indexOf('频率 (THz)') === 0);
+    return {
+      peakF: read('specLast.peakF'), df: read('specLast.df_thz'), fmax: read('specLast.fmax_thz'),
+      keep: JSON.parse(read('JSON.stringify(filtKeepRange(specLast))')),
+      head: ls.slice(0, i0),
+      wave: ls.slice(i0 + 1).filter((l) => l !== '').map((l) => l.split(',')[1]),
+    };
+  };
+  const atRaw = specNow();
+  run('specLast.__v = 1;');
+  run("$('btn-data-scale').onclick()"); await tick();      // 切回折算
+  const keptRaw = read('specLast.__v');
+  const atUm = specNow();
+  run("$('btn-data-scale').onclick()"); await tick();      // 切回原值（后面几条还按原值口径走）
+  ok('换口径不改变谱的频率刻度：峰频、分辨率 1/T、上限在两种口径下逐位相同（谱只认物理时间）',
+     atRaw.peakF === atUm.peakF && atRaw.df === atUm.df && atRaw.fmax === atUm.fmax &&
+     Math.abs(atRaw.peakF - peakUm) < 1e-12,
+     atUm.peakF + ' THz（折算） vs ' + atRaw.peakF + ' THz（原值），df ' + atUm.df + ' vs ' + atRaw.df);
+  ok('按波长框选出的谱线在两种口径下也是同一批（同一组波长 → 同一批根，与后端 bands 同一套）',
+     atRaw.keep.ok === true && atRaw.keep.all === false &&
+     atRaw.keep.kLo === atUm.keep.kLo && atRaw.keep.kHi === atUm.keep.kHi,
+     '原值 ' + atRaw.keep.kLo + '~' + atRaw.keep.kHi + ' / 折算 ' + atUm.keep.kLo + '~' + atUm.keep.kHi);
+  ok('CSV 的波长列在两种口径下一字不差（导的是同一条谱，口径不进文件里的数）',
+     atRaw.wave.length > 0 && JSON.stringify(atRaw.wave) === JSON.stringify(atUm.wave),
+     atRaw.wave.length + ' 行，第一格 ' + atRaw.wave[0] + ' / ' + atUm.wave[0]);
+  ok('CSV 文件头如实说：谱按物理时间算（口径只影响横轴显示），并写出这条扫描的读回系数',
+     atRaw.head.some((l) => l.indexOf('# 时间: ') === 0 && l.indexOf('物理') > 0 &&
+       l.indexOf(String(RAW_FACTOR)) > 0) &&
+     !atRaw.head.some((l) => l.indexOf('# 口径: ') === 0),
+     atRaw.head.filter((l) => l.indexOf('# 时间:') === 0 || l.indexOf('# 口径:') === 0).join(' | '));
+  ok('换口径不重算谱（缓存键里没有口径这一项），标题也不再写口径',
+     keptRaw === 1 &&
+     read("$('spec-title').textContent").indexOf('读回原值') < 0 &&
+     read("$('spec-title').textContent").indexOf('折算') < 0,
+     read("$('spec-title').textContent"));
+  run("$('filt-lmin').value = ''; $('filt-lmax').value = ''; $('filt-lmin').oninput();" +
+      "dataLast.wavelength_um_per_thz = " + JSON.stringify(hadCV) + ";");
   const peakRaw = read('specLast.peakF');
-  ok('频谱跟着口径走：原值口径下时间列大 1/0.75 → 频率小 0.75 倍（同一串数换刻度）',
-     Math.abs(peakRaw - peakUm * RAW_FACTOR) < 1e-9 &&
-     read("$('spec-title').textContent").indexOf('读回原值') > 0,
-     peakUm + ' THz（折算） -> ' + peakRaw + ' THz（原值）');
+  ok('原值口径下峰频与折算口径相同（同一条谱，只是像素曲线的横轴换了刻度）',
+     Math.abs(peakRaw - peakUm) < 1e-12, peakUm + ' THz（折算） / ' + peakRaw + ' THz（原值）');
   run("$('btn-data-scale').onclick()"); await tick();
   ok('切回折算：窗口按系数换回去（26.667~106.667 原值 → ×0.75 = 20~80 µm）',
      read("$('data-xmin').value") === '20.000' && read("$('data-xmax').value") === '80.000' &&
@@ -2659,6 +2724,70 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('filt-n').textContent") === '0' &&
      read("$('filt-band').textContent").indexOf('一根谱线都没有') > 0 && flat,
      read("$('filt-band').textContent"));
+
+  // **填了但不合法 ≠ 留空**：留空是"这一边不限"，填 0 / 负数 / 非数是**填错了**。
+  // 判据照 backend/bands.py 的 band_lines（那边对同一串参数抛同一句话），不自己另立一套。
+  // 从前这里按 v > 0 判，填个 0 就等于把滤波器关掉、还一个字都不说 —— 界面按全通算，
+  // 相位图却会拒，两边说的不是一件事。
+  console.log('  -- 波长框填了不合法的数：红字 + 禁用 + 不发请求（与后端同一句） --');
+  run("$('filt-lmin').value = '0'; $('filt-lmax').value = ''; $('filt-lmin').oninput()");
+  const badAll = JSON.parse(read('JSON.stringify(bandOf())'));
+  ok('填 0 不是全通：bandOf() 带出那句话，all 也不成立（与后端 bands.band_lines 同一条判据）',
+     badAll.all === false && badAll.bad === '波长最小要填一个正数（µm）' &&
+     badAll.lmin === null && badAll.lmax === null,
+     JSON.stringify(badAll));
+  ok('滤波卡当场说清：波段那格红字写着后端那句话，曲线不留（不拿上一条冒充这一条）',
+     read("$('filt-band').textContent") === '波段：波长最小要填一个正数（µm）' &&
+     read("$('filt-band').className").indexOf('warn') >= 0 &&
+     read("$('filt-empty').hidden") === false &&
+     read("$('filt-empty').textContent") === '波长最小要填一个正数（µm）' &&
+     read("$('filt-n').textContent") === '—',
+     read("$('filt-band').textContent") + ' | ' + read("$('filt-empty').textContent"));
+  ok('两张整幅图卡也跟着红、按钮禁用（同一个 bad，不是每个调用点各判一遍）',
+     read("$('btn-map-run').disabled") === true &&
+     read("$('map-band').className").indexOf('warn') >= 0 &&
+     read("$('map-band').textContent") === '波段：波长最小要填一个正数（µm）' &&
+     read("$('btn-map-run').title").indexOf('波长最小要填一个正数（µm）') > 0 &&
+     read("$('btn-align-run').disabled") === true &&
+     read("$('align-band').className").indexOf('warn') >= 0 &&
+     read("$('align-band').textContent") === '波段：波长最小要填一个正数（µm）',
+     [read("$('map-band').textContent"), read("$('btn-map-run').title"),
+      read("$('align-band').textContent")].join(' | '));
+  calls.length = 0;
+  await run("$('btn-map-run').onclick()"); await tick();
+  await run("$('btn-align-run').onclick()"); await tick();
+  ok('填错了点起算：当场说清哪一格、要填什么，**一个请求都不发**（后端也会拒，前端不假装能算）',
+     calls.length === 0 &&
+     read("$('toast').textContent").indexOf('波长最小要填一个正数（µm）') > 0,
+     JSON.stringify(calls) + ' | ' + read("$('toast').textContent"));
+  run("$('filt-lmin').value = '-3'; $('filt-lmin').oninput()");
+  ok('填负数同样算填错（不是"不限"）：说的还是那句话',
+     JSON.parse(read('JSON.stringify(bandOf())')).bad === '波长最小要填一个正数（µm）',
+     read("$('filt-band').textContent"));
+  // 真浏览器里 type=number 填了 "abc" 时 value 是空串、badInput 为真（框里显示的那串不进 value）：
+  // 那与"留空"在 value 上长得一样，靠 badInput 才分得开。
+  run("$('filt-lmin').value = ''; $('filt-lmin').validity.badInput = true; $('filt-lmin').oninput()");
+  ok('填了不是数的东西（浏览器里 value 是空串、badInput 为真）也算填错，不当成留空',
+     JSON.parse(read('JSON.stringify(bandOf())')).bad === '波长最小要填一个正数（µm）' &&
+     read("$('filt-band').textContent") === '波段：波长最小要填一个正数（µm）',
+     read("$('filt-band').textContent"));
+  run("$('filt-lmin').validity.badInput = false; $('filt-lmin').value = 'abc'; $('filt-lmax').value = '1'; $('filt-lmax').oninput()");
+  ok('框里塞进一个非数的字符串（value 拿得到原文）同样算填错；两个都错时报前一个（先问"波长最小"）',
+     JSON.parse(read('JSON.stringify(bandOf())')).bad === '波长最小要填一个正数（µm）',
+     read("$('filt-band').textContent"));
+  run("$('filt-lmax').value = ''; $('filt-lmin').value = '370'; $('filt-lmin').oninput()");
+  ok('改回合法的数：红字收回、按钮恢复（框是唯一的准，没有第二套判断）',
+     read("$('filt-band').className").indexOf('warn') < 0 &&
+     read("$('filt-band').textContent").indexOf('留下 20 根') >= 0 &&
+     read("$('btn-map-run').disabled") === false &&
+     read("$('map-band').className").indexOf('warn') < 0,
+     read("$('filt-band').textContent") + ' | ' + read("$('map-band').textContent"));
+  run("$('filt-lmin').value = ''; $('filt-lmax').value = ''; $('filt-lmin').oninput()");
+  ok('清空两个框 = 回到全通（留空与填错是两件事，清空不是"填了个 0"）',
+     read("$('filt-band').textContent").indexOf('全通') === 0 &&
+     read("$('filt-n').textContent") === '127' &&
+     read("$('map-band').textContent").indexOf('全通') > 0,
+     read("$('filt-band').textContent") + ' | ' + read("$('map-band').textContent"));
 
   run("$('btn-filt-all').onclick()");
   ok('「全通」= 清空两个框（不是把范围放到无穷大）',
@@ -3067,6 +3196,71 @@ const count = (m) => calls.filter((c) => c === m).length;
      Math.abs(parseFloat(read("$('filt-fwhm').textContent")) - hannGot * 6.6712819) < 3,
      read("$('filt-fwhm').textContent"));
   run("$('btn-data-axis').onclick()"); await tick();
+
+  // 横轴**递减**（读数往回走）时宽度不能变成负数：宽度是长度，只在 envFwhm 一处取绝对值。
+  // XMT 上读数往回走是常态（实测一条 2000 点的扫描里 318 个间隔往回走）—— 同一份汉宁包络，
+  // 横轴升序给 width、严格递减给 −width 的话，界面就报一个负的半高宽。
+  const envAsc = JSON.parse(read('JSON.stringify(' + JSON.stringify(
+    Array.from({ length: 256 }, (_, i) => 100 * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / 255)))) + ')'));
+  const fwAsc = JSON.parse(read('JSON.stringify(envFwhm(' + JSON.stringify(
+    Array.from({ length: 256 }, (_, i) => i * 100)) + ', ' + JSON.stringify(envAsc) + ', Math.SQRT1_2))'));
+  const fwDesc = JSON.parse(read('JSON.stringify(envFwhm(' + JSON.stringify(
+    Array.from({ length: 256 }, (_, i) => (255 - i) * 100)) + ', ' + JSON.stringify(envAsc) + ', Math.SQRT1_2))'));
+  ok('半高宽恒为非负：同一份包络、横轴升序与严格递减给同一个宽度（宽度是长度，不是有符号的差）',
+     fwAsc.width !== null && fwDesc.width !== null && fwDesc.width > 0 &&
+     Math.abs(fwAsc.width - fwDesc.width) < 1e-9 &&
+     Math.abs(fwAsc.width - 0.364072 * 255 * 100) < 1,
+     '升序 ' + fwAsc.width.toFixed(3) + ' / 递减 ' + fwDesc.width.toFixed(3));
+  ok('宽度只由 envFwhm 一处定正负：两侧都不降到阈值以下时照样是 null（不编一个 0）',
+     JSON.parse(read('JSON.stringify(envFwhm([1, 2, 3], [5, 5, 5], Math.SQRT1_2))')).width === null &&
+     JSON.parse(read('JSON.stringify(envFwhm([3, 2, 1], [5, 5, 5], Math.SQRT1_2))')).width === null);
+
+  // ==================== dB 纵轴：解不出的那根留空，不拿一个地板数把轴拉下去 ====================
+  // 等间隔奇数点（2001 点、kMax = 1000）的 Nyquist 那根解不出来（条件数过线，见 specSolvable）：
+  // 功率是 0。dB 那一列从前写 −180 的地板，纵轴按这一列铺满就成了 −189~0，999 根真实谱线
+  // （0 ~ −60 dB）全挤在顶上那一小条里；而导出的 CSV 同一格是空的 —— 图与文件走了两条路。
+  // 现在那一格是 null（与 CSV 同一件事），铺满时跳过它；功率轴照旧给 0（那是真实值）。
+  console.log('\n[Y3] dB 纵轴：解不出的那根留空（不拿地板数把轴拉下去）');
+
+  const oddBody = seriesOf(2001, 300, 100, 500, 0);   // 等间隔奇数点：Nyquist 那根解不出
+  oddBody.scan_id = 56;
+  oddBody.wavelength_um_per_thz = C_UM_THZ;
+  route = (m, url) => (url.indexOf('/pixel') > 0 ? { body: oddBody } : { body: {} });
+  run("specDb = false; setText('btn-spec-db', '纵轴：功率 (ADU²)');" +
+      "setText('spec-ymin-k', '功率最小 (ADU²)'); setText('spec-ymax-k', '功率最大 (ADU²)');" +
+      "specY.pinned = false; specX.pinned = false;");
+  await run("$('btn-data-draw').onclick()"); await tick(); await tick();
+  const oddK = read('specLast.kMax');
+  const oddNyq = read('specLast.p[specLast.kMax - 1]');     // 细格号 j = kMax 那一根（下标 kMax−1）
+  ok('2001 点等间隔：Nyquist 那根确实解不出来（功率 0），其余谱线照常有数',
+     oddK === 1000 && oddNyq === 0 && read('specLast.p[299]') > 0,
+     'kMax ' + oddK + ' / Nyquist 功率 ' + oddNyq + ' / 第 300 根 ' + read('specLast.p[299]'));
+
+  run("$('btn-spec-db').onclick()"); await tick();
+  const dbOdd = JSON.parse(read('JSON.stringify(specChart.data[1])'));
+  ok('dB 列里解不出的那根是 null（与 CSV 同一件事：功率 0 的地方没有 dB），不是 −180',
+     dbOdd[oddK - 1] === null && dbOdd.filter((v) => v === null).length === 1,
+     'Nyquist 那格 ' + dbOdd[oddK - 1] + ' / 空 ' + dbOdd.filter((v) => v === null).length + ' 格');
+  // 下界 = 真实谱线里最低的那一根（再留 5% 边距），**不是那个地板数**：
+  // 从前 −180 一进来，自动范围就是 −189~0，999 根 0~−60 dB 的谱线挤在顶上 32%。
+  const dbLo = Math.min.apply(null, dbOdd.filter((v) => v !== null));
+  ok('纵轴自动范围不含 −180：下界就是真实谱线里最低的那一根（铺满时跳过 null）',
+     dbLo !== -180 && Math.abs(parseFloat(read("$('spec-ymin').value")) - (dbLo - Math.abs(dbLo) * 0.05)) < 1e-3 &&
+     parseFloat(read("$('spec-ymin').value")) !== -189 &&
+     parseFloat(read("$('spec-ymax').value")) === 0,
+     read("$('spec-ymin').value") + ' ~ ' + read("$('spec-ymax').value") + ' dB（最低那根 ' + dbLo.toFixed(4) + '）');
+  ok('图上那条轴也不含 −180（uPlot 按数据铺满时同样跳过 null）',
+     read('specChart.scales.y.min') !== -189 && read('specChart.scales.y.min') !== -180 &&
+     Math.abs(read('specChart.scales.y.min') - parseFloat(read("$('spec-ymin').value"))) < 1e-3,
+     JSON.stringify(read('specChart.scales.y')));
+
+  run("$('btn-spec-db').onclick()"); await tick();
+  const pwOdd = JSON.parse(read('JSON.stringify(specChart.data[1])'));
+  ok('切回功率轴：解不出的那根是 0（那是真实值，功率本来就是 0 —— 与 dB 那一列留空不矛盾）',
+     pwOdd[oddK - 1] === 0 && read('specChart.scales.y.min') >= 0,
+     'Nyquist 那格 ' + pwOdd[oddK - 1] + ' / 纵轴 ' + JSON.stringify(read('specChart.scales.y')));
+  run("specY.pinned = false; specX.pinned = false; specY.apply(); specX.apply();");
+  run("specLast = null; specSrc = null; specChart = null; specDb = false;");
 
   // ==================== 数据页：相位图（整幅图的相位差） ====================
   // 口径：波段 = 〈滤波曲线〉那两个波长框（**唯一来源**）；每个像素跟**基准像素**差多少相位

@@ -1709,7 +1709,8 @@ async function loadHistory() {
    读法：位置 = 台子走到哪（采图那一刻的读数）；时间 = 光走那段往返光程要多久（系数与换算都在后端）。
    口径：**折算** = 按设备声明的系数折成 µm；**原值** = 设备当时报的数（µm ÷ 系数；XMT 上是
    4/3 µm，也就是厂商上位机显示的那套数）。串还是同一串、换的只是刻度 —— 所以钉住的范围框
-   要跟着换算，频谱的频率刻度也跟着变。 */
+   要跟着换算。**频谱不跟着变**：谱算的是物理时间 time_fs（时间 = 位移 × 2/c，不随口径变），
+   口径只换像素曲线 / 滤波曲线的横轴刻度与范围框（见 pixelSpectrum）。 */
 const DATA_AXIS = {
   pos: { um: { key: 'position_um', unit: 'µm', legend: '实际位置 (µm)',
                span: '位置跨度 (µm)', btn: '横轴：位置 (µm)' },
@@ -1735,9 +1736,6 @@ let dataOrder = 'seq';     // 连线顺序：seq = 采图顺序（默认，如�
 let dataSeq = 0;           // 取数请求序号：慢响应回来时可能已经换了扫描或像素
 
 function dataAxisCur() { return DATA_AXIS[dataAxis][dataScale]; }
-
-/* 频谱要的是**时间**那一列（跟横轴按钮在看位置还是时间无关）：口径跟着横轴走。 */
-function dataTimeKey() { return dataScale === 'raw' ? 'time_raw_fs' : 'time_fs'; }
 
 /* 这条扫描能不能切到「原值」：系数记下了、而且不是 1。
    不能切时**必须说清为什么** —— 按钮灰着不解释，看着就像功能坏了。 */
@@ -2108,7 +2106,8 @@ function dataAxisToggle() {
 }
 
 /* 换位置口径：折算 µm ↔ 设备读回原值。**同一串数换刻度，不取数** —— 四列都在手里。
-   钉住的范围框按系数换算过去（框里填的数永远跟横轴同一个口径），频谱跟着重算。 */
+   钉住的范围框按系数换算过去（框里填的数永远跟横轴同一个口径）。谱不重算：它算的是物理
+   时间 time_fs，两种口径下是同一张谱（见 pixelSpectrum）。 */
 function dataScaleToggle() {
   const d = dataLast;
   const st = dataScaleState(d);
@@ -2172,11 +2171,9 @@ const SPEC_MIN_POINTS = 16;     // 比这少就不出图：几个点算出来的
 const SPEC_SOLVABLE_KAPPA = 1e12;
 const SPEC_BAD_SHOWN = 3;       // 不合格的点最多列几个（够定位就行，不刷屏）
 const SPEC_FS_TO_THZ = 1e3;     // 1/fs = 1e15 Hz = 1000 THz：只换单位，不含任何物理系数
-const SPEC_DB_FLOOR = -180;     // dB 下限：功率为 0 的频点 log 发散，压在它上面
 
 let specLast = null;            // 最近一次算出来的谱（切 dB 照它重画，不重算）
 let specSrc = null;             // 它是对哪一份取数结果算的：同一份就别再算一遍
-let specScale = null;           // 算它的时候用的是哪种口径（换口径时间列就变了）
 let specAxisTitle = '';         // 「频谱横轴」按钮原样的说明（禁用时在后面补"为什么切不了"）
 let specChart = null;
 let specChartDb = null;         // 上面那张图是按哪种纵轴画的（换读法要重建：图例写死了）
@@ -2206,7 +2203,11 @@ function specSolvable(scc, sss, scs) {
 function pixelSpectrum(d, m) {
   m = m || 1;
   const n = d.value.length;
-  const time = d[dataTimeKey()];        // 时间列跟着横轴口径走（原值口径下那串数大 1/系数）
+  // **一律用物理时间列 time_fs**：时间 = 位移 × 2/c 这条关系不随显示口径变。
+  // 原值口径下那串数大 1/系数（time_raw_fs），拿它算谱会把频率整体缩 1/系数 —— 物理峰没动、
+  // 界面报的频率与按波长框选出的根却全错，还看不出错；后端 bands.band_lines 永远按 actual_um
+  // 的物理时间算，两边就此对不上。口径只影响像素曲线 / 滤波曲线的横轴显示与范围框。
+  const time = d.time_fs;
   const bad = [];
   for (let i = 0; i < n; i++) {
     const at = '第 ' + (i + 1) + ' 个点（idx ' + d.idx[i] + '）';
@@ -2289,13 +2290,16 @@ function pixelSpectrum(d, m) {
   };
 }
 
-/* 图上的纵轴那一列：功率，或相对最强那根的 dB。**同一串数换刻度** —— 切 dB 不重算。 */
+/* 图上的纵轴那一列：功率，或相对最强那根的 dB。**同一串数换刻度** —— 切 dB 不重算。
+   dB 那一列里**解不出的根留空**（功率 0 → log 发散，没有这个数），与导出的 CSV 同一件事：
+   从前这里压一个 −180 的地板，图与文件就走了两条路；而且纵轴按这一列铺满时，
+   等间隔奇数点（2001 点、kMax = 1000）那根 Nyquist 解不出来，自动范围被它拉到 −189，
+   999 根真实谱线全挤在顶上那一小条里。功率轴（specDb === false）照旧给 0 —— 那是真实值。 */
 function specSeries() {
   if (!specDb) return specLast.p;
   const p = specLast.p, out = new Array(p.length);
   for (let i = 0; i < p.length; i++) {
-    const db = 10 * Math.log10(p[i] / specLast.peakP);
-    out[i] = db < SPEC_DB_FLOOR ? SPEC_DB_FLOOR : db;
+    out[i] = p[i] > 0 ? 10 * Math.log10(p[i] / specLast.peakP) : null;
   }
   return out;
 }
@@ -2468,11 +2472,11 @@ function renderSpectrum(d) {
   // 停在波长轴、这条响应却没有波长系数（老后端）→ **退回频率轴**：宁可显示频率，
   // 也不能拿 undefined 当横坐标画出一张空图。按钮那边会把原因写在 title 上。
   if (specAxis === 'wave' && !specC()) { specAxis = 'freq'; specAxisApplyLabels(); }
-  // 口径换了、密度改了，谱都要重算（密度只改画的格，整数格上那几根一个不差 —— 见第 9 条）
-  if (specSrc !== d || specScale !== dataScale || specLast === null || specLast.m !== specDensity) {
+  // 换了取数结果、密度改了，谱才要重算（密度只改画的格，整数格上那几根一个不差 —— 见第 9 条）。
+  // **口径不在这个判据里**：谱算的是物理时间列 time_fs，与显示口径无关（见 pixelSpectrum）。
+  if (specSrc !== d || specLast === null || specLast.m !== specDensity) {
     specLast = pixelSpectrum(d, specDensity);
     specSrc = d;
-    specScale = dataScale;
   }
   const spec = specLast;
   const empty = $('spec-empty');
@@ -2526,9 +2530,9 @@ function renderSpectrum(d) {
   $('btn-spec-axis').disabled = !axSt.ok;
   $('btn-spec-axis').title = axSt.ok ? specAxisTitle : '切不了波长轴：' + axSt.why;
 
+  // 标题里不写口径：谱按物理时间算，两种口径下是同一张谱（口径只换像素/滤波曲线的横轴刻度）
   setText('spec-title', '#' + d.scan_id + (d.name ? ' · ' + d.name : '') +
-    '　像素 (' + d.x + ', ' + d.y + ') · 按采图顺序 · ' +
-    (dataScale === 'raw' ? '读回原值' : '折算 µm'));
+    '　像素 (' + d.x + ', ' + d.y + ') · 按采图顺序');
   setText('spec-n', String(spec.n));
   setText('spec-span', spec.span_fs.toFixed(1));
   // 两格分开写：**谱线间距**跟着密度走，**分辨率**永远是 1/T（T 是真的观测了多久）。
@@ -2576,11 +2580,14 @@ const specY = rangeBox({
     const s = specLast;
     if (!s || s.error) return null;
     const ys = specSeries();
-    let lo = ys[0], hi = ys[0];
-    for (let i = 1; i < ys.length; i++) {
+    // dB 那一列里解不出的根是 null（没有这个数）：铺满时跳过它，别把空当成 −∞ 把轴拉下去
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < ys.length; i++) {
+      if (ys[i] === null || ys[i] === undefined) continue;
       if (ys[i] < lo) lo = ys[i];
       if (ys[i] > hi) hi = ys[i];
     }
+    if (!(lo <= hi)) return null;
     const pad = (hi - lo) * 0.05 || Math.abs(hi) * 0.05 || 0.001;
     lo -= pad; hi += pad;
     // 两条边不许越：功率没有负的；dB 的天花板就是最强那根（0 dB）
@@ -2592,7 +2599,8 @@ function applySpecRange() { specX.apply(); specY.apply(); }
 
 /* 「聚焦最强峰」：把频率轴窗口填成以最强分量为中心的一段。**与「自动范围」同一层** ——
    只是替你把两个数填进范围框并钉住（框仍然是唯一的准，之后滚轮/拖动照旧改框里的数）。
-   宽度 = max(20 个**分辨率格**（1/T）, 峰频的 20%)：分辨率细的谱别只框住一根线，峰靠 0 的别框到负频率去。
+   **宽度**（窗口两端之差）= max(20 个**分辨率格**（1/T）, 峰频的 20%)：分辨率细的谱别只框住一根线，
+   峰靠 0 的别框到负频率去。下面写的是**半宽**，所以两条都取一半（10 格 / 峰频的 10%）。
    用 1/T 而不是画出来的间距 —— 这是这条数据的属性，改谱线密度不该把窗口挪掉。
    波长读法下按同一个式子换算，**两端对调**（频率高的那头波长短，与 specAxisToggle 同式）。 */
 function specFocusPeak() {
@@ -2600,7 +2608,7 @@ function specFocusPeak() {
   if (!s || s.error) { toast('还没有频谱可聚焦。', true); return; }
   const c = specC();
   if (specAxis === 'wave' && !c) { toast('切不了波长轴：' + specAxisState().why, true); return; }
-  const half = Math.max(20 * s.df_thz, s.peakF * 0.1);
+  const half = Math.max(10 * s.df_thz, s.peakF * 0.1);
   const lo = Math.max(0, s.peakF - half);
   const hi = Math.min(s.fmax_thz, s.peakF + half);
   if (!(hi > lo) || (specAxis === 'wave' && !(lo > 0))) {
@@ -2666,8 +2674,10 @@ function specCsv(d, s, P) {
       (d.bits ? ' · ' + d.bits + ' 位' : '') +
       (d.crop ? ' · 裁剪过（原始坐标只留了 ' + d.crop.join(', ') + '）' : ' · 未裁剪') +
       '；坐标是保存的 PNG 自己的坐标',
-    '# 口径: ' + (dataScale === 'raw' ? '设备读回原值' : '折算 µm') +
-      '；时间列 = 读出位置 × 2/c，相位以这条序列最早那一拍 t0 为基准',
+    '# 时间: 按物理时间列算（时间 = 位移 × 2/c，不随显示口径变）—— 位置轴切到「设备读回原值」' +
+      '只换曲线横轴的刻度，这张表里的频率、波长、谱线一根都不动' +
+      (d.readback_to_um ? '；这条扫描的读回系数 ' + d.readback_to_um + ' µm/单位' : '') +
+      '；相位以这条序列最早那一拍 t0 为基准',
     '# 变换点数: ' + s.n + ' · 真实跨度: ' + s.span_fs.toFixed(1) + ' fs' +
       ' · 已去均值（直流 ' + fp(s.mean) + ' ADU，不加回）',
     '# 频率分辨率 1/T: ' + s.df_thz.toFixed(3) + ' THz · 谱线间距: ' + s.step_thz.toFixed(3) +
@@ -2737,25 +2747,45 @@ let filtXs = [];                // 横轴那一列（「自动范围」照它铺
 let filtYCols = [];
 
 /* 两个波长框现在填的是什么。**只此一处读它们** —— 滤波曲线与相位图认的是同一段波长
-   （相位图那两个数由后端换算成谱线，见 backend/phasemap.py 的 band_lines，同一条规矩）。
-   非正数、空、填了不是数的东西一律当"没填"：那边就是不限。 */
+   （相位图那两个数由后端换算成谱线，见 backend/bands.py 的 band_lines，同一条规矩）。
+
+   **「留空」与「填了但不合法」是两件事**（判据照 bands.py 的 band_lines，不自己另立一套）：
+   - 留空（框里没有内容）= 这一边不限；
+   - 填了数但 ≤ 0、或者填的不是数 = **填错了**，不是「不限」。后端对同一串参数抛
+     「波长最小要填一个正数（µm）」，前端不能悄悄按全通算（填个 0 就等于把滤波器关掉，
+     界面还一个字都不说）。返回值里的 bad 带着那句话，谁要红字谁读它。 */
 function filtBoxes() {
-  const vmin = parseFloat($('filt-lmin').value);
-  const vmax = parseFloat($('filt-lmax').value);
-  return { lmin: isFinite(vmin) && vmin > 0 ? vmin : null,
-           lmax: isFinite(vmax) && vmax > 0 ? vmax : null };
+  const out = { lmin: null, lmax: null, bad: null };
+  // 两个框各是哪个字段、叫什么名字（错的时候那句话要指名道姓，与后端 band_lines 逐字一致）
+  [['lmin', '波长最小'], ['lmax', '波长最大']].forEach(function (box) {
+    const k = box[0], el = $('filt-' + k);
+    const raw = String(el.value || '').trim();
+    // 浏览器里 type=number 遇到不是数的内容时 value 是空串（框里显示的那串不进 value）——
+    // 那与"留空"在 value 上长得一样，但它是**填错了**，只有 badInput 分得开。
+    const wrong = (el.validity && el.validity.badInput) || (raw !== '' && !(parseFloat(raw) > 0));
+    if (wrong) {
+      if (!out.bad) out.bad = box[1] + '要填一个正数（µm）';   // 与后端同一句话
+      return;
+    }
+    if (raw !== '') out[k] = parseFloat(raw);     // 留空 = 这一边不限
+  });
+  return out;
 }
 
 /* 波段**只有这一个来源**：上面那两个框。`all` = 两个都空（全通）——
-   全通收不收由调用方判（相位图拒、强度对齐照算），"读哪两个框"这件事只在这里。 */
+   全通收不收由调用方判（相位图拒、强度对齐照算），"读哪两个框"这件事只在这里。
+   `bad` 非空 = 有一个框填了不合法：这时既不是全通、也算不了（两个波长都是 null）。
+   谁要标红、谁要禁用按钮，读它，别在每个调用点各判一遍。 */
 function bandOf() {
   const b = filtBoxes();
-  return { lmin: b.lmin, lmax: b.lmax, all: b.lmin === null && b.lmax === null };
+  return { lmin: b.lmin, lmax: b.lmax, bad: b.bad,
+           all: !b.bad && b.lmin === null && b.lmax === null };
 }
 
 /* 波段写成一句话。`allText` 是"两个框都空"时那句的后半 —— 两张整幅图对全通的处置不同，
    前半句与格式只有这一份。 */
 function bandText(b, allText) {
+  if (b.bad) return '波段：' + b.bad;
   if (b.all) return '波段：全通（两个波长框都空着）—— ' + allText;
   // 波长与频率反向：**短波那一头是高频**。所以"波长最小"管的是频率上限 ⇒ 波长 ≥ lmin；
   // "波长最大"管的是频率下限 ⇒ 波长 ≤ lmax（与 filtKeepRange 里那两个判断一一对应）。
@@ -2774,9 +2804,11 @@ function bandQuery(b, extra) {
 }
 
 /* 波长框里的两个数 → 谱上的第几根到第几根。λ 与 ν 反向：**短波那一头是高频**，
-   所以「波长最小」管的是频率上限。两个框都空 = 全通；只填一边，另一边就是不限。 */
+   所以「波长最小」管的是频率上限。两个框都空 = 全通；只填一边，另一边就是不限；
+   填了不合法（≤ 0 / 不是数）= 算不了，把那句话原样交出去（不按全通算）。 */
 function filtKeepRange(s) {
   const b = bandOf();
+  if (b.bad) return { ok: false, why: b.bad };
   if (b.all) return { ok: true, all: true, kLo: 1, kHi: s.kMax };
   const c = specC();
   if (!c) return { ok: false, why: '这次取数里没有波长换算系数（后端没给）—— 按波长选范围用不了。' };
@@ -2911,7 +2943,9 @@ function filtPhaseGate() {
 /* 强度半高宽：强度 I ∝ |z|²，所以「强度降到一半」⇔「包络 |z| 降到峰值的 1/√2」—— 两种说法是同一件事
    （对 |z|² 取半高与对 |z| 取 1/√2 是同一对交点）。包络列**不含直流**（滤波曲线本身就是绕 0 的
    纯带通结果），所以直接拿它比 1/√2 就是强度半高 —— 没有"先把基线减掉"这一步。
-   在**显示顺序**上从峰值向两侧各找第一个落到阈值以下的点、两头线性插值，宽度 = 右 − 左。
+   在**显示顺序**上从峰值向两侧各找第一个落到阈值以下的点、两头线性插值，宽度 = 两个交点之差。
+   宽度是**长度**，所以取绝对值：横轴按采图顺序画，读数往回走时那一列是降序的
+   （XMT 上这是常态，实测一条 2000 点的扫描里 318 个间隔往回走），不取绝对值就会报出负宽度。
    整条算（可视范围框只管看，不吃它）；**与相位门限无关**（门限只管相位画不画）。
    任一侧一直不降到阈值以下 → width = null，界面上照实写「未降到」，不编一个数。 */
 function envFwhm(xs, envs, ratio) {
@@ -2937,7 +2971,7 @@ function envFwhm(xs, envs, ratio) {
       break;
     }
   }
-  return { width: (lo === null || hi === null) ? null : hi - lo, top: top, at: xs[p] };
+  return { width: (lo === null || hi === null) ? null : Math.abs(hi - lo), top: top, at: xs[p] };
 }
 
 /* 「傅里叶极限」那条曲线的开关：**只改显示** —— setSeries 换这一条的 show，
@@ -2969,9 +3003,12 @@ function renderFiltered() {
                'filt-fwhm', 'filt-fringe', 'filt-phpp', 'filt-phstep'];
   for (let i = 0; i < ids.length; i++) setText(ids[i], '—');
   const empty = $('filt-empty');
+  const b = bandOf();
   const fail = function (msg) {
     empty.hidden = false; empty.className = 'hint warn'; empty.textContent = msg;
-    setText('filt-title', '—'); setText('filt-band', '—');
+    setText('filt-title', '—');
+    // 填错时那句话就写在「波段」这一格（与后端同一句），别处失败才是「—」
+    setText('filt-band', b.bad ? '波段：' + b.bad : '—');
     filtXs = []; filtYCols = [];
     if (filtChart) filtChart.setData([[], [], [], [], []]);
   };
@@ -2979,10 +3016,13 @@ function renderFiltered() {
     empty.hidden = false; empty.className = 'hint';
     empty.textContent = '还没有取数。上面画出曲线之后，这里就是它的带通重建。';
     setText('filt-title', '未取数'); setText('filt-band', '—');
+    $('filt-band').className = 'hint';      // 还没取数就没什么可挑的：不标红
     filtXs = []; filtYCols = [];
     if (filtChart) filtChart.setData([[], [], [], [], []]);
     return;
   }
+  // 「波段」那格是红是灰只由 bandOf().bad 说了算（填错 = 红；全通 / 正常波段 = 灰）
+  $('filt-band').className = 'hint' + (b.bad ? ' warn' : '');
   if (!s || s.error) { fail(s ? s.error : '还没有谱 —— 先把上面那张曲线画出来。'); return; }
   const r = filtKeepRange(s);
   if (!r.ok) { fail(r.why); return; }
@@ -3272,18 +3312,24 @@ function mapSyncUI() {
   setText('map-band', bandText(b, '相位图算不了，先填一段'));
   const running = mapPolling.running();
   const btn = $('btn-map-run');
-  btn.disabled = b.all || running;
-  btn.title = b.all
-    ? '算不了：〈滤波曲线〉那张卡的两个波长框都空着（全通）—— 相位图要有"跟哪一根比"'
-    : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；换基准像素不用。'
-      + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : '');
+  // 两个波长框填错了（≤ 0 / 不是数）与「全通」一样算不了 —— 但说的不是同一句话，
+  // 而且卡要标红（全通是正常的空着，填错是填错）。
+  $('map-band').className = 'hint' + (b.bad ? ' warn' : '');
+  btn.disabled = b.all || !!b.bad || running;
+  btn.title = b.bad
+    ? '算不了：' + b.bad + '（在〈滤波曲线〉那张卡里改）'
+    : b.all
+      ? '算不了：〈滤波曲线〉那张卡的两个波长框都空着（全通）—— 相位图要有"跟哪一根比"'
+      : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；换基准像素不用。'
+        + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : '');
   // 扫描列表还没回来（刚进页面）时 cur 是 null —— 那时**不下判断**：
   // 「现在选的是 #null」是编出来的号，列表一到就会自己纠正（showView 里接着刷一次）。
   const r = mapResult, cur = scanIdOf();
   let why = '';
   if (r && cur === null) why = '';
   else if (r && r.scan_id !== cur) why = '图是 #' + r.scan_id + ' 的（现在选的是 #' + cur + '）';
-  else if (r && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
+  // 波段框填错了就不谈"改过"：那时没有一段波长可比，红字已经在那格上说了（见 bandOf().bad）
+  else if (!b.bad && r && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
   else if (r && mapAtMoved(r)) why = '「看哪一刻」改过，点重算';
   $('map-stale').hidden = !why;
   if (why) setText('map-stale', running ? why + '（正在算新的…）' : why);
@@ -3311,7 +3357,9 @@ function mapAtMoved(r) {
 async function mapRun() {
   const s = dataScanPick();
   if (!s) { toast('先选一条扫描', true); return; }
-  if (bandOf().all) {
+  const b = bandOf();
+  if (b.bad) { toast('相位图算不了：' + b.bad + '（在〈滤波曲线〉那张卡里改）', true); return; }
+  if (b.all) {
     toast('相位图要有波段：〈滤波曲线〉那张卡的两个波长框都空着（全通）', true);
     return;
   }
@@ -3857,20 +3905,25 @@ function alignSyncUI() {
     : bandText(b, '所有能解出的谱线的交流能量'));
   const n = alignN(), running = alignPolling.running();
   const btn = $('btn-align-run');
-  btn.disabled = !isFinite(n) || running;
+  // 波段填错了（≤ 0 / 不是数）也算不了 —— 不滤波时不看波段，那时不拦（与「波段改过」同一套判据）
+  const bad = unf ? null : b.bad;
+  $('align-band').className = 'hint' + (bad ? ' warn' : '');
+  btn.disabled = !isFinite(n) || !!bad || running;
   const how = unf
     ? '把这一条扫描的每一帧读一遍，逐像素直接算它自己时间序列的交流能量（不按波段；后台跑，进度在右边）。换扫描要重算；改 n、改门限、改波段都不用。'
     : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描要重算；改 n、改门限不用。';
   btn.title = !isFinite(n)
     ? '算不了：n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)，n < 1/2 会变成负数、把暗点放大）'
-    : how + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : '');
+    : bad
+      ? '算不了：' + bad + '（在〈滤波曲线〉那张卡里改）'
+      : how + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : '');
   // 扫描列表还没回来时 cur 是 null —— 不下判断（见 mapSyncUI 同一处说明）
   const r = alignResult, cur = scanIdOf();
   let why = '';
   if (r && cur === null) why = '';
   else if (r && r.scan_id !== cur) why = '图是 #' + r.scan_id + ' 的（现在选的是 #' + cur + '）';
   else if (r && !!r.unfiltered !== unf) why = '口径改过，点重算';
-  else if (!unf && r && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
+  else if (!unf && !bad && r && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
   $('align-stale').hidden = !why;
   setText('align-stale', why ? (running ? why + '（正在算新的…）' : why) : '');
 }
@@ -3880,11 +3933,14 @@ async function alignRun() {
   const s = dataScanPick();
   if (!s) { toast('先选一条扫描', true); return; }
   if (!isFinite(alignN())) { toast('n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)）', true); return; }
+  const unf = alignUnfiltered();
+  const b = bandOf();
+  // 波段填错了当场说清，一个请求都不发（后端对同一串参数也是抛这句话）
+  if (!unf && b.bad) { toast('强度对齐算不了：' + b.bad + '（在〈滤波曲线〉那张卡里改）', true); return; }
   if (alignPolling.running()) return;
   if (scanActive) toast('扫描进行中：这一遍要读全盘，会跟采图抢磁盘');
-  const unf = alignUnfiltered();
   const d = await post('/api/scans/' + s.id + '/align' +
-                       (unf ? '?unfiltered=1' : bandQuery(bandOf(), null)));
+                       (unf ? '?unfiltered=1' : bandQuery(b, null)));
   if (!d) return;
   setText('align-progress', JOB_TEXT.started(d.total));
   alignPolling.start();
