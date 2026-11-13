@@ -4,7 +4,8 @@
   会话 = 一次 open_camera 产生的一切 + 它用的那个 SDK 实例；
   会话只在「使用窗口」内存在（预览意图 ∪ 扫描持有 ∪ 一次动作）；
   任何异常（除输入校验）→ 丢弃会话，记 failure，不重试；状态是派生量；
-  **一个会话只 arm 一次**：设置只在会话出生时写，此后预览 / 手动保存 / 扫描共用一条连续流。
+  **一个会话只 arm 一次**：设置只在会话出生时写；预览与手动保存共用连续流，扫描另用单帧会话
+  （触发模式在会话出生时定，不能在 arm 之后改）。
 
 直接跑：python backend/tests/test_ccd_reopen.py
 """
@@ -44,6 +45,9 @@ class _Cam:
     保存不再碰相机"这条不变量（上机实测 2026-10-08：流跑着的时候再 arm 一轮，出帧就停摆）。
     """
 
+    # 触发模式写不进去的假相机（钉住"读回不一致就不拿它去扫描"）
+    ignore_trigger_mode_write = False
+
     def __init__(self, serial="34331"):
         self.serial = serial
         self.model = "CS165MU"
@@ -58,6 +62,9 @@ class _Cam:
         self.roi_writes = 0
         self.expo_writes = 0
         self.gain_writes = 0
+        self.trigger_calls = 0
+        self.image_poll_timeout_ms = 2000
+        self._frames_per_trigger = 0
         self.frames: list = []            # 待取帧队列：get_pending_frame_or_null 从队首拿
 
     @property
@@ -91,6 +98,15 @@ class _Cam:
         self._gain = int(value)
 
     @property
+    def frames_per_trigger_zero_for_unlimited(self):
+        return self._frames_per_trigger
+
+    @frames_per_trigger_zero_for_unlimited.setter
+    def frames_per_trigger_zero_for_unlimited(self, value):
+        if not type(self).ignore_trigger_mode_write:
+            self._frames_per_trigger = int(value)
+
+    @property
     def image_width_pixels(self):
         return self._roi[2] + 1
 
@@ -107,7 +123,7 @@ class _Cam:
         self.disarm_calls += 1
 
     def issue_software_trigger(self):
-        pass
+        self.trigger_calls += 1
 
     def get_pending_frame_or_null(self):
         return self.frames.pop(0) if self.frames else None
@@ -165,8 +181,9 @@ def _cam() -> ThorlabsCamera:
     return ThorlabsCamera()
 
 
-def _session(sdk=None, cam=None) -> _Session:
-    return _Session(sdk or _SDK(), cam or _Cam(), "34331", (0, 0, 1440, 1080))
+def _session(sdk=None, cam=None, single_frame: bool = False) -> _Session:
+    return _Session(sdk or _SDK(), cam or _Cam(), "34331", (0, 0, 1440, 1080),
+                    single_frame=single_frame)
 
 
 # ---------------- 状态是派生量 ----------------
@@ -348,7 +365,7 @@ def test_scan_holds_the_session_until_it_says_end():
         restore()
 
 
-# ---------------- 一条连续流：一个会话只 arm 一次 ----------------
+# ---------------- 两种会话：一个会话只 arm 一次 ----------------
 # 上机实测（2026-10-08，data/_grab_probe3.py）：预览连续出帧时做**两轮** disarm→arm，第二轮之后
 # 相机一帧都不再出（1.4 s 后按"没出新帧"判掉线）；只做一轮安然无恙，设置写与取帧都不是必要条件。
 # 旧代码的手动保存正是"disarm → 改设置 → arm → 取帧 → 再 disarm → 改回来 → 再 arm"，
@@ -397,25 +414,24 @@ def test_save_without_preview_is_a_one_shot_session():
         restore()
 
 
-def test_begin_scan_reuses_the_preview_stream():
-    """扫描在预览跑着的时候接手：**不重配、不重新 arm**，会话接着用。"""
-    import numpy as np
-
+def test_begin_scan_switches_to_a_single_frame_session():
+    """扫描接手：预览那条连续流换成**单帧触发**会话（模式是会话级设置，不能原地改）。"""
     restore = _fake_sdk([["34331"]])
     try:
         cam = _cam()
         cam._run(("preview", True, 0.0))
-        sess = cam._sess
-        before = (sess.cam.roi_writes, sess.cam.expo_writes, sess.cam.gain_writes)
-        sess.cam.frames.extend(_Frame(np.zeros((2, 2), dtype=np.uint16)) for _ in range(3))
+        old = cam._sess
+        assert old is not None and old.single_frame is False
 
         cam._run(("begin_scan",))
-        assert cam._sess is sess and cam.state() == "held", "接着用预览那条流"
-        assert sess.cam.arm_calls == 1, "接手不许再 arm"
-        assert sess.cam.disarm_calls == 0
-        assert (sess.cam.roi_writes, sess.cam.expo_writes, sess.cam.gain_writes) == before, \
-            "接手不许重配相机"
-        assert len(sess.cam.frames) == 3, "接手不去清帧队列：实测没人取帧时驱动自己丢帧，攒不下来"
+        sess = cam._sess
+        assert cam.state() == "held"
+        assert sess is not old, "预览会话不能拿来扫描（触发模式不同）"
+        assert old.cam.disposed == 1 and old.sdk.disposed == 1, "旧会话（句柄 + SDK）要一起丢"
+        assert sess.single_frame is True
+        assert sess.cam.frames_per_trigger_zero_for_unlimited == 1, "扫描必须是一次触发一帧"
+        assert sess.cam.arm_calls == 1, "一个会话只 arm 一次"
+        assert sess.cam.trigger_calls == 0, "arm 后不预触发：第一帧要等扫描到位后才开始"
         cam._run(("end_scan",))
     finally:
         restore()
@@ -424,8 +440,8 @@ def test_begin_scan_reuses_the_preview_stream():
 def test_frame_freshness_counts_only_while_frames_are_expected():
     """扫描期间没人取帧，那段时间不算"预览没出新帧" —— 交还后不许立刻把会话判掉线。
 
-    上机实测（2026-10-08）：扫描交还后第一次节拍就丢了会话，报"预览 2.1s 没出新帧" ——
-    其实扫描期间相机归扫描、根本没在取帧。判据只在"应该出帧"的时间里计时才对。
+    现在交还时会重建预览会话（单帧 → 连续），旧的计时天然被切断；这条同时钉住：
+    新会话不会被旧的"没出新帧"带下水，而真掉线仍然照判。
     """
     restore = _fake_sdk([["34331"]])
     try:
@@ -438,32 +454,123 @@ def test_frame_freshness_counts_only_while_frames_are_expected():
         sess.last_frame_at = time.monotonic() - 60
         sess.frames_expected_since = time.monotonic() - 60
 
-        cam._run(("end_scan",))                    # 交还预览：基线刷新
-        assert cam._sess is sess
+        cam._run(("end_scan",))                    # 交还预览：丢掉单帧会话、按连续模式重开
+        live = cam._sess
+        assert live is not None and live is not sess
         cam._maybe_pump(0.0)
-        assert cam._sess is sess, "刚交还就拿扫描期间没取帧去判掉线了"
+        assert cam._sess is live, "刚交还就拿扫描期间没取帧去判掉线了"
 
         # 但真掉线还是要判：期望起点也推回 60 s 前，同一拍就该丢掉会话
-        sess.frames_expected_since = time.monotonic() - 60
+        live.frames = 5
+        live.last_frame_at = time.monotonic() - 60
+        live.frames_expected_since = time.monotonic() - 60
         cam._maybe_pump(0.0)
         assert cam._sess is None and "没出新帧" in cam.status()["failure"]
     finally:
         restore()
 
 
-def test_end_scan_keeps_the_stream_when_preview_is_wanted():
-    """扫描交还相机、预览还要着：会话留着接着出帧 —— 不许 disarm、不许重新 arm。"""
+def test_end_scan_rebuilds_a_continuous_preview_session():
+    """扫描交还、预览还要着：丢掉单帧会话，按连续模式重开 —— 预览那条流不能是单帧的。"""
     restore = _fake_sdk([["34331"]])
     try:
         cam = _cam()
         cam._preview_wanted = True
         cam._run(("begin_scan",))
-        sess = cam._sess
-        assert cam.state() == "held" and sess.cam.arm_calls == 1
+        scan_sess = cam._sess
+        assert cam.state() == "held" and scan_sess.single_frame is True
+
         cam._run(("end_scan",))
-        assert cam._hold == 0 and cam._sess is sess, "预览要着就别收会话"
-        assert sess.cam.disarm_calls == 0 and sess.cam.arm_calls == 1, "一个会话只 arm 一次"
+        assert cam._hold == 0
+        assert scan_sess.cam.disposed == 1 and scan_sess.sdk.disposed == 1
+        sess = cam._sess
+        assert sess is not None and sess is not scan_sess
+        assert sess.single_frame is False, "预览要连续视频"
+        assert sess.cam.arm_calls == 1
+        assert sess.cam.trigger_calls >= 1, "连续流靠第一发触发起来"
+        assert cam.state() == "preview"
     finally:
+        restore()
+
+
+# ---------------- 单帧触发：扫描严格性的根基 ----------------
+
+def test_single_frame_session_never_auto_triggers():
+    """单帧会话取帧时缺帧**不补触发**（补一发就多一帧，整条对应关系会错位）；连续会话照补。"""
+    cam = _cam()
+    sess = cam._sess = _session(single_frame=True)
+    sess.armed = True
+    assert cam._next_frame(sess) is None
+    assert sess.cam.trigger_calls == 0
+
+    cont = cam._sess = _session()
+    cont.armed = True
+    assert cam._next_frame(cont) is None
+    assert cont.cam.trigger_calls == 1
+
+
+def test_begin_scan_rolls_back_hold_when_the_session_cannot_be_built():
+    """扫描接手建不起会话：_hold 要回到 0，别把"相机归扫描用"永远挂在身上。"""
+    restore = _fake_sdk([[]])
+    try:
+        cam = _cam()
+        try:
+            cam._run(("begin_scan",))
+        except CameraError:
+            pass
+        else:
+            raise AssertionError("没设备时 begin_scan 必须失败")
+        assert cam._hold == 0, cam._hold
+        assert cam._sess is None
+    finally:
+        restore()
+
+
+def test_reopen_and_actions_are_refused_while_scan_holds():
+    """扫描持有期间重开/开预览/保存一律拒绝 —— 重开会把单帧会话换成连续流，严格性静默消失。"""
+    cam = _cam()
+    sess = cam._sess = _session(single_frame=True)
+    cam._hold = 1
+    for job in (("reopen", 0.0), ("preview", True, 0.0), ("save",)):
+        try:
+            cam._run(job)
+        except CameraInputError as exc:
+            assert "扫描进行中" in str(exc), (job, exc)
+        else:
+            raise AssertionError(f"扫描持有期间不许 {job[0]}")
+    assert cam._sess is sess, "拒绝的是动作，不是会话"
+    assert sess.cam.disposed == 0
+
+
+def test_mode_mismatch_keeps_the_session():
+    """别的动作来要"连续模式"、而当前是扫描的单帧会话：只拒绝，**不许把扫描会话丢掉**。"""
+    cam = _cam()
+    sess = cam._sess = _session(single_frame=True)
+    try:
+        cam._ensure_session(0.0)
+    except CameraInputError as exc:
+        assert "触发模式" in str(exc), exc
+    else:
+        raise AssertionError("模式不符时必须拒绝")
+    assert cam._sess is sess, "模式不符是输入错误，不是会话坏了"
+
+
+def test_trigger_mode_readback_failure_rejects_the_session():
+    """触发模式写不进去就别拿这个会话去扫描 —— 严格性只靠这一个设置。"""
+    restore = _fake_sdk([["34331"]])
+    try:
+        _Cam.ignore_trigger_mode_write = True
+        cam = _cam()
+        try:
+            cam._ensure_session(0.0, single_frame=True)
+        except CameraError as exc:
+            assert "触发模式没设上" in str(exc), exc
+        else:
+            raise AssertionError("读回不一致时必须拒绝")
+        assert cam._sess is None
+        assert _SDK.made and _SDK.made[0].disposed == 1, "建到一半失败要把 SDK 一起收掉"
+    finally:
+        _Cam.ignore_trigger_mode_write = False
         restore()
 
 

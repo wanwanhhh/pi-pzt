@@ -66,6 +66,7 @@ class FakeStage:
 
     def move(self, target: float) -> float:
         self.moves.append(target)
+        self.events.append("move")
         self._target = target
         if target not in self.lost:
             self._position = target
@@ -73,6 +74,9 @@ class FakeStage:
 
     def wait_on_target(self, timeout: float, cancel=None, settle_s: float = 0.0) -> bool:
         self.settle_s.append(settle_s)
+        self.events.append("wait")           # 钉"触发之前必须有一次到位等待"
+        if cancel is not None and cancel():
+            return False                     # 真设备取消即 False，假设备別把它盖掉
         return self.wait_ok
 
     def poll(self) -> StageStatus:
@@ -205,12 +209,15 @@ def test_device_that_skips_the_step_check_keeps_capturing():
         assert round(pts[2]["target_um"], 4) == 12.0, pts[2]
 
 
-def test_trigger_comes_before_the_position_read():
-    """每点：**先触发曝光 → 再读位置 → 取帧**。
+def test_frame_is_taken_before_moving_to_the_next_point():
+    """严格采集的顺序：**到位 → 触发 → 读位置 → 等帧 → 移向下一点 → 触发下一点**。
 
-    两件事一个走 USB、一个走串口，互不相干；串行做就是白等一次曝光（实测 200 ms/点）。
-    并行之后那次读数还落进了这一帧的积分窗，位置与图对得更齐。顺序反了这个收益就没了 ——
-    所以这里把顺序钉死，改顺序会红。
+    - 每发触发都紧跟一次到位等待（先到位，再让曝光开始 —— 曝光整段落在目标上）；
+    - 位置读数在它自己的触发之后；
+    - **取帧在移动之前**：帧交付本身就是「曝光已结束」的硬证明（上机实测触发之后
+      还有一段启动 + 读出延迟），提前移动会动在积分里；
+    - 取帧之后才移动，到位之后才触发下一点。
+    顺序反了任何一条，严格性就不成立，所以这里把顺序钉死。
     """
     with with_temp_store():
         events: list = []
@@ -219,9 +226,88 @@ def test_trigger_comes_before_the_position_read():
         st = run_scan(ScanRequest(start_um=10.0, stop_um=10.4, count=3, settle_ms=0),
                       stage, capture)
         assert st["status"] == "done", st
-        # 开头那次 poll 是 start() 查伺服/行程用的；之后每点就是 trigger → poll → capture
-        assert events[0] == "poll" and events[1:] == ["trigger", "poll", "capture"] * 3, events
         assert capture.triggered == 3, capture.triggered
+        seq = events[1:]          # events[0] 是 start() 查伺服/行程用的 poll
+        trig = [k for k, e in enumerate(seq) if e == "trigger"]
+        poll = [k for k, e in enumerate(seq) if e == "poll"]
+        cap = [k for k, e in enumerate(seq) if e == "capture"]
+        mov = [k for k, e in enumerate(seq) if e == "move"]
+        assert len(trig) == len(poll) == len(cap) == 3, seq
+        assert len(mov) == 4, f"预逼近 + 起点 + 两次点间移动：{seq}"   # i=2 是最后一点
+        for k in trig:
+            assert seq[k - 1] == "wait", f"触发之前没等到位：{seq}"
+        for t, p, c in zip(trig, poll, cap):
+            assert t < p < c, f"位置读数/取帧不在触发之后：{seq}"
+        for i in range(2):
+            assert cap[i] < mov[i + 2], f"还没拿到第 {i} 帧就移动了：{seq}"
+            assert mov[i + 2] < trig[i + 1], f"没到位就触发下一点：{seq}"
+
+
+def test_next_point_not_arrived_keeps_the_point_already_captured():
+    """下一点没到位：已经采到的这一点先入库，整条 failed，不再移动/触发。
+
+    新流水线里第 i 点的帧是在移动到 i+1 之前采的；i+1 没到位时绝不能把已经到手的
+    第 i 点丢掉（旧实现是"先采 i、再移 i+1"，天然就没有这个歧义）。
+    """
+    with with_temp_store():
+        class FailsAt(FakeStage):
+            fail_target = 12.0
+
+            def wait_on_target(self, timeout, cancel=None, settle_s=0.0) -> bool:
+                ok = super().wait_on_target(timeout, cancel, settle_s)
+                return ok and self._target != self.fail_target
+
+        events: list = []
+        stage, capture = FailsAt(events=events), FakeCapture(events=events)
+        st = run_scan(ScanRequest(start_um=10.0, stop_um=14.0, count=5, settle_ms=0),
+                      stage, capture)
+        assert st["status"] == "failed", st
+        assert "第 2/5 点未确认到位" in st["message"], st["message"]
+        assert [c[1] for c in capture.taken] == [0, 1], capture.taken
+        pts = store.get_points(int(st["scan_id"]))
+        assert [p["idx"] for p in pts] == [0, 1], pts
+        # 失败之后不许再触发/取帧
+        assert capture.triggered == 2, capture.triggered
+
+
+def test_pause_after_the_frame_does_not_move_or_trigger_again():
+    """暂停落在「等帧」期间：当前这一帧收下后必须停住 —— 不再移动、不再触发下一点。
+
+    用 capture 里调 scanner.pause() 把时机钉死（不靠 sleep 抢窗口）。这一点正是
+    「暂停期间台子不动、不开始新曝光」的承诺；以前只检查在等帧之前，暂停晚一拍。
+    """
+    with with_temp_store():
+        events: list = []
+        stage, capture = FakeStage(events=events), FakeCapture(events=events)
+        scanner = Scanner(stage, capture)
+        original = capture.capture
+        paused_once = {"done": False}
+
+        def capture_then_pause(scan_id, index, position):
+            shot = original(scan_id, index, position)
+            if not paused_once["done"]:
+                paused_once["done"] = True
+                scanner.pause()
+            return shot
+
+        capture.capture = capture_then_pause        # 实例属性盖住方法：时机确定
+        scanner.start(ScanRequest(start_um=10.0, stop_um=10.4, count=4, settle_ms=0))
+        deadline = time.monotonic() + 5.0
+        while scanner.state()["status"] != "paused" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert scanner.state()["status"] == "paused", scanner.state()
+        moves_at_pause = events.count("move")
+        triggers_at_pause = events.count("trigger")
+        time.sleep(0.2)
+        assert events.count("move") == moves_at_pause, f"暂停后台子又动了：{events}"
+        assert events.count("trigger") == triggers_at_pause, f"暂停后又开始曝光了：{events}"
+
+        scanner.resume()
+        while scanner.state()["status"] in ("running", "paused") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        st = scanner.state()
+        assert st["status"] == "done", st
+        assert len(capture.taken) == 4, capture.taken
 
 
 def test_deviation_inside_half_a_step_is_accepted():

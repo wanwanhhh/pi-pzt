@@ -12,9 +12,11 @@
    （在 Python 里改 `os.environ["PATH"]` 也没用，窗口已经过了。）
    没进 PATH 时本模块**直接拒绝启动并说明原因**，不让上层去猜那个错误码。
 
-2. **SDK 进程内只开一次、退出前只关一次**。每次开/关都会让 CYUSB3 驱动重新枚举
-   USB 设备（Windows 会"叮咚"），而且紧接着的其它进程会撞上 error code 1。
-   所以：预展开一次、采图跟着预展、进程退出才关。
+2. **SDK 与句柄按会话成对开/关：一个会话一次 open、一次 dispose；SDK 是进程级单例**
+   （同一时刻只能有一个实例）。开一次会话实测 0.8~2.7 s，比采一帧贵得多，所以只在
+   使用窗口开始/结束时做：预览开着就留着、扫描期间留着、一次性动作做完就整个收掉；
+   **绝不每帧、每点开关**。开/关时 Windows 可能"叮咚"一声、紧接着的其它进程会撞
+   error code 1（"已被占用"那句会误导人，见 E2/E6）。
 
 3. **增益和曝光都是掉电保持的**，进程退出后相机记着上次的值。每次连接都要显式写、
    并读回确认，绝不能假设默认值。踩过：上个脚本把增益拉到 480 档没还原，之后几轮
@@ -29,9 +31,19 @@
    第二轮之后相机一帧都不再出（1.4 s 后被判"没出新帧"，会话丢掉）；只做一轮则安然无恙。
    设置写与取帧都不是必要条件 —— 两轮 arm 里一个设置不写、一帧不取，照样停摆。
    所以：设置只在**会话出生时**写一次（`_open_session` → `_apply`），arm 只在**第一次要帧时**
-   做一次（`_ensure_armed`）；此后预览 / 手动保存 / 扫描共用这**一条连续流**，谁都不再动相机。
+   做一次（`_ensure_armed`）；此后**预览与手动保存**共用这条连续流（扫描另用单帧会话，见第 6 条），
+   谁都不再动相机。
    （旧代码正是在这条上翻车：手动保存走"disarm → 改设置 → arm → 取帧 → 再 disarm → 改回来 →
    再 arm"，于是每点一次「保存原生帧」，预览就死一次。）
+
+6. **扫描用「一次触发一帧」的会话，预览用「一次触发一段连续视频」的会话，两者不共用。**
+   `frames_per_trigger_zero_for_unlimited` 是会话级设置（0 = 连续视频，1 = 一帧/触发），
+   只能在会话出生时写；arm 之后要改它就等于重新 arm —— 正是第 5 条会停摆的操作。所以
+   扫描接手时把预览会话丢掉、按单帧模式重开，交还时再丢掉、按连续模式重开
+   （open/dispose 是允许的，见 E9；每次扫描各多约 1 s）。
+   **单帧会话 arm 之后不预触发**：每点在「到位 + 稳定延时」之后由扫描自己发触发，
+   触发就是积分起点 —— 这是"整段曝光都落在到位位置"的唯一保证。取帧路径也不再为空队列
+   自动补触发：单帧会话里多发一发就是多一帧，会把"一点一帧"的对应关系打乱。
 """
 from __future__ import annotations
 
@@ -167,7 +179,7 @@ class _Session:
     `(200001, 29184, -200000, 1)` 这种值毒死 ROI 缓存的）。
     """
 
-    def __init__(self, sdk, cam, serial: str, roi: tuple) -> None:
+    def __init__(self, sdk, cam, serial: str, roi: tuple, single_frame: bool = False) -> None:
         self.sdk = sdk
         self.cam = cam
         self.serial = serial
@@ -185,6 +197,9 @@ class _Session:
         self.last_frame_at = 0.0
         self.frames_expected_since = 0.0   # 从这一刻起"应该出帧"（见 _expect_frames_from_now）
         self.opened_at = time.time()
+        # 触发模式（会话级设置，见文件头第 6 条）：False = 连续视频（预览），
+        # True = 一次触发一帧（扫描）。它决定 arm 后要不要预触发、取帧缺帧能不能补触发。
+        self.single_frame = single_frame
 
 
 class ThorlabsCamera:
@@ -330,25 +345,26 @@ class ThorlabsCamera:
         return self._submit(("reopen", wait_s), timeout=TL_OPEN_TIMEOUT_S + wait_s)
 
     def begin_scan(self, timeout: float = TL_OPEN_TIMEOUT_S + TL_SCAN_OPEN_WAIT_S) -> dict:
-        """扫描接手相机：持有会话、预览让位、**把采图设置配好并 arm 起来**（状态变 held）。
+        """扫描接手相机：持有会话、预览让位、按**单帧触发**模式建会话并 arm（状态变 held）。
 
-        配置只在这里做一次：全幅 + 采图曝光 + 增益，然后 arm。之后每点只有
-        「补一发软触发 → 取帧」—— 从前每点都 disarm/配置/arm 一遍，实测那一段要 ~585 ms，
-        而预览那条路早就证明"arm 一次、每帧补触发"是可行的（全幅 34.8 fps）。
+        预览是"一次触发一段连续视频"的会话，扫描是"一次触发一帧"的会话；触发模式是
+        会话级设置，arm 之后不能改（文件头第 5 条），所以这里把预览会话丢掉、按单帧
+        模式重开（约 800 ms，一次扫描只付一次）。arm 之后**不预触发**：每点由扫描在
+        「到位 + 稳定」之后自己触发，触发就是这一帧曝光的起点。
         """
         self._ensure_thread()
         return self._submit(("begin_scan",), timeout=timeout)
 
     def end_scan(self, timeout: float = TL_OPEN_TIMEOUT_S) -> dict:
-        """扫描交还相机：还想要预览就接着取帧，不要就把会话收掉。"""
+        """扫描交还相机：丢掉单帧会话；预览还要着就按连续模式重开并接着出帧。"""
         self._ensure_thread()
         return self._submit(("end_scan",), timeout=timeout)
 
     def trigger(self) -> None:
-        """补一发软触发：**曝光从这一刻开始**。
+        """发一发软触发：**单帧会话里曝光从这一刻开始**（扫描在到位 + 稳定之后调它）。
 
-        scanner 在读到位置之前先调它，于是那次串口读数（~60 ms）落在曝光窗里，
-        不另占时间。相机没 arm 就现 arm（幂等），会话没了就抛 —— 扫描中相机出错整条 failed。
+        连续会话（预览）里它是"补一发、别停流"；单帧会话里它就是这一帧的起点。
+        相机没 arm 就现 arm（幂等），会话没了就抛 —— 扫描中相机出错整条 failed。
         """
         self._ensure_thread()
         self._submit(("trigger",), timeout=TL_CAPTURE_TIMEOUT_S)
@@ -356,8 +372,10 @@ class ThorlabsCamera:
     def capture(self, scan_id: int, index: int, position_um: float) -> tuple[Optional[str], Optional[int]]:
         """取这一点的帧（触发由 trigger() 发过）并存 16 位 PNG。
 
+        单帧扫描里的调用时机是「触发之后、移动之前」：等这一帧交付（帧到手就是曝光结束的
+        证明），取帧 + 落盘做完才移动。单帧会话取帧时**不补触发**，所以这里拿到的永远是
+        "这一发触发对应的那一帧"。
         返回 (相对 DATA_DIR 的路径, 这一帧采图时相机上的曝光 µs)。
-        走的是 ccd.Capture 契约，scanner 不关心这里怎么实现。
         """
         self._ensure_thread()
         job = ("capture", scan_id, index, position_um)
@@ -417,6 +435,9 @@ class ThorlabsCamera:
         kind = job[0]
         if kind == "preview":
             on, wait_s = bool(job[1]), float(job[2])
+            if on and self._hold:
+                # HTTP 侧的 409 在任务入队之前判，与这里之间还有窗口；门要放在线程里。
+                raise CameraInputError("扫描进行中，相机归扫描用；先暂停或中止再看预览")
             self._preview_wanted = on
             if on:
                 sess = self._ensure_session(wait_s)
@@ -427,6 +448,10 @@ class ThorlabsCamera:
                 self._discard("预览已停", failed=False)   # 窗口结束：会话收掉
             return self.status()
         if kind == "reopen":
+            if self._hold:
+                # 扫描持有期间重开 = 把单帧会话换成连续会话，严格性会**静默**消失。
+                # 门放在线程里：HTTP 的 409 与任务入队之间仍有窗口（见 test）。
+                raise CameraInputError("扫描进行中，相机归扫描用；先暂停或中止再重连相机")
             wait_s = float(job[1])
             log.info("重开相机（手动）：丢掉会话（句柄 + SDK）再建；上次失败：%s",
                      self._failure or "无")
@@ -441,37 +466,58 @@ class ThorlabsCamera:
             return self.status()
         if kind == "begin_scan":
             self._hold += 1
-            reusing = self._sess is not None
-            t0 = time.perf_counter()
-            sess = self._ensure_session(TL_SCAN_OPEN_WAIT_S)
-            self._ensure_armed(sess)
-            # 不用清帧队列：实测（tools/thorlabs_stream_probe.py backlog）停取帧 3 s 之后队列里仍是 0 帧 ——
-            # 没人取帧时驱动直接丢帧，不攒；所以接手后第一帧本来就是新的，位置与图不会错配。
-            log.info("扫描接手相机：%s（%.0f ms，%dx%d）—— 之后每点只补触发",
-                     "接着用预览那条流" if reusing else "新建会话",
+            old = self._sess
+            try:
+                if old is not None and not old.single_frame:
+                    # 预览那条连续流不能拿来扫描：触发模式是会话级设置，arm 之后不能改
+                    # （改它就要重新 arm，正是文件头第 5 条的停摆条件）。丢掉重建。
+                    self._discard("扫描接手：改用单帧触发会话", failed=False)
+                t0 = time.perf_counter()
+                sess = self._ensure_session(TL_SCAN_OPEN_WAIT_S, single_frame=True)
+                self._ensure_armed(sess)
+            except Exception:
+                self._hold = max(0, self._hold - 1)   # 建不起来别把「扫描持有」留在 1
+                raise
+            log.info("扫描接手相机：%s（%.0f ms，%dx%d，触发=单帧）—— 每点到位后再触发",
+                     "接着用现成的单帧会话"
+                     if old is not None and old.single_frame else "新建单帧会话",
                      1000 * (time.perf_counter() - t0), sess.roi[2], sess.roi[3])
             return self.status()
         if kind == "end_scan":
             self._hold = max(0, self._hold - 1)
             sess = self._sess
             if sess is not None and not self._hold:
-                if self._preview_wanted:
+                if sess.single_frame:
+                    # 单帧会话交不回预览：预览要连续视频，改触发模式必须重新 arm（第 5 条）。
+                    # 丢掉重建 —— 每次扫描收尾固定多付约 1 s，换来「触发 = 曝光起点」。
+                    self._discard("扫描结束：单帧会话收工", failed=False)
+                    if self._preview_wanted:
+                        sess = self._ensure_session(TL_SCAN_OPEN_WAIT_S)
+                        self._ensure_armed(sess)
+                        self._expect_frames_from_now(sess)
+                        self._pump(sess)
+                elif self._preview_wanted:
                     # 交还给预览：新鲜度**从现在重新起算**。扫描期间没人取帧（相机归扫描），
                     # 那段时间不该算进"预览没出新帧"—— 不刷新的话扫描一结束就会立刻被判掉线。
                     self._expect_frames_from_now(sess)
                 else:
                     # 没人要预览：使用窗口结束，会话（句柄 + SDK）一起收掉。
-                    # **不 disarm**：这台相机 disarm 之后再 arm 会让出帧停摆（文件头第 5 条），
-                    # 而"用过就丢、下个会话重建"本来就更省心（重建 ~800 ms，只在人再点预览时付）。
                     self._discard("扫描结束、没人要预览", failed=False)
             return self.status()
         if kind == "trigger":
             sess = self._sess
             if sess is None:
                 raise CameraError("相机没有会话（掉线？）—— 扫描中止")
+            if self._hold and not sess.single_frame:
+                # 扫描期拿到连续会话说明会话被换掉了：宁可直接失败，也不静默采到
+                # 「曝光早于到位」的那一帧。
+                raise CameraError("扫描会话不是单帧触发模式 —— 本次扫描中止")
             self._fire(sess)
             return None
         if kind == "capture":
+            sess = self._sess
+            if sess is not None and self._hold and not sess.single_frame:
+                raise CameraError("扫描会话不是单帧触发模式 —— 本次扫描中止")
             return self._grab_frame(*job[1:])
         if kind == "exposure":
             exposure_us = int(job[1])
@@ -499,6 +545,9 @@ class ThorlabsCamera:
             self._rotation = _norm_rotation(int(job[1]))   # 输入校验：非法值抛 CameraInputError
             return self.status()
         if kind == "save":
+            if self._hold:
+                # 单帧会话里抢一帧会把扫描的「一点一帧」对应关系打乱。
+                raise CameraInputError("扫描进行中，相机归扫描用；先暂停或中止再保存原生帧")
             # 「保存原生帧」= 从**当前这条流**里取一帧，图像由调用方写盘（见 save_raw）。
             # 不重配、不 disarm、不重新 arm：设置是会话出生时写好的那一套，预览 / 保存 / 扫描
             # 共用同一条连续流 —— 预览中途保存因此不会打断预览（文件头第 5 条）。
@@ -516,29 +565,40 @@ class ThorlabsCamera:
         raise CameraInputError(f"未知相机任务 {kind!r}")
 
     # ------------------------------------------------------------ 会话
-    def _ensure_session(self, wait_s: float = 0.0) -> _Session:
+    def _ensure_session(self, wait_s: float = 0.0, single_frame: bool = False) -> _Session:
         """拿到当前会话；没有就建一个（唯一建会话的地方）。
 
         wait_s > 0：等设备出现（最多这么久）再放弃 —— 拔插之后 USB 要重新枚举，人手刚插上
         就点按钮时第一次枚举不到不代表相机不在。
+
+        single_frame：要哪种触发模式（见文件头第 6 条）。**模式是会话级设置**，现有会话
+        模式不符时直接报错而不是悄悄改 —— 改它要重新 arm（第 5 条会停摆），调用方
+        （begin_scan / end_scan）负责先把旧会话丢掉。
         """
         if self._sess is not None:
+            if self._sess.single_frame != single_frame:
+                # 用**输入错误**：调用方要的是另一种模式，现有会话（可能正被扫描用）不可信吗？
+                # 不 —— 它只是模式不符，不能因此把正在跑的扫描会话丢掉（_after_job_error 只留
+                # CameraInputError 的会话）。扫描的 begin/end 会先显式丢弃旧会话再来这里。
+                raise CameraInputError(
+                    "相机会话的触发模式与请求不一致（应先丢弃旧会话再按目标模式重开）")
             return self._sess
         self._opening = True
         try:
-            sess = self._open_session(wait_s)
+            sess = self._open_session(wait_s, single_frame)
         finally:
             self._opening = False
         self._sess = sess
         self._failure = ""             # 建起来了：上一次的失败不再是当前状态
         return sess
 
-    def _open_session(self, wait_s: float) -> _Session:
+    def _open_session(self, wait_s: float, single_frame: bool = False) -> _Session:
         """建一个新会话：SDK 实例 + 相机句柄 + **把这一套设置写进去**（文件头第 5 条）。
 
-        **SDK 只建一次**：它是进程级单例，建第二个会抛 "TLCameraSDK is already in use"
-        （旧代码在重试循环里反复 new，于是第一次 discover 为空之后就永远失败、还报成
-        「打不开相机 SDK…确认 ThorCam 已关闭」）。等设备只用重跑 discover。
+        **同一时刻只能有一个 SDK 实例**：它是进程级单例，建第二个会抛
+        "TLCameraSDK is already in use"（旧代码在重试循环里反复 new，于是第一次 discover
+        为空之后就永远失败、还报成「打不开相机 SDK…确认 ThorCam 已关闭」）。
+        等设备只用重跑 discover。
 
         设置写在这里、而不是"用的时候再配"：这台相机只要在流跑着的时候 disarm + 重写设置 +
         再 arm，连续出帧就停摆（文件头第 5 条的实测）。会话出生时还没有 arm、没有触发，
@@ -560,9 +620,9 @@ class ThorlabsCamera:
                 time.sleep(0.5)     # 等它枚举出来
             serial = serials[0]
             cam = sdk.open_camera(serial)
-            cam.frames_per_trigger_zero_for_unlimited = 0
+            self._set_trigger_mode(cam, single_frame)
             cam.image_poll_timeout_ms = 2000
-            sess = _Session(sdk, cam, serial, self._roi)
+            sess = _Session(sdk, cam, serial, self._roi, single_frame)
             t_cfg = time.perf_counter()
             self._apply(sess)
         except BaseException:
@@ -573,6 +633,23 @@ class ThorlabsCamera:
                  sess.model, sess.serial, 1000 * (t_cfg - t0),
                  1000 * (time.perf_counter() - t_cfg))
         return sess
+
+    @staticmethod
+    def _set_trigger_mode(cam, single_frame: bool) -> None:
+        """写触发模式并读回确认 —— **只能在 arm 之前**（会话出生时，见文件头第 6 条）。
+
+        连续模式（0）是预览那条连续流的生命线；扫描要的是「一次触发一帧」（1），
+        这样「触发 = 曝光起点」才成立，扫描才能保证整段积分都落在到位位置。
+        写不进去（读回不一致）就别拿这个会话去扫描：严格性靠的就是这一个设置，
+        不能"大概设上了"。
+        """
+        want = 1 if single_frame else 0
+        cam.frames_per_trigger_zero_for_unlimited = want
+        got = int(cam.frames_per_trigger_zero_for_unlimited)
+        if got != want:
+            raise CameraError(
+                f"触发模式没设上：要 {want}（{'一帧/触发' if want else '连续视频'}），"
+                f"相机读回 {got} —— 这个会话不能拿去扫描")
 
     def _teardown(self, sdk, cam=None) -> None:
         """关掉句柄与它用的 SDK 实例 —— **两个都要关**（丢弃会话、建到一半失败共用这条路）。
@@ -685,29 +762,38 @@ class ThorlabsCamera:
     def _ensure_armed(self, sess: _Session) -> None:
         """要帧就得 arm —— **一个会话最多 arm 一次**（文件头第 5 条）。
 
-        arm 过就一直是 arm 的：此后不再 disarm、不再重写设置，预览 / 手动保存 / 扫描共用
-        这**一条连续流**。`arm()` 会顺手清空帧队列（SDK 文档），所以"再 arm 一次"看着无害，
+        arm 过就一直是 arm 的：此后不再 disarm、不再重写设置，**预览与手动保存**共用
+        这条连续流（扫描另用单帧会话，文件头第 6 条）。`arm()` 会顺手清空帧队列（SDK 文档），所以"再 arm 一次"看着无害，
         实际会让这台相机彻底不再出帧 —— 实测见文件头第 5 条。
         """
         if not sess.armed:
             self._arm(sess)
 
     def _arm(self, sess: _Session) -> None:
-        """冷会话的第一次（也是唯一一次）进入连续出帧：arm + 第一发软触发。"""
+        """冷会话的第一次（也是唯一一次）arm。
+
+        连续会话（预览）arm 完顺手补一发触发进入视频流；**单帧会话不预触发** ——
+        每一帧都要等扫描在「到位 + 稳定」之后自己触发。arm 时就触发的话，会有一帧
+        在扫描还没走到起点时就开始曝光，第一个点拿到的是它（旧实现首点半帧的来历）。
+        """
         sess.cam.arm(2)
-        sess.cam.issue_software_trigger()
-        sess.last_trigger = time.monotonic()
+        if not sess.single_frame:
+            sess.cam.issue_software_trigger()
+            sess.last_trigger = time.monotonic()
         sess.armed = True
 
     def _fire(self, sess: _Session) -> None:
-        """补一发软触发。扫描路径在**读位置之前**调它，让那次串口读数落进曝光窗（A7）。
+        """发一发软触发。扫描路径在**读位置之前**调它，让那次串口读数落进曝光窗（A7）。
 
-        冷会话（还没 arm）由这里补上 arm；连续出帧时多发几发触发是无害的
+        冷会话（还没 arm）由这里补上 arm：连续会话 arm 里已经带了一发触发（直接返回）；
+        **单帧会话 arm 不触发（第 6 条），所以这里必须照发这一发** —— 它就是这一帧的
+        曝光起点，吞掉的话第一点永远等不到帧。连续出帧时多发几发是无害的
         （SDK 文档：disarm 之前可以发多次）。
         """
         if not sess.armed:
             self._arm(sess)
-            return
+            if not sess.single_frame:
+                return
         sess.cam.issue_software_trigger()
         sess.last_trigger = time.monotonic()
 
@@ -720,10 +806,15 @@ class ThorlabsCamera:
         sess.frames_expected_since = time.monotonic()
 
     def _next_frame(self, sess: _Session):
-        """拿一帧（uint16，是临时缓冲，调用方要用就得自己 copy）。"""
+        """拿一帧（uint16，是临时缓冲，调用方要用就得自己 copy）。
+
+        连续会话没帧就补一发触发（预览靠它起流、续流）；**单帧会话不补** ——
+        一发触发对应一帧，补一发就多出一帧，之后每个点都会错位取到上一点的那帧。
+        """
         frame = sess.cam.get_pending_frame_or_null()
         if frame is None:
-            sess.cam.issue_software_trigger()      # 触发丢了或缓冲空了，补一发
+            if not sess.single_frame:
+                sess.cam.issue_software_trigger()
             return None
         return frame
 

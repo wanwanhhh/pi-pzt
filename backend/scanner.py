@@ -21,7 +21,7 @@ from .config import (
     SOFT_LIMIT_MARGIN,
 )
 from .models import ScanRequest
-from .stage_api import StageAborted, StageProto
+from .stage_api import StageAborted, StageProto, StageStatus
 
 log = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ class Scanner:
         return dict(self._state)
 
     def pause(self) -> dict[str, Any]:
-        """暂停：循环在点边界停下，台子保持原位。"""
+        """暂停：当前这一帧采完后停住 —— 不再移动、不再开始新曝光，台子留在当时的位置。"""
         return self._set_paused(True)
 
     def resume(self) -> dict[str, Any]:
@@ -137,40 +137,37 @@ class Scanner:
         try:
             # 相机归扫描用（预览让位、会话保持到扫描结束）：什么时候算结束只有这里知道，
             # 所以持有/交还由扫描器显式说 —— 不靠「空闲多久」之类的计时器去猜。
+            # begin() 建的是**单帧触发**会话：之后每一发触发就是一次曝光的起点。
             self._capture.begin()
             self._approach_start(req, step, settle_s)
+
+            moved_at = 0.0       # 这一点的移动时刻（耗时口径的起点）
+            paused_s = 0.0       # 移动之后、触发之前的暂停（从这一点的耗时里扣掉）
             for i in range(req.count):
-                self._resume.wait()
-                if self._abort.is_set():
-                    status, message = "aborted", f"已中止于第 {i}/{req.count} 点"
-                    break
                 target = req.start_um + step * i
-                t0 = time.monotonic()
-                self._stage.move(target)
-                # 等待与判到位都归设备层：PI 等 ONT 信号 + 稳定延时；XMT 只等满稳定延时
-                # （不读回、不判任何东西）。上层只要「到位 / 超时 / 中止」这一个结论。
-                if not self._stage.wait_on_target(
-                    ON_TARGET_TIMEOUT_S,
-                    cancel=self._abort.is_set,
-                    settle_s=settle_s,
-                ):
-                    if self._abort.is_set():
-                        status, message = "aborted", f"已中止于第 {i}/{req.count} 点"
-                    else:
-                        # 没到位就不能采图、不能继续：宁可不跑，也不能入库错点。
-                        # 文案不提「多少秒」：PI 是超时（10 s），XMT 是等满延时后读回超差，
-                        # 两者的时间含义不同，说成超时会把用户引去查信号/通讯。
-                        pos = self._stage.status().position
-                        status = "failed"
-                        message = (f"第 {i}/{req.count} 点未确认到位"
-                                   f"（目标 {target:.4f} µm，读数 {pos:.4f} µm）")
-                        log.error("扫描 %s %s", scan_id, message)
-                    break
-                # **先让相机开始曝光，再读位置**：一个走 USB、一个走串口，本来就互不相干，
-                # 串行做就是白等一次曝光（实测 200 ms/点）。并行之后那次读数还落进了这一帧
-                # 的积分窗，位置与图对得更齐（从前读数比帧早 ~250 ms）。
-                self._capture.trigger()
-                # 这一读就是**采集时的位置**，连同命令值一起入库（点位表能看到实际间距）。
+                if i == 0:
+                    # 第 0 点：走到起点、等稳定，**然后才触发**（曝光从这一刻开始）。
+                    ok, _ = self._wait_boundary()
+                    if not ok:
+                        status, message = "aborted", f"已中止于第 0/{req.count} 点"
+                        break
+                    self._stage.move(target)
+                    moved_at = time.monotonic()
+                    # 等待与判到位都归设备层：PI 等 ONT 信号 + 稳定延时；XMT 只等满稳定延时
+                    # （不读回、不判任何东西）。上层只要「到位 / 超时 / 中止」这一个结论。
+                    if not self._stage.wait_on_target(
+                        ON_TARGET_TIMEOUT_S,
+                        cancel=self._abort.is_set,
+                        settle_s=settle_s,
+                    ):
+                        if self._abort.is_set():
+                            status, message = "aborted", f"已中止于第 0/{req.count} 点"
+                        else:
+                            status, message = self._not_arrived(scan_id, i, req, target)
+                        break
+                    self._capture.trigger()
+
+                # 这一读就是**采集时的位置**（触发之后），连同命令值一起入库。
                 # XMT 上它还是唯一能事后看出丢帧的东西（我们不做判据了，见下面那条）。
                 st = self._stage.poll()
                 if not st.on_target:
@@ -191,16 +188,49 @@ class Scanner:
                                f"设点可能丢了，或台子没走到")
                     log.error("扫描 %s %s", scan_id, message)
                     break
-                # 图片路径与**这一帧的曝光**一起入库：曝光是相机读回值，扫描参数里没有它，
-                # 事后要问"这张图当时用的多少曝光"只能从元数据或 PNG 自己身上查。
+
+                # **等帧到齐再动**。帧交付本身就是「曝光已经结束」的硬证明：上机实测
+                # 触发之后还有一段启动 + 读出延迟（12 ms 曝光也要 91 ms 才见帧），按
+                # 「触发 + 曝光」去算什么时候能移动，会动在积分里。慢一点，但严格。
                 shot = self._capture.capture(scan_id, i, st.position)
-                store.add_point(
-                    scan_id, i, target, st.position,
-                    (time.monotonic() - t0) * 1000.0, st.on_target, st.settle_source,
-                    shot.path, shot.exposure_us,
-                )
-                with self._lock:
-                    self._state.update(index=i + 1, target_um=target, actual_um=st.position)
+
+                if i + 1 < req.count:
+                    # 点边界（帧已到手）：暂停/中止在这里生效 —— 台子不再动，也不会有
+                    # 挂着的未取帧（暂停期间单帧会话里什么都不欠）。
+                    ok, _ = self._wait_boundary()
+                    if not ok:
+                        self._store_point(scan_id, i, target, st, moved_at, paused_s, shot)
+                        status, message = "aborted", f"已中止于第 {i}/{req.count} 点"
+                        break
+                    next_target = req.start_um + step * (i + 1)
+                    self._stage.move(next_target)
+                    next_moved_at = time.monotonic()
+                    if not self._stage.wait_on_target(
+                        ON_TARGET_TIMEOUT_S,
+                        cancel=self._abort.is_set,
+                        settle_s=settle_s,
+                    ):
+                        # 第 i 点已经采到，帧是好的：先入库再报错（不丢有效数据）。
+                        self._store_point(scan_id, i, target, st, moved_at, paused_s, shot)
+                        if self._abort.is_set():
+                            status, message = "aborted", f"已中止于第 {i}/{req.count} 点"
+                        else:
+                            status, message = self._not_arrived(scan_id, i + 1, req, next_target)
+                        break
+                    # 到位之后、触发之前：暂停/中止在这里生效 —— 不再开始新曝光。
+                    ok, next_paused = self._wait_boundary()
+                    if not ok:
+                        self._store_point(scan_id, i, target, st, moved_at, paused_s, shot)
+                        status, message = "aborted", f"已中止于第 {i}/{req.count} 点"
+                        break
+                    # 到位之后才触发下一点：曝光整段都落在目标位置。
+                    self._capture.trigger()
+                else:
+                    next_moved_at, next_paused = moved_at, 0.0
+
+                self._store_point(scan_id, i, target, st, moved_at, paused_s, shot)
+                moved_at = next_moved_at
+                paused_s = next_paused
             else:
                 status, message = "done", f"完成 {req.count} 点"
         except StageAborted:
@@ -225,6 +255,56 @@ class Scanner:
             log.info("扫描 %s 结束：%s %s", scan_id, status, message)
 
     # ---------------------------------------------------------------- 内部
+    def _wait_boundary(self) -> tuple[bool, float]:
+        """点边界：暂停就停在这里（台子不动、不开始新曝光）。
+
+        返回 (是否继续, 等了多久秒)。中止时返回 (False, 已等)；等了多久用来从
+        该点的「耗时」里扣掉暂停时间（暂停不是采集开销）。
+
+        只在两个位置调用：**帧到手之后**（移动之前）与**到位之后、触发之前**。
+        所以暂停期间单帧会话里没有挂着的未取帧 —— 不会因为暂停把这一帧晾丢。
+        """
+        if self._abort.is_set():
+            return False, 0.0
+        if self._resume.is_set():
+            return True, 0.0
+        t0 = time.monotonic()
+        while not self._resume.is_set():
+            if self._abort.is_set():
+                return False, time.monotonic() - t0
+            self._resume.wait(0.05)
+        return True, time.monotonic() - t0
+
+    def _not_arrived(self, scan_id: int, i: int, req: ScanRequest,
+                     target: float) -> tuple[str, str]:
+        """没确认到位：不采图、不继续（宁可不跑，也不能入库错点）。
+
+        文案不提「多少秒」：PI 是超时（10 s），XMT 是等满延时后读回超差，
+        两者的时间含义不同，说成超时会把用户引去查信号/通讯。
+        """
+        pos = self._stage.status().position
+        status = "failed"
+        message = (f"第 {i}/{req.count} 点未确认到位"
+                   f"（目标 {target:.4f} µm，读数 {pos:.4f} µm）")
+        log.error("扫描 %s %s", scan_id, message)
+        return status, message
+
+    def _store_point(self, scan_id: int, i: int, target: float, st: StageStatus,
+                     moved_at: float, paused_s: float, shot) -> None:
+        """把第 i 点的帧入库/进状态（帧已经采到、写盘也在 capture 里做完了）。
+
+        **耗时口径** = 从**这一次移动**到这一帧落盘，扣掉移动之后、触发之前的暂停。
+        它包含「移动 + 稳定 → 触发 → 等帧交付」整段，首点/末点同一口径；其中
+        「触发→帧交付」是相机固定延迟，所以一定大于曝光 —— 严格采集的代价在这里。
+        """
+        duration_ms = max(0.0, (time.monotonic() - moved_at - paused_s) * 1000.0)
+        store.add_point(
+            scan_id, i, target, st.position, duration_ms, st.on_target, st.settle_source,
+            shot.path, shot.exposure_us,
+        )
+        with self._lock:
+            self._state.update(index=i + 1, target_um=target, actual_um=st.position)
+
     def _approach_start(self, req: ScanRequest, step: float, settle_s: float) -> None:
         """先退到起点外侧再逼近，让首点与后续点从同一侧过来。
 
