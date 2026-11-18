@@ -441,6 +441,7 @@
           <button id="data-tab-filt" class="tab" role="tab" aria-selected="false">滤波曲线</button>
           <button id="data-tab-map" class="tab" role="tab" aria-selected="false">相位图</button>
           <button id="data-tab-align" class="tab" role="tab" aria-selected="false">强度对齐</button>
+          <button id="data-tab-line" class="tab" role="tab" aria-selected="false">线包络</button>
         </span>
         <span id="data-tab-note">这个像素随扫描位置怎么变</span>
       </p>
@@ -502,6 +503,7 @@
           <h2><span class="sub" id="spec-title">未取数</span>
             <span class="sub" id="spec-xpin" hidden>频率范围已钉住</span>
             <span class="sub" id="spec-ypin" hidden>纵轴范围已钉住</span>
+            <span class="sub" id="spec-radpin" hidden>相位范围已钉住</span>
           </h2>
           <div class="right">
             <button id="btn-spec-axis" class="ghost"
@@ -534,13 +536,23 @@
             <option value="4" selected>4×</option>
             <option value="8">8×</option>
           </select>
-          <span class="tsep"></span>
+        </div>
+        <div class="tools">
           <label class="mini" for="spec-ymin" id="spec-ymin-k">功率最小 (ADU²)</label>
           <input id="spec-ymin" class="mini" type="number" step="any">
           <label class="mini" for="spec-ymax" id="spec-ymax-k">功率最大 (ADU²)</label>
           <input id="spec-ymax" class="mini" type="number" step="any">
           <button id="btn-spec-yfit" class="ghost"
                   title="按这条谱把纵轴铺满；滚轮/拖动改过的范围也用它复位">自动范围</button>
+          <span class="tsep"></span>
+          <label class="mini" for="spec-radmin">相位最小 (rad)</label>
+          <input id="spec-radmin" class="mini" type="number" step="any"
+                 title="右边那条相位轴的显示范围：填了就是它（钉住），留空 = 按门限内那些谱线自己铺满。**只改画法** —— 相位本身、导出、滤波、波段一个数都不动，画到窗外的照旧算、只是看不见。它按**整条**谱算：缩放、平移频率轴都不带动它（两个窗口的相位才能直接对看）。">
+          <label class="mini" for="spec-radmax">相位最大 (rad)</label>
+          <input id="spec-radmax" class="mini" type="number" step="any"
+                 title="同上。填反了或只填一个 = 不套用（框留着等人改完，图上不动），与频率、功率那两对同一个规矩。">
+          <button id="btn-spec-radfit" class="ghost"
+                  title="相位轴松钉：按门限内整条相位重新铺满（两个框重新填上数）">自动范围</button>
           <span class="tsep"></span>
           <label class="mini" for="spec-phmin">相位门限 (dB)</label>
           <input id="spec-phmin" class="mini" type="number" step="any" value="-20"
@@ -596,8 +608,10 @@
           相位与频率刻度是同一套：换频率/波长轴时它跟着一起换，不重新取数、也不重算谱；
           <b>换位置口径（折算 µm ↔ 读回原值）它一动不动</b> —— 谱按物理时间算，两种口径下是同一张谱，
           口径只换像素曲线 / 滤波曲线的横轴刻度。
-          右边这条轴<b>只有自动范围</b>（没有范围框、也不吃滚轮/拖动）—— 它按门限内那些谱线自己铺满
-          （整条；缩放、平移都不带动它，所以两个窗口的相位能直接对看）。
+          右边这条轴<b>也能钉住</b>：<b>相位最小 / 最大</b>两格，填了就是它、留空就按门限内那些谱线
+          自己铺满（「自动范围」松钉）—— 与频率、功率那两对同一个规矩。它按<b>整条</b>算：缩放、平移
+          都不带动它（所以两个窗口的相位能直接对看），也<b>不吃滚轮/拖动</b> —— 一次拖动不能同时改两根纵轴，
+          手势只管频率与功率。
           <b>「导出这条谱」</b>把这一整条存成一个 CSV（每根一行：频率、波长、功率、dB、相位）：
           与图上那条相位是同一份数，<b>整条导出</b>（可视范围、纵轴 dB、横轴读法都不参与）；
           <b>解不出的谱线与相位门限以下留空</b>（不补 0，与图上断开同一件事）。
@@ -847,6 +861,13 @@
           <label class="mini" for="align-cap">显示上限</label>
           <input id="align-cap" class="mini" type="text" placeholder="99.9% 或数值"
                  title="只改画法：超过上限的按上限画（色标右端就是这个数），统计条报超过多少格。留空 = 不掐（最白还是这张图里最强的那一格）。填 99.9% = 按分位（只有最亮的 0.1% 涂白）；填一个数 = 绝对值（S 的单位）。比最强那一格还大 = 没掐。改它只重画，不重读盘、不重算。">
+          <label class="mini chk-inline" for="align-mask"
+                 title="掩掉亮斑：灰尘/颗粒在图上是一颗十几像素的弥散斑，小窗口判不出来 —— 所以拿它跟「局部背景」（64×64 块的中位数，插值到每个像素）比，超过 N 倍的格子**按邻域填平**（从斑的边缘往里铺，画成与附近同一档灰）并单独计数，不参与「超过上限」。只改画法：数据一个数不动，hover 照实读真值并写出背景。">
+            <input id="align-mask" type="checkbox"> 掩掉亮斑
+          </label>
+          <label class="mini" for="align-mask-n">背景倍数</label>
+          <input id="align-mask-n" class="mini" type="number" step="any" min="1" value="4"
+                 title="超过局部背景多少倍算亮斑（默认 4）：调大只掩最强的几颗，调小掩得多。改它只重判一次，不重读盘、不改数据。">
           <span class="hint" id="align-progress">—</span>
         </div>
         <div class="mapbox"><canvas id="align-canvas" width="8" height="8"></canvas></div>
@@ -863,6 +884,7 @@
           <div><dt>直流中位数 (ADU)</dt><dd id="align-dcmed">—</dd></div>
           <div><dt>门限以下</dt><dd id="align-blank">—</dd></div>
           <div><dt>超过上限</dt><dd id="align-over">—</dd></div>
+          <div><dt>亮斑抹平</dt><dd id="align-masked">—</dd></div>
         </dl>
         <p class="hint" id="align-hover">鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。</p>
         <p class="hint" id="align-empty">还没有算。左边选一条扫描，在〈滤波曲线〉那张卡里填好波长范围（就是条纹那一段；留空 = 全通，这里也能算），或勾选「不滤波」（不分波段），再点「算强度对齐」。</p>
@@ -895,6 +917,118 @@
           <b>代价</b>：一遍读盘，与相位图同档；滤波时累加 2K 张图（K = 带内谱线根数），
           超上限会当场拒并说清怎么办；不滤波只累加三张与谱线根数无关的图，所以全幅也不受那个上限约束。
           坐标是<b>保存的 PNG 自己的坐标</b>，裁过的也是这一套。</p>
+      </section>
+
+      <!-- 线包络：固定**一行 y**（画 x-t）或**一列 x**（画 y-t），把这条线上每个位置、每一帧的
+           带通包络 |z| 摆成一张图（横轴位置、纵轴帧），再除以每个位置自己的直流 d^((2n−1)/(2n)) ——
+           分母与强度对齐同一个（n 也照那张卡的口径与下限）。后端一遍读盘交三列
+           （包络 帧×线长、直流 线长、每帧读出位置），所以改 n、门限、上限、色标**只重画**；
+           换波段、换扫描、换那条线才要重算。口径住在 backend/line_envelope.py 的文件头。 -->
+      <section class="card grow" id="card-line" hidden>
+        <div class="head">
+          <h2><span class="sub" id="line-title">未算</span>
+            <span class="sub" id="line-stale" hidden>波段改过，点重算</span>
+          </h2>
+          <div class="right">
+            <button id="btn-line-note" class="ghost" aria-expanded="false"
+                    title="这张图的口径（横轴纵轴各是什么、包络怎么来、分母是什么、代价）—— 点开看，看完收起">说明</button>
+          </div>
+        </div>
+        <div class="tools">
+          <label class="mini" for="line-row">行 y</label>
+          <input id="line-row" class="mini" type="number" step="1" min="0" placeholder="0"
+                 title="固定哪一行：填**像素行号**（原始坐标，裁过的扫描也填原始坐标），再点「算 x-t」—— 横轴是 x、纵轴是帧。">
+          <button id="btn-line-xt" class="primary">算 x-t</button>
+          <span class="tsep"></span>
+          <label class="mini" for="line-col">列 x</label>
+          <input id="line-col" class="mini" type="number" step="1" min="0" placeholder="0"
+                 title="固定哪一列：填**像素列号**（原始坐标），再点「算 y-t」—— 横轴是 y、纵轴是帧。">
+          <button id="btn-line-yt" class="primary">算 y-t</button>
+          <label class="mini chk-inline" for="line-nofilter"
+                 title="不滤波：不做带通、不算解析信号 —— 每个位置先把整条时间序列减掉自己的均值 b = I − d，取绝对值，再除以同一个分母 d^((2n−1)/(2n))。它与「全通」（所有能解出的谱线的包络）不是一回事；勾上时波段不参与，改波段也不用重算。">
+            <input id="line-nofilter" type="checkbox"> 不滤波
+          </label>
+          <span class="tsep"></span>
+          <span class="hint" id="line-band">—</span>
+          <span class="hint" id="line-progress">—</span>
+        </div>
+        <div class="tools">
+          <label class="mini" for="line-n">n</label>
+          <input id="line-n" class="mini" type="number" step="any" min="0.5" value="3"
+                 data-min="0.5"
+                 title="归一化的强度：每个位置除自己的直流，指数是 (2n−1)/(2n)（与强度对齐同一个分母）。n 越大亮度差压得越狠 —— n→∞ 是完全归一化（只剩对比度），n=1/2 是不归一化（就是包络本身）。默认 3。**改它只重画**：后端给的三列与 n 无关。">
+          <label class="mini" for="line-dcmin">直流门限 (dB)</label>
+          <input id="line-dcmin" class="mini" type="number" step="any" value="-40"
+                 title="相对**这条线直流的中位数**多少 dB：直流更小的位置整列不画（涂深灰并计数）。那里的包络除以 d^((2n−1)/(2n)) 会爆炸 —— 那是「算得出却不可复现」，不是当成 0。留空 = 不掐。">
+          <label class="mini" for="line-cap">显示上限</label>
+          <input id="line-cap" class="mini" type="text" placeholder="99.9% 或数值"
+                 title="只改画法：超过上限的按上限画（色标右端就是这个数），统计条报超过多少格。留空 = 不掐（色标右端是这张图里最强的那一格）；填 99.9% = 按分位；填一个数 = 绝对值。改它只重画，不重读盘。">
+          <label class="mini" for="line-cmap">色标</label>
+          <select id="line-cmap" class="mini"
+                  title="只改画法：图上色与图下那条色标读的是**同一份** 256 格表 —— 灰度第 k 格就是灰阶 k，彩色色标把同一串数铺成颜色（0 → 左端、上限 → 右端）。换色标不重算、不重读盘，hover 照旧读真值。">
+            <option value="gray" selected>灰度</option>
+            <option value="viridis">viridis</option>
+            <option value="inferno">inferno</option>
+            <option value="magma">magma</option>
+            <option value="plasma">plasma</option>
+            <option value="cividis">cividis</option>
+            <option value="turbo">turbo</option>
+            <option value="hot">hot</option>
+            <option value="jet">jet</option>
+          </select>
+        </div>
+        <div class="mapbox"><canvas id="line-canvas" width="8" height="8"></canvas></div>
+        <div class="mapscale-x">
+          <span id="line-x-lo">—</span><span id="line-x-mid">—</span><span id="line-x-hi">—</span>
+        </div>
+        <div class="mapscale">
+          <canvas id="line-bar" width="256" height="1"></canvas>
+          <div class="mapscale-x">
+            <span id="line-bar-lo">0</span><span id="line-bar-mid">—</span><span id="line-bar-hi">—</span>
+          </div>
+        </div>
+        <dl class="stats inline">
+          <div><dt>n</dt><dd id="line-n-note">—</dd></div>
+          <div><dt>这条线</dt><dd id="line-at">—</dd></div>
+          <div><dt>幅面</dt><dd id="line-size">—</dd></div>
+          <div><dt id="line-lines-label">留下谱线</dt><dd id="line-lines">—</dd></div>
+          <div><dt>帧数 / 跨度</dt><dd id="line-frames">—</dd></div>
+          <div><dt>直流中位数 (ADU)</dt><dd id="line-dcmed">—</dd></div>
+          <div><dt>门限以下</dt><dd id="line-blank">—</dd></div>
+          <div><dt>超过上限</dt><dd id="line-over">—</dd></div>
+        </dl>
+        <p class="hint" id="line-hover">鼠标停在图上：读出那一帧、那一列的位置与 E（= |z| ÷ d^α）。</p>
+        <p class="hint" id="line-empty">还没有算。左边选一条扫描，在〈滤波曲线〉那张卡里填好波长范围（留空 = 全通，这里也能算），
+          填一个行号或列号，再点「算 x-t」/「算 y-t」。</p>
+        <p class="hint" id="line-note" hidden><b>这张图答的是「沿这条线，条纹深度随时间和位置怎么变」</b>：
+          固定一行 y（点「算 x-t」）或一列 x（点「算 y-t」），把这条线上每个位置、每一帧的信号取出来 ——
+          横轴是<b>位置</b>（原始坐标，裁过的也按原始坐标填），纵轴是<b>帧</b>：<b>自上而下 = 采图顺序</b>，
+          第一帧在最上面。纵轴按帧<b>等间距</b>铺开，不按位置读数拉开（帧间隔本来就不匀），真实跨度写在统计条里。
+          <b>每一格是什么</b>：把这个位置的时间序列按〈滤波曲线〉那张卡选中的<b>同一段波长</b>做带通
+          （同一个非均匀最小二乘、不插值、不重采样），取解析信号的模 |z| —— 就是那条曲线上
+          <b>灰细线包络</b>的逐帧版；再除以该位置<b>自己的直流</b> d 的 (2n−1)/(2n) 次方 ——
+          与〈强度对齐〉<b>同一个分母、同一个 n</b>。两件事的区别只有一处：那张图先把时间加掉（Σb²，每个像素一个数），
+          这张把时间<b>留着</b>（图上多一条时间轴）。
+          <b>为什么除直流</b>：亮的地方包络本来就大、暗的地方本来就小，直接比就是比照明；每个位置除自己的直流底子，
+          图上比的才是「条纹的相对深度」，同一个灰度在不同位置是同一件事。
+          <b>「不滤波」</b>勾上后不做带通、也不算解析信号：每个位置先把整条时间序列减掉自己的均值 b = I − d，
+          取绝对值再除以同一个分母 —— 图上画的是 <b>|I − d| / d^α</b>（与〈强度对齐〉那个「不滤波」同一口径）。
+          它与「全通」（所有能解出的谱线的包络）不是一个口径；勾上时波段不参与，改波段也不用重算。
+          <b>n 是什么意思</b>：指数 (2n−1)/(2n) 是归一化程度 —— n 越大压得越狠；n=1/2 时指数 0（不归一化，就是包络），
+          n→∞ 时指数 2（完全归一化）。<b>改 n 只重画</b>：后端给的是包络与直流两列与 n 无关的数。
+          <b>线性色标</b>（不做对数）：色标左端 = 0、右端 = 显示上限那个数（默认是这张图里最强的那一格）；
+          图下方色标写着这三格数。<b>色标</b>那一格可以选灰度或八张彩色色标之一（默认灰度）——
+          图上色与图下色标读的是<b>同一份</b> 256 格表，彩色只换颜色、不换数，换色标<b>只重画</b>。
+          彩虹色标（turbo / jet）中间有一段最亮、两端反而暗 —— 那里别拿亮度当数的大小，读数看 hover 与色标右端。
+          <b>显示上限</b>填一个数（超过的按它画、落在色标右端）或填 <b>99.9%</b>（按分位）；
+          <b>只改画法</b>，hover 照旧读原值并注明涂白。
+          <b>直流门限</b>相对<b>这条线直流的中位数</b>：以下的位置<b>整列</b>涂深灰并计数 —— 那是「除不了」，
+          不是 0（留空 = 不掐）。
+          <b>全通也能算</b>（这里不需要载波）；波段只有〈滤波曲线〉那两个框一个来源，改波段与换扫描都会标「改过，点重算」。
+          <b>一遍读盘</b>：每帧只取这一行（或这一列），比整幅图便宜得多；换波段、换扫描、换一条线要重算，
+          改 n / 门限 / 上限都不用。数据全部来自盘上<b>已经落盘的帧</b>：不重采、不碰设备，
+          扫描跑着也能算（会跟采图抢磁盘，界面上先提醒一句）。<b>缺一个点（没图 / 没记读数）整条不算</b>。
+          结果只在内存里，不落盘、不进库。</p>
       </section>
     </div>
 

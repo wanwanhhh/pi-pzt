@@ -319,7 +319,7 @@ def test_a_band_with_no_solvable_line_is_refused_not_drawn_as_zeros():
 
     201 点等间隔扫描的 Nyquist（第 100 根）解不出来；波段只框住它时，留下的谱线是空的。
     从前的行为：k_lo=k_hi=100、phase 全 0、amp 全 0，不报错 —— 看着像算完了，其实一根
-    谱线都没用上。强度对齐那一侧一直会拒（intensity_align._prep），话术是同一句。
+    谱线都没用上。强度对齐那一侧一直会拒（intensity_align.prep），话术是同一句。
     两个口径都要拒：整条与某一时刻各走一条权重函数，判断在它们共用的 `_grid` 里。
     """
     import tempfile
@@ -398,7 +398,7 @@ def test_the_result_reports_only_the_lines_that_were_kept():
     2001 点等间隔、波段 990~1000：`_grid` 实际给 990~999（Nyquist 那根解不出、丢掉了），
     所以 k_hi 必须是 999、k_c 是 994.5（990 与 999 的中点），不是 1000 与 995.0。
     界面（app.js）拿 k_lo~k_hi 写「共 N 根」，按原值报就会多报一根、载波也偏半格。
-    强度对齐那边用的是 `_prep` 交回的那一串，本来就是对的 —— 两边现在同一个口径。
+    强度对齐那边用的是 `prep` 交回的那一串，本来就是对的 —— 两边现在同一个口径。
     """
     import tempfile
 

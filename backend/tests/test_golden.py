@@ -1,7 +1,7 @@
 """跨语言 golden：同一份期望值，Python 与 JS 两边各跑一遍。
 
 **这条钉子补的是什么**：`app.js` 的 `pixelSpectrum` / `filteredSignal` 与
-`phasemap._grid` / `intensity_align._prep` 是同一条式子的两份实现（非均匀采样下逐根解 2×2 正规方程）。
+`phasemap._grid` / `intensity_align.prep` 是同一条式子的两份实现（非均匀采样下逐根解 2×2 正规方程）。
 改了一边、另一边不报错、只出错数 —— 而现有的两条"自证"都是拿 Python 重写一遍去对 Python，
 **对 JS 那一份零约束**。这里用一份独立算出来的期望值把两边钉在同一根桩上。
 
@@ -12,7 +12,7 @@
 **"逐根各解一次"是口径的一半，不能省**：把 2K 个基函数放在一起解一次是**另一个**最小二乘问题 ——
 非均匀采样下 cos7/sin7 与 cos19/sin19 彼此不正交，联合解会把能量在两根之间重新分配
 （实测用例 2 的 k=7：联合解 A=3.974292、B=0.013210，逐根解 A=3.973640、B=−0.121714）。
-两边实现（`pixelSpectrum` 的 2×2、`_prep` 的 2×2）都是逐根，所以 golden 也必须逐根。
+两边实现（`pixelSpectrum` 的 2×2、`prep` 的 2×2）都是逐根，所以 golden 也必须逐根。
 
 **为什么不是漂亮的 2.5**：采样非均匀时 cos/sin 在 N 个点上**并不正交**，
 所以即使样本是 `3.0 + 2.5·cos(11θ)`，投影系数也会略偏离 2.5（实测 2.49976）。
@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.bands import band_lines, solvable  # noqa: E402
-from backend.intensity_align import _prep  # noqa: E402
+from backend.intensity_align import prep  # noqa: E402
 from backend.phasemap import _grid  # noqa: E402
 
 GOLDEN = json.loads((Path(__file__).resolve().parent / "golden_spectrum.json").read_text("utf-8"))
@@ -120,28 +120,28 @@ def test_solvable_matches_the_golden_rows():
 
 
 def test_prep_rows_agree_with_the_golden():
-    """`intensity_align._prep` 交出来的系数行 = golden 那组投影（同一份式子，两处实现）。
+    """`intensity_align.prep` 交出来的系数行 = golden 那组投影（同一份式子，两处实现）。
 
     **比的是"逐根单独解"**（与前端 `pixelSpectrum` 同一个做法：每根各解一个 2×2），
     不是"把 2K 个基函数放在一起解一次"—— 后者是另一个最小二乘问题，系数会不同（非均匀采样
     下两族基函数不正交，联合解会把能量在它们之间重新分配）。golden 的期望值就是逐根投影。
 
-    做法：只把**这一根**交给 `_prep`（k_lo = k_hi = k），这样它交出来的就是逐根那一份。
+    做法：只把**这一根**交给 `prep`（k_lo = k_hi = k），这样它交出来的就是逐根那一份。
     """
     for case in GOLDEN["cases"]:
         x = np.asarray(case["x"], dtype=np.float64)
         for k_str, want in case["want"].items():
             k = int(k_str)
-            _ks, rows_a, rows_b, _phi = _prep(GOLDEN["t_fs"], k, k, GOLDEN["span_fs"])
+            _ks, rows_a, rows_b, _phi = prep(GOLDEN["t_fs"], k, k, GOLDEN["span_fs"])
             got_a, got_b = float(x @ rows_a[0]), float(x @ rows_b[0])
             assert abs(got_a - want["A"]) < 1e-9, (case["name"], k_str, got_a, want["A"])
             assert abs(got_b - want["B"]) < 1e-9, (case["name"], k_str, got_b, want["B"])
 
 
 def test_prep_multi_root_agrees_with_the_golden():
-    """`_prep` 一次要**多根**时，交出来的每一行都对得上 golden 里对应的那一根。
+    """`prep` 一次要**多根**时，交出来的每一行都对得上 golden 里对应的那一根。
 
-    **这条补的是上面那条的缺口**：上面只把一根（k_lo = k_hi = k）交给 `_prep`，而单根时
+    **这条补的是上面那条的缺口**：上面只把一根（k_lo = k_hi = k）交给 `prep`，而单根时
     「逐根各解一个 2×2」与「把 2K 个基函数一起解一次」在数学上**完全相同** —— 所以那条
     证明不了它自己声称的口径。这里用 golden 用例 2（k = 7 与 19 各带自己的相位）真正跨多根：
 
@@ -152,9 +152,9 @@ def test_prep_multi_root_agrees_with_the_golden():
     """
     case = next(c for c in GOLDEN["cases"] if len(c["want"]) > 1)
     ks_want = sorted(int(k) for k in case["want"])
-    # `_prep` 吃的是**一段**谱线（k_lo..k_hi），所以这里要 7..19 整段：多根同时解，
+    # `prep` 吃的是**一段**谱线（k_lo..k_hi），所以这里要 7..19 整段：多根同时解，
     # 只有每根各解一个 2×2 才对得上 golden；联合解在第 7 根上差 1.6e-2。
-    ks, rows_a, rows_b, phi = _prep(GOLDEN["t_fs"], ks_want[0], ks_want[-1], GOLDEN["span_fs"])
+    ks, rows_a, rows_b, phi = prep(GOLDEN["t_fs"], ks_want[0], ks_want[-1], GOLDEN["span_fs"])
     assert ks == list(range(ks_want[0], ks_want[-1] + 1)), ks
     assert rows_a.shape == (len(ks), len(GOLDEN["t_fs"])), rows_a.shape
     # phi 的列 = [cos_k …, sin_k …]，与 a = [A_1..A_K, B_1..B_K] 一一对应
@@ -172,17 +172,17 @@ def test_prep_multi_root_agrees_with_the_golden():
 
 
 def test_grid_rows_agree_with_the_golden():
-    """`phasemap._grid` 与 `intensity_align._prep` 解的是同一对 2×2，只在**去均值**上分工不同。
+    """`phasemap._grid` 与 `intensity_align.prep` 解的是同一对 2×2，只在**去均值**上分工不同。
 
     `_grid` 交的是**原始**权重（去均值由调用方 `_demean` 统一做：`weight_vector` 那一步）；
-    `_prep` 交的**已经去过均值**（它的调用方直接拿去乘样本）。所以这里比的是
-    「`_grid` 的行减掉它自己的均值」= 「`_prep` 的行」—— 差的只是一个常数，不是两套式子。
+    `prep` 交的**已经去过均值**（它的调用方直接拿去乘样本）。所以这里比的是
+    「`_grid` 的行减掉它自己的均值」= 「`prep` 的行」—— 差的只是一个常数，不是两套式子。
 
     复数拼法是 `ga − i·gb`（"c_k = A − iB"那个约定的另一半），两处一致。
     """
     t = GOLDEN["t_fs"]
     _t, _t0, _df, _th, rows = _grid(t, 7, 7, GOLDEN["span_fs"])
-    _ks, rows_a, rows_b, _phi = _prep(t, 7, 7, GOLDEN["span_fs"])
+    _ks, rows_a, rows_b, _phi = prep(t, 7, 7, GOLDEN["span_fs"])
     assert len(rows) == 1 and _ks == [7], (rows, _ks)
     row = rows[0][1]
     demeaned = (row - row.mean())
