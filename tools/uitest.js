@@ -4356,6 +4356,63 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('line-over').textContent") === '0',
      read("$('line-bar-hi').textContent") + ' | ' + read("$('line-over').textContent"));
 
+  // ---- 按列最大值归一化：每一列除以它自己沿帧方向的最大值（只改画法，与 n 无关）----
+  // 分母里的 d^((2n−1)/(2n)) 是逐位置常数，上下约掉 —— 所以勾上后改 n 一格都不该变。
+  const lnNormWant = (function () {
+    const raw = LN_ENV.map((e, i) => e / Math.pow(LN_DC[i % 4], 5 / 6));
+    const col = [0, 1, 2, 3].map((j) => Math.max(raw[j], raw[4 + j], raw[8 + j]));
+    return raw.map((v, i) => v / col[i % 4]);
+  })();
+
+  calls.length = 0;
+  run("$('line-colnorm').checked = true; $('line-colnorm').onchange()");
+  ok('勾上「按列最大值归一化」：每列最强的那一格 = 1，其余按各自那一列的比例 —— 一个请求都不发',
+     (function () {
+       const vals = JSON.parse(read('JSON.stringify(Array.from(lineSeries()))'));
+       return vals.every((v, i) => Math.abs(v - lnNormWant[i]) < 1e-6) && calls.length === 0;
+     })(), read('JSON.stringify(Array.from(lineSeries()).slice(0, 4))') + ' | ' + JSON.stringify(calls));
+
+  ok('每列各自的最强那一格都顶到色标右端（第 1、2、3、4 列各有一个 255），其余按比例上灰',
+     lnPx(0)[0] === 255 && lnPx(5)[0] === 255 && lnPx(10)[0] === 255 && lnPx(7)[0] === 255 &&
+     lnPx(1)[0] === 64,
+     JSON.stringify([lnPx(0)[0], lnPx(5)[0], lnPx(10)[0], lnPx(7)[0], lnPx(1)[0]]));
+
+  ok('色标右端就是 1（每列各自的最强那一格），统计条里 n 那格照实写「n 不参与」',
+     read("$('line-bar-hi').textContent") === '1.00' &&
+     read("$('line-n-note').textContent") === '—（按列归一化，n 不参与）' &&
+     read("$('line-bar').title").indexOf('（按列最大值归一化）') > 0,
+     read("$('line-bar-hi').textContent") + ' | ' + read("$('line-n-note').textContent"));
+
+  calls.length = 0;
+  run("$('line-n').value = '0.5'; $('line-n').oninput()");
+  ok('勾着归一化时改 n（3 → 0.5）：数值一格都不变（d^α 上下约掉），也还是一个请求都不发',
+     calls.length === 0 && (function () {
+       const vals = JSON.parse(read('JSON.stringify(Array.from(lineSeries()))'));
+       return vals.every((v, i) => Math.abs(v - lnNormWant[i]) < 1e-6);
+     })(), read('JSON.stringify(Array.from(lineSeries()).slice(0, 4))'));
+  run("$('line-n').value = '3'; $('line-n').oninput()");
+
+  run("$('line-dcmin').value = '-30'; $('line-dcmin').oninput()");
+  ok('勾着归一化时门限照旧按列判：直流 10 的那一整列涂深灰并计数（除不了，不是 0）',
+     JSON.stringify(lnPx(2)) === JSON.stringify([30, 41, 59]) &&
+     read("$('line-blank').textContent") === '1 / 4 列（25.0%）',
+     JSON.stringify(lnPx(2)) + ' | ' + read("$('line-blank').textContent"));
+  run("$('line-dcmin').value = ''; $('line-dcmin').oninput()");
+
+  run("$('line-canvas').onmousemove({ clientX: 150, clientY: 100 })");
+  ok('归一化后的 hover：读「占该列最大值百分之几」，并照实给 |z| 与直流',
+     read("$('line-hover').textContent").indexOf('E ÷ 该列最大 = 100.0%') > 0 &&
+     read("$('line-hover').textContent").indexOf('|z| = 4000') > 0,
+     read("$('line-hover').textContent"));
+  run("$('line-canvas').onmouseleave()");
+
+  calls.length = 0;
+  run("$('line-colnorm').checked = false; $('line-colnorm').onchange()");
+  ok('取消勾选：回到 d^(2n−1)/(2n) 那条式子（缓存按开关作废），一个请求都不发',
+     calls.length === 0 && Math.abs(read('lineSeries()[0]') - 4000 / Math.pow(1000, 5 / 6)) < 1e-6 &&
+     read("$('line-n-note').textContent") === '3（指数 0.8333）',
+     read("$('line-n-note').textContent") + ' | ' + JSON.stringify(calls));
+
   // ---- 色标：图上色与图下那条色标读的是**同一份** 256 格表（换色标只改画法）----
   // 灰度在表里就是第 k 格 = (k,k,k)；彩色色标给的是 matplotlib 同名色标的锚点（这里只认两端的
   // 那两个颜色：viridis 两头是 [68,1,84] 与 [253,231,37]）。表只铺一次、图与色标同读一份内存。

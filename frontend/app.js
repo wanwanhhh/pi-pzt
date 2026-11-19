@@ -4630,6 +4630,18 @@ function lineCmapText() {
    （与强度对齐同一个脾气）。 */
 function lineUnfiltered() { return $('line-nofilter').checked === true; }
 
+/* 勾没勾「按列最大值归一化」。**只此一处读这个框**：算式、缓存键、色标、hover 都从这里拿。
+   逐列（每个位置）除以它自己**沿帧方向**的最大值 —— 分母里的 d^((2n−1)/(2n)) 是逐位置常数，
+   上下约掉，所以勾上后这张图与 n 无关（这不影响「改 n 只重画」：它本来只是显示层）。 */
+function lineColNorm() { return $('line-colnorm').checked === true; }
+
+/* 统计条里「n」那一格：勾了归一化就照实说 n 不参与（不是把 n 偷偷藏起来）。 */
+function lineNNote() {
+  if (lineColNorm()) return '—（按列归一化，n 不参与）';
+  const n = lineN();
+  return isFinite(n) ? n + '（指数 ' + normExponent(n).toFixed(4) + '）' : '—';
+}
+
 /* 直流门限 (dB)：相对**这条线直流的中位数**（与强度对齐同一条规矩：不是最强那个位置 ——
    直流常有零星热点，按最强算会把整片掐掉）。留空 = 不掐。 */
 function lineGate() {
@@ -4657,6 +4669,18 @@ function lineSeries() {
     const row = i * p;
     for (let j = 0; j < p; j++) out[row + j] = env[row + j] * scale[j];
   }
+  if (!lineColNorm()) return out;
+  // 逐列除以该列自己的最大值：每列最亮的那一格 = 1。整列都是 0（或已被门限涂灰）就留 NaN ——
+  // 那是「除不了」，与门限以下同一句话，不当成 0。
+  for (let j = 0; j < p; j++) {
+    let m = 0;
+    for (let i = 0; i < nf; i++) {
+      const v = out[i * p + j];
+      if (v === v && v > m) m = v;
+    }
+    const k = m > 0 ? 1 / m : NaN;
+    for (let i = 0; i < nf; i++) out[i * p + j] *= k;
+  }
   return out;
 }
 
@@ -4667,7 +4691,7 @@ function lineSeriesCached() {
   if (!lineData || !lineResult) return null;
   const capIn = capInput('line-cap');
   const key = lineLoadedKey + '|' + lineN() + '|' + lineGate() + '|' +
-    (capIn ? (capIn.pct || capIn.abs) : '');
+    (capIn ? (capIn.pct || capIn.abs) : '') + '|' + (lineColNorm() ? 'n' : '');
   if (lineCache && lineCache.key === key) return lineCache;
   const vals = lineSeries();
   if (!vals) return null;
@@ -4791,11 +4815,13 @@ function linePick(ev) {
 
 /* 色标的三格刻度：讲的是这一张图的数（0 → 色标左端、上限 → 右端），与图上那条线性式子同源。 */
 function lineScaleText(top, cap) {
-  const cv = $('line-bar'), how = lineCmapText();
+  const cv = $('line-bar'), how = lineCmapText(), norm = lineColNorm();
   cv.title = top === null
     ? '线包络：' + how + '（0 → 左端、最强那一格 → 右端）；深灰 = 直流在门限以下（不是 0）'
-    : '线包络：' + how + ' —— 左端 = 0、右端 = ' + grayNum(cap) +
-      (cap < top ? '（显示上限：超过它的都按右端画）' : '（这张图里最强的那一格）') +
+    : '线包络：' + how + (norm ? '（按列最大值归一化）' : '') +
+      ' —— 左端 = 0、右端 = ' + grayNum(cap) +
+      (cap < top ? '（显示上限：超过它的都按右端画）'
+                 : norm ? '（每列各自的最强那一格）' : '（这张图里最强的那一格）') +
       '；深灰 = 直流在门限以下（不是 0）';
   setText('line-bar-lo', '0');      // 左端永远是 0（最深），与有没有图无关
   setText('line-bar-mid', top === null ? '—' : grayNum(cap / 2));
@@ -4811,13 +4837,12 @@ function linePaint() {
   const ids = ['line-size', 'line-at', 'line-lines', 'line-frames', 'line-dcmed',
                'line-blank', 'line-over'];
   const empty = $('line-empty');
-  const n = lineN();
   const cached = lineSeriesCached();
   const vals = cached && cached.vals;
   if (!lineData || !lineResult || !vals) {
     setText('line-lines-label', lineResult && lineResult.unfiltered ? '口径' : '留下谱线');
     for (let i = 0; i < ids.length; i++) setText(ids[i], '—');
-    setText('line-n-note', isFinite(n) ? n + '（指数 ' + normExponent(n).toFixed(4) + '）' : '—');
+    setText('line-n-note', lineNNote());
     setText('line-title', '未算');
     setText('line-x-lo', '—'); setText('line-x-mid', '—'); setText('line-x-hi', '—');
     lineScaleText(null, null);
@@ -4855,7 +4880,7 @@ function linePaint() {
   const fixedName = r.axis === 'y' ? '行 y' : '列 x';
   setText('line-title', '#' + r.scan_id + '　线包络 ' + (r.axis === 'y' ? 'x-t' : 'y-t') +
     (r.unfiltered ? '（不滤波）' : '') + ' · ' + fixedName + ' = ' + r.at + '　' + p + '×' + nf);
-  setText('line-n-note', n + '（指数 ' + normExponent(n).toFixed(4) + '）');
+  setText('line-n-note', lineNNote());
   setText('line-at', fixedName + ' = ' + r.at + '，横轴 ' + axisName);
   setText('line-size', r.w + '×' + r.h +
     (r.rect ? '（原始坐标原点 ' + r.rect[0] + ',' + r.rect[1] + '）' : ''));
@@ -4885,9 +4910,12 @@ function lineIdleText() {
     return '鼠标停在图上：读出那一帧、那一列的位置与 E（= |z| ÷ d^α）。';
   }
   const unf = lineResult && lineResult.unfiltered;
-  return '每个位置每帧：E = ' + (unf ? '|I − d|' : '|z|') + ' ÷ d^' +
-    normExponent(lineN()).toFixed(4) + '（n = ' + lineN() + '）　｜　' + lineCmapText() +
-    '　｜　鼠标停在图上读任意一格';
+  return (lineColNorm()
+    ? '每列各除自身最大值：E = ' + (unf ? '|I − d|' : '|z|') +
+      ' ÷ 该列最大值（每列最强那一格 = 1，与 n 无关）'
+    : '每个位置每帧：E = ' + (unf ? '|I − d|' : '|z|') + ' ÷ d^' +
+      normExponent(lineN()).toFixed(4) + '（n = ' + lineN() + '）') +
+    '　｜　' + lineCmapText() + '　｜　鼠标停在图上读任意一格';
 }
 
 function lineHover(ev) {
@@ -4904,6 +4932,15 @@ function lineHover(ev) {
   if (v !== v) {
     setText('line-hover', at + '　' + where + '　直流 ' + fmt(d, 1) +
       ' ADU 在门限以下 —— 没算（不是 0）');
+    return;
+  }
+  if (lineColNorm()) {
+    // E 已经是「占该列最大值」的比例 —— 照实读这个比例，连同它的 |z| 与直流一起给
+    // （归一化只改画法，那两个数一个都不动）。
+    const raw = lineData.env[q.i * lineData.p + q.j];
+    setText('line-hover', at + '　' + where + '　E ÷ 该列最大 = ' + (v * 100).toFixed(1) + '%' +
+      '　|z| = ' + grayNum(raw) + '　直流 ' + fmt(d, 1) + ' ADU' +
+      (v > cached.cap ? '；超过显示上限，按色标右端画' : ''));
     return;
   }
   const share = cached.top > 0 ? v / cached.top : 0;
@@ -5607,6 +5644,7 @@ function wire() {
   $('line-n').oninput = function () { linePaint(); lineSyncUI(); };
   $('line-dcmin').oninput = linePaint;
   $('line-cap').oninput = linePaint;
+  $('line-colnorm').onchange = linePaint;        // 按列归一化只改画法：不重算、不重读盘
   $('line-cmap').onchange = linePaint;           // 换色标只改画法：不重算、不重读盘
   $('line-nofilter').onchange = lineSyncUI;      // 口径只改「该重算」，手里那张图不动
   $('line-canvas').onmousemove = lineHover;
