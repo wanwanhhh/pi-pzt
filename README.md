@@ -173,6 +173,6 @@ Windows 把 `.venv/bin/python` 换成 `.venv\Scripts\python.exe`。相机另有�
 
     backend/     Python 后端（分层见 backend/__init__.py）与离线单测 backend/tests/
     frontend/    单页界面，零构建
-    tools/       上机自检脚本
+    tools/       上机自检与出图脚本
     docs/        需求、设计、词表、地图 + 各设备的资料与认识账（读哪份见 docs/地图.md）
     data/        运行期生成：SQLite 元数据 + 图像（不入库）

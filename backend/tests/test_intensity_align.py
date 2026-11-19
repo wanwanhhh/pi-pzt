@@ -15,7 +15,7 @@
      它与「全通」（所有能解出的谱线）是两个口径；不建 2K 张图，所以不受谱线内存上限约束。
 
 **第 1 条钉的是「这条式子该给什么数」，不是「现状给什么数」**：直接算法走 lstsq（QR/SVD），
-被测的 `_prep` 走 2×2 正规方程 —— 两条不同代数路线。两边都写成正规方程时，
+被测的 `prep` 走 2×2 正规方程 —— 两条不同代数路线。两边都写成正规方程时，
 同一处代数错（scs 符号写反）会一起错、互相印证，测试反而全绿（实测过）。
 
 直接跑：python backend/tests/test_intensity_align.py
@@ -30,7 +30,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.config import TIME_FS_PER_UM, WAVELENGTH_UM_PER_THZ  # noqa: E402
-from backend.intensity_align import _prep, align_maps  # noqa: E402
+from backend.intensity_align import prep, align_maps  # noqa: E402
 from backend.thorlabs_ccd import _save_png16  # noqa: E402
 
 
@@ -77,7 +77,7 @@ def _scan(w, h, n, lines, tmp, seed=3):
 def _direct_energy(images, th, k_lo, k_hi):
     """**直接算法**（与 app.js 的 filteredSignal 同式）：逐像素解 A/B，再逐点加回、平方求和。
 
-    **系数走 lstsq（QR/SVD），不走正规方程** —— 被测代码（`_prep`）用的是 2×2 的代数式
+    **系数走 lstsq（QR/SVD），不走正规方程** —— 被测代码（`prep`）用的是 2×2 的代数式
     （`(yc·sss − ys·scs)/det`）。两条路线算法不同，所以这一条钉的是「这条式子该给什么数」，
     不是「现状给什么数」；如果两边都写成正规方程，同一处代数错（比如 scs 符号写反）
     会一起错、互相印证，测试反而全绿。
@@ -143,7 +143,7 @@ def test_cross_terms_matter_on_uneven_sampling():
         # （**逐根 2×2 解**，与前端同式 —— 不是把 2K 个基函数放在一起做联合最小二乘，那是另一批系数）
         series = np.array([np.asarray(im).ravel() for im in s["images"]], dtype=np.float64)
         t_fs = [p * TIME_FS_PER_UM for (_, p, _) in s["items"]]
-        _ks, rows_a, rows_b, _phi = _prep(t_fs, k_lo, k_hi, s["span"])
+        _ks, rows_a, rows_b, _phi = prep(t_fs, k_lo, k_hi, s["span"])
         coeff = np.concatenate([series.T @ rows_a.T, series.T @ rows_b.T], axis=1)
         full = ((coeff @ g) * coeff).sum(axis=1)
         diag = ((coeff @ g_diag) * coeff).sum(axis=1)

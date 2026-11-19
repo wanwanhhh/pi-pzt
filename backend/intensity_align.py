@@ -36,7 +36,7 @@ from .bands import band_lines, solvable
 from .config import ALIGN_MAX_BYTES, TIME_FS_PER_UM
 
 
-def _prep(t_fs, k_lo: int, k_hi: int, span: float):
+def prep(t_fs, k_lo: int, k_hi: int, span: float):
     """解系数的那几行（A_k、B_k 各一行，**已去均值**）＋ 建 G 的基函数。
 
     A_k = Σ_t I(t)·ga_k(t)、B_k = Σ_t I(t)·gb_k(t)（2×2 正规方程，与前端同式）；
@@ -252,7 +252,7 @@ def align_maps(items, crop=None, lmin=None, lmax=None, workers: int = 8,
     t_fs = [p * TIME_FS_PER_UM for (_, p, _) in items]
     span = max(t_fs) - min(t_fs)
     k_lo, k_hi, k_max, df_thz = band_lines(lmin, lmax, len(items), span)
-    ks, rows_a, rows_b, phi = _prep(t_fs, k_lo, k_hi, span)
+    ks, rows_a, rows_b, phi = prep(t_fs, k_lo, k_hi, span)
 
     # 内存先算清：超了当场拒，别跑到一半爆掉。裁过就**读盘前**用裁剪幅面判（这时就知道），
     # 没裁过由 _accumulate 在第一帧读出来、分配之前判 —— 两处都调同一个 _check_memory。

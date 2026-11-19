@@ -11,10 +11,13 @@
  *       L 界面不许编数、状态可见性；M 两页视图的切换与重新量宽；
  *       N–V 预览质心与图库、轮廓图、点位表、数据页（像素曲线 / 横轴范围与手势 / 裁剪 / 频谱 /
  *       位置口径：折算 µm ↔ 设备读回原值 / 频谱横轴：频率 ↔ 波长）；
- *       W–Z 数据页的频谱轴、滤波与解析信号（包络 / 相位残差 / 傅里叶极限）；
+ *       W–Z 数据页的频谱轴、滤波与解析信号（包络 / 相位残差 / 傅里叶极限 / 相位轴的范围框）；
  *       AA 数据页相位图（波段来源、一遍读盘的起算与进度、绕圈配色、门限、换基准不重取数）；
  *       AB 数据页强度对齐（全通照算、不滤波仍走同一个三步、n 只改显示、线性灰度、
- *          显示上限只改画法、直流门限相对中位数、慢响应、字节数）；
+ *          显示上限只改画法、直流门限相对中位数、亮斑掩模按局部背景判离群、慢响应、字节数）；
+ *       LD 数据页线包络（x-t / y-t 两个方向、三列二进制的长度、除法只改显示、线性色标
+ *          （灰度与彩色同读一份 256 格表）、门限按列涂灰、显示上限只改画法、横轴写原始坐标、
+ *          hover 读帧与位置、非法输入不发请求）；
  *       AC 跨语言 golden：pixelSpectrum / filtKeepRange 与后端同一条式子（期望值在
  *          backend/tests/golden_spectrum.json，Python 那半边是 backend/tests/test_golden.py）。
  *       （相机预览那块只有"加载 app.js 不炸"这一层被覆盖，预览时序未测。）
@@ -216,6 +219,10 @@ uPlot.prototype._rerange = function () {
   const sc = this.opts.scales || {};
   for (const k in sc) {
     if (!sc[k] || typeof sc[k].range !== 'function') continue;
+    // 已经写死了 min/max 的轴不再按数据重算（真 uPlot 的 getScales 先看 min/max 有没有值，
+    // range 函数只给"还是自动"的轴用）—— rangeBox 钉住窗口靠的就是这一条。
+    const cur = this.scales[k];
+    if (cur && cur.min != null && cur.max != null) continue;
     const r = sc[k].range(this, -7, 7, k);
     this.scales[k] = { min: r[0], max: r[1] };
   }
@@ -2804,7 +2811,7 @@ const count = (m) => calls.filter((c) => c === m).length;
   // 三步：φ = atan2(B, A) 沿频率**展开** → **减掉线性相位**（群延迟那条斜坡）→ **零钉在门限内最强那根上**。
   // **只在有信号的地方有意义** —— 门限以下的谱线留空（两个几乎为零的数相除，出来的是随机相位），
   // 展开与减线性相位也不从它们身上过。
-  console.log('\n[Y] 频谱上的相位：右边那条轴（展开 / 减线性相位 / 零钉在最强那根）');
+  console.log('\n[Y] 频谱上的相位：右边那条轴（展开 / 减线性相位 / 零钉在最强那根 / 范围框可钉住）');
 
   ok('图上是三列：功率 + 相位；右边那根轴走 y2、不画网格，y2 这个 scale 也跟轴一起建出来',
      read('specChart.opts.series[2].label') === '相位 (rad，去线性)' &&
@@ -2834,7 +2841,8 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('spec-ptau').textContent") === '—' && read("$('spec-pstep').textContent") === '—',
      read("$('spec-ptau').textContent") + ' / ' + read("$('spec-pstep').textContent"));
 
-  // 相位轴**没有范围框、也不吃滚轮/拖动**（见 AGENTS.md），所以它的范围只按"门限以内那一列"算：
+  // 相位轴**不吃滚轮/拖动**（一次拖动不能同时改两根纵轴，见设计 §十一 —— 这是全套范围框里唯一的例外），
+  // 所以**没填过相位范围框时**它的范围只按"门限以内那一列"算：
   // uPlot 重铺范围时会拿**视窗里那几个数**去问每根没写死 min/max 的轴 —— 桩故意递一对跟数据无关的
   // 视窗数（−7 / 7）进去，理不理它一眼就看得出。真机上这个 bug 长这样：谱的相位散在整条横轴上，
   //  视窗一挪，门限内那几根一根不剩 → 相位轴变 [null, null]，整条相位就没了。
@@ -2848,6 +2856,37 @@ const count = (m) => calls.filter((c) => c === m).length;
   run("specX.set(2, 3)");      // 一次手势 = 别条轴的 setScale：uPlot 顺手重铺其余各轴
   ok('滚轮/拖动重铺别的轴时，相位轴一动都不动', y2Span() === y2a, y2a + ' → ' + y2Span());
   run("specX.pinned = false; specX.apply()");
+
+  // ---- 相位轴的范围框：与频率、功率同一套规矩（框是唯一的准、「自动范围」松钉、只改画法）----
+  const radBoxes = () => read("JSON.stringify([parseFloat($('spec-radmin').value)," +
+    " parseFloat($('spec-radmax').value)])");
+  const radTag = read('specLast.__rad = 1, specLast.__rad');
+  ok('相位范围框：没手填过就按整条铺满（框里那两个数就是轴上那两个数），角标不亮',
+     read("$('spec-radpin').hidden") === true && radBoxes() === y2Span(),
+     radBoxes() + ' vs ' + y2Span());
+
+  calls.length = 0;
+  run("radTag = 1; $('spec-radmin').value = '-0.2'; $('spec-radmin').oninput();" +
+      "$('spec-radmax').value = '0.2'; $('spec-radmax').oninput()");
+  ok('相位最小 / 最大填 −0.2 / 0.2：轴上就是这一段、角标亮起 —— 一个请求都不发、谱不重算，别的轴没被钉',
+     y2Span() === '[-0.2,0.2]' && read("$('spec-radpin').hidden") === false &&
+     calls.length === 0 && read('specLast.__rad') === radTag &&
+     read('specX.pinned') === false && read('specY.pinned') === false,
+     y2Span() + ' | 角标 ' + read("$('spec-radpin').textContent") + ' | ' + JSON.stringify(calls));
+
+  run("$('spec-radmax').value = ''; $('spec-radmax').oninput()");
+  ok('只填一个（清掉最大）= 不套用：轴上还是上一份，框留着等人改完（与另两对同一个规矩）',
+     y2Span() === '[-0.2,0.2]' && read("$('spec-radpin').hidden") === false, y2Span());
+
+  run("$('spec-radmax').value = '0.2'; $('spec-radmax').oninput()");   // 两个都填好 = 又套用
+  await run("renderSpectrum(specSrc)");     // 重画一遍 = setData：桩把各轴的范围全清掉再重铺
+  ok('重画之后钉住的相位范围还在（框是唯一的准，图不会自己弹回自动）',
+     y2Span() === '[-0.2,0.2]' && read("$('spec-radpin').hidden") === false, y2Span());
+
+  run("$('btn-spec-radfit').onclick()");
+  ok('「自动范围」松钉：两个框重新填上整条的数，轴回到按整条铺满，角标灭',
+     y2Span() === y2Want && read("$('spec-radpin').hidden") === true && radBoxes() === y2Want,
+     y2Span() + ' vs ' + y2Want);
 
   const tag0 = read('specLast.__tag = 1, specLast.__tag');
   const calls1 = calls.length;
@@ -3825,7 +3864,7 @@ const count = (m) => calls.filter((c) => c === m).length;
   run("alignPolling.stop(); alignResult=null; alignData=null; alignLoadedKey=''; alignSeq=0;" +
       "dataLast=null; specLast=null; dataChart=null; filtChart=null; dataScans=[];" +
       "$('filt-lmin').value=''; $('filt-lmax').value=''; $('align-n').value='3';" +
-      "$('align-dcmin').value='-40'; $('align-cap').value=''; alignBarPaint(); alignSyncUI();");
+      "$('align-dcmin').value='-40'; $('align-cap').value=''; barPaint('align-bar'); alignSyncUI();");
   await run('loadDataScans()'); await tick();
   run("$('data-x').value = '500'; $('data-y').value = '400';");
 
@@ -3937,7 +3976,7 @@ const count = (m) => calls.filter((c) => c === m).length;
 
   // 分位那一路：全幅 1.5 M 格排序不值，量化到 4096 段再数（门限以下的 NaN 不算）。
   const qExpr = '(function(){var a=new Float64Array(1000);' +
-    'for(var i=0;i<1000;i++)a[i]=i*0.001;a[500]=NaN;return alignQuantile(a,0.999,99);})()';
+    'for(var i=0;i<1000;i++)a[i]=i*0.001;a[500]=NaN;return capQuantile(a,0.999,99);})()';
   ok('按分位填（99%）：上限落在第 99 百分位附近（量化误差 ≤ 满量程/4096，NaN 不算）',
      (function () { const q = read(qExpr); return q >= 0.989 && q <= 0.9915; })(),
      String(read(qExpr)));
@@ -4133,6 +4172,45 @@ const count = (m) => calls.filter((c) => c === m).length;
      read("$('align-stale').hidden") === false &&
      read("$('align-stale').textContent") === '口径改过，点重算',
      read("$('align-stale').textContent"));
+  // ---- 亮斑掩模：比局部背景（64×64 块中位数）亮 N 倍的格子不画 ----
+  // 这张 4×2 全在一个块里：S 的中位数是 3.162（第 5 小的那格）。
+  //   N=3 → 阈值 9.49，掩掉 S=12.65、12.65、50.60 三格（i=0、4、7）
+  //   N=8 → 阈值 25.3，只剩 i=7 那一格（50.60）
+  run("$('align-n').value='3'; $('align-dcmin').value='-40'; $('align-cap').value='';" +
+      "$('align-mask').checked=false; $('align-mask-n').value='4'; alignPaint();");
+  ok('不勾掩模：统计条写 0，最强那一格照常画白',
+     read("$('align-masked').textContent") === '0' &&
+     JSON.stringify(alPx(7)) === JSON.stringify([255, 255, 255]),
+     read("$('align-masked').textContent") + ' | ' + JSON.stringify(alPx(7)));
+
+  run("$('align-mask').checked=true; $('align-mask-n').value='3'; alignPaint();");
+  ok('勾上掩模（N=3）：比局部背景亮 3 倍的 3 格按邻域填平并计数',
+     read("$('align-masked').textContent") === '3 / 8（37.5%，3 倍，已按邻域填平）' &&
+     JSON.stringify(alPx(7)) === JSON.stringify([10, 10, 10]) &&
+     JSON.stringify(alPx(0)) === JSON.stringify(alPx(1)),
+     read("$('align-masked').textContent") + ' | ' + JSON.stringify(alPx(7)) + ' vs 背景 ' + JSON.stringify(alPx(1)));
+  ok('没超过 N 倍的格子照常画（i=2 比背景暗 4 倍，不该被抹平）',
+     JSON.stringify(alPx(2)) !== JSON.stringify(alPx(1)),
+     JSON.stringify(alPx(2)) + ' vs ' + JSON.stringify(alPx(1)));
+
+  run("$('align-mask-n').value='8'; alignPaint();");
+  ok('N 改大只重判：只剩最强那一格被掩（背景与阈值都不重算数据）',
+     read("$('align-masked').textContent") === '1 / 8（12.5%，8 倍，已按邻域填平）' &&
+     JSON.stringify(alPx(0)) !== JSON.stringify(alPx(1)) &&
+     JSON.stringify(alPx(7)) === JSON.stringify([10, 10, 10]),
+     read("$('align-masked').textContent"));
+
+  run("$('align-mask-n').value='0.5'; alignPaint();");
+  ok('倍数填了 ≤ 1：不当成"全掩"，按默认 4 判，统计条照实写用的是几',
+     read("$('align-masked').textContent").indexOf('，4 倍，已按邻域填平）') > 0,
+     read("$('align-masked').textContent"));
+
+  run("$('align-mask').checked=false; $('align-mask-n').value='4'; alignPaint();");
+  ok('关掉掩模：统计条回到 0，最强那一格照常画白',
+     read("$('align-masked').textContent") === '0' &&
+     JSON.stringify(alPx(7)) === JSON.stringify([255, 255, 255]),
+     read("$('align-masked').textContent"));
+
   run("$('filt-lmin').value = ''; $('filt-lmax').value = ''; " +
       "alignResult = null; alignData = null; alignLoadedKey = ''; alignSyncUI();");
 
@@ -4140,8 +4218,298 @@ const count = (m) => calls.filter((c) => c === m).length;
   // ==================== 跨语言 golden：前端与后端解的是同一条式子 ====================
   // 期望值不是从任何一边的实现抄来的，是**逐根最小二乘投影的定义本身**（np.linalg.lstsq 算的）。
   // 口径写在 backend/tests/golden_spectrum.json 的 `_rule` 里；Python 那半边是
-  // backend/tests/test_golden.py，比的是 phasemap._grid / intensity_align._prep。
+  // backend/tests/test_golden.py，比的是 phasemap._grid / intensity_align.prep。
   // 两边钉在同一根桩上，"改了一边、另一边不报错、只出错数"才拦得住。
+  // ==================== 数据页：线包络（沿一条线的 x-t / y-t） ====================
+  // 口径：每个位置每帧 E = |z| ÷ d^((2n−1)/(2n)) —— 分母与强度对齐同一个 d、同一个 n。
+  // **后端只给三列与 n 无关的数**（包络、直流、每帧位置）→ 改 n / 门限 / 上限只重画；
+  // 波段只有〈滤波曲线〉那两个框一个来源（全通照算）；门限相对**这条线直流的中位数**。
+  console.log('\n[LD] 数据页线包络：x-t / y-t 两个方向 / 三列二进制 / 除法只改显示 / 门限按列');
+
+  run("linePolling.stop(); lineResult=null; lineData=null; lineLoadedKey=''; lineSeq=0;" +
+      "$('line-n').value='3'; $('line-dcmin').value='-40'; $('line-cap').value='';" +
+      "$('line-row').value=''; $('line-col').value='';" +
+      "barPaint('line-bar'); linePaint(); lineSyncUI();");
+
+  // 4 个位置 × 3 帧（原始坐标 rect = 500,400,4,3）：固定一行 y=10 时横轴是 x 500~503。
+  // 直流里第 3 个位置是 10（中位数 1000 的 −40 dB），门限一收紧它就整列涂灰。
+  const LN_ENV = [4000, 1000, 5, 800,
+                  2000, 4000, 5, 1600,
+                  1000, 250, 5, 400];
+  const LN_DC = [1000, 1000, 10, 800];
+  const LN_POS = [0.0, 1.5, 3.0];
+  const lnBytes = (function () {
+    const f = new Float32Array(12 + 4 + 3);
+    for (let i = 0; i < 12; i++) f[i] = LN_ENV[i];
+    for (let i = 0; i < 4; i++) f[12 + i] = LN_DC[i];
+    for (let i = 0; i < 3; i++) f[16 + i] = LN_POS[i];
+    return f.buffer;
+  })();
+  const lnMeta = { scan_id: 82, axis: 'y', at: 10, from: 500, p: 4, n: 3, w: 4, h: 3,
+                   rect: [500, 400, 4, 3], k_lo: 192, k_hi: 196, k_max: 1999, df_thz: 0.5,
+                   band: [null, null], dc_median: 1000, span_fs: 667.1, t0_fs: 0 };
+  let lnJob = { running: false, scan_id: null, done: 0, total: 0, error: null, result: null };
+  let lnBin = lnBytes;   // 当前这一份的三列（换口径要换一份）
+  const lnRoute = (m, url) => {
+    if (url === '/api/scans') return { body: [scan82] };
+    if (url.indexOf('line.bin') > 0) return { buf: lnBin };
+    if (url === '/api/line') return { body: { job: lnJob } };
+    if (url.indexOf('/line') > 0) {
+      lnJob = { running: true, scan_id: 82, done: 0, total: 3, error: null, result: null };
+      return { body: { ok: true, scan_id: 82, total: 3 } };
+    }
+    return { body: {} };
+  };
+  route = lnRoute;
+  await run('loadDataScans()'); await tick();
+
+  const lnPx = (i) => JSON.parse(read('JSON.stringify(Array.prototype.slice.call(' +
+    '$("line-canvas")._img.data,' + (i * 4) + ',' + (i * 4 + 3) + '))'));
+
+  ok('一进页面：两个方向各一个起算按钮，全通照算（按钮可用），色标三格还没有图时写「—」',
+     read("$('btn-line-xt').disabled") === false &&
+     read("$('btn-line-yt').disabled") === false &&
+     read("$('line-bar-mid').textContent") === '\u2014' &&
+     read("$('line-band').textContent").indexOf('全通') > 0,
+     read("$('line-band').textContent"));
+
+  calls.length = 0;
+  run("$('line-row').value = '10'");
+  await run("$('btn-line-xt').onclick()"); await tick();
+  ok('固定一行 y=10 起算：请求带上 axis=y 与 index=10（全通就不带波长），进度从 0 报起',
+     calls.indexOf('POST /api/scans/82/line?axis=y&index=10') >= 0 &&
+     read("$('line-progress').textContent") === '正在读盘 0 / 3 张 …',
+     JSON.stringify(calls));
+
+  lnJob = { running: true, scan_id: 82, done: 2, total: 3, error: null, result: null };
+  await run('linePoll()');
+  ok('进度只照后端报的数写',
+     read("$('line-progress').textContent") === '正在读盘 2 / 3 张 …',
+     read("$('line-progress').textContent"));
+
+  lnJob = { running: false, scan_id: 82, done: 3, total: 3, error: null, result: lnMeta };
+  calls.length = 0;
+  await run('linePoll()');
+  ok('算完：三列 float32 一次取完（各列长度按结果里的 p / n 说），轮询停掉',
+     calls.indexOf('GET /api/scans/82/line.bin') >= 0 &&
+     read('lineData.p') === 4 && read('lineData.nf') === 3 &&
+     read('lineData.dc.length') === 4 && read('lineData.pos.length') === 3 &&
+     read('linePolling.running()') === false,
+     JSON.stringify(calls) + ' | ' + read('JSON.stringify([lineData.p, lineData.nf])'));
+
+  ok('画布内部尺寸 = 线长 × 帧数；标题写明方向与固定的那一行',
+     read("$('line-canvas').width") === 4 && read("$('line-canvas').height") === 3 &&
+     read("$('line-title').textContent").indexOf('线包络 x-t · 行 y = 10　4×3') > 0,
+     read("$('line-title').textContent"));
+
+  ok('n=3 的式子：E = |z| ÷ d^(5/6)，逐格与手算一致',
+     (function () {
+       const vals = JSON.parse(read('JSON.stringify(Array.from(lineSeries()))'));
+       const want = LN_ENV.map((e, i) => e / Math.pow(LN_DC[i % 4], 5 / 6));
+       return vals.every((v, i) => Math.abs(v - want[i]) < 1e-6);
+     })(), read('JSON.stringify(Array.from(lineSeries()).slice(0, 4))'));
+
+  ok('**线性**灰度：一格的颜色 = 它占最强那一格的比例 × 255（最亮 255、四分之一 64）',
+     lnPx(0)[0] === 255 && lnPx(1)[0] === 64 &&
+     Math.abs(lnPx(1)[0] - Math.round((1000 / Math.pow(1000, 5 / 6)) /
+       (4000 / Math.pow(1000, 5 / 6)) * 255)) <= 1,
+     JSON.stringify([lnPx(0)[0], lnPx(1)[0]]));
+
+  ok('统计条：横轴是 x（原始坐标）、帧数与真实跨度、直流中位数、谱线根数',
+     read("$('line-at').textContent") === '行 y = 10，横轴 x' &&
+     read("$('line-frames').textContent") === '3 帧，真实跨度 667.1 fs' &&
+     read("$('line-dcmed').textContent") === '1000.0' &&
+     read("$('line-lines').textContent").indexOf('192 ~ 196（共 5 根 / Nyquist 到 1999）　全通') >= 0,
+     [read("$('line-at').textContent"), read("$('line-frames').textContent"),
+      read("$('line-dcmed').textContent")].join(' | '));
+
+  ok('横轴刻度写的是**原始坐标**（从 rect 的原点起，不是从 0 起）',
+     read("$('line-x-lo').textContent") === 'x 500' &&
+     read("$('line-x-mid').textContent") === 'x 501' &&
+     read("$('line-x-hi').textContent") === 'x 503',
+     [read("$('line-x-lo').textContent"), read("$('line-x-hi').textContent")].join(' / '));
+
+  calls.length = 0;
+  run("$('line-dcmin').value = '-30'; $('line-dcmin').oninput()");
+  ok('门限收紧到 −30 dB（= 31.6 ADU）：直流 10 的那一**整列**涂深灰并计数 —— 改门限只重画',
+     JSON.stringify(lnPx(2)) === JSON.stringify([30, 41, 59]) &&
+     read("$('line-blank').textContent") === '1 / 4 列（25.0%）' && calls.length === 0,
+     JSON.stringify(lnPx(2)) + ' | ' + read("$('line-blank').textContent"));
+  run("$('line-dcmin').value = ''; $('line-dcmin').oninput()");
+  ok('门限留空 = 不掐：那一列又画出来（框是唯一的准）',
+     JSON.stringify(lnPx(2)) !== JSON.stringify([30, 41, 59]) &&
+     read("$('line-blank').textContent") === '0',
+     read("$('line-blank').textContent"));
+
+  calls.length = 0;
+  run("$('line-cap').value = '8'; $('line-cap').oninput()");
+  ok('显示上限填 8：超过的涂白、色标右端变成 8、统计条报超出几格 —— 一个请求都不发',
+     read("$('line-bar-hi').textContent") === '8.00' &&
+     read("$('line-bar-mid').textContent") === '4.00' &&
+     read("$('line-over').textContent") === '2 / 12 格（16.7%）' &&
+     lnPx(0)[0] === 255 && calls.length === 0,
+     [read("$('line-bar-hi').textContent"), read("$('line-over').textContent"),
+      JSON.stringify(lnPx(0))].join(' | '));
+  run("$('line-cap').value = ''; $('line-cap').oninput()");
+  ok('上限留空 = 不掐：色标与统计回到按最强那一格',
+     read("$('line-bar-hi').textContent") === '12.6' &&
+     read("$('line-over').textContent") === '0',
+     read("$('line-bar-hi').textContent") + ' | ' + read("$('line-over').textContent"));
+
+  // ---- 色标：图上色与图下那条色标读的是**同一份** 256 格表（换色标只改画法）----
+  // 灰度在表里就是第 k 格 = (k,k,k)；彩色色标给的是 matplotlib 同名色标的锚点（这里只认两端的
+  // 那两个颜色：viridis 两头是 [68,1,84] 与 [253,231,37]）。表只铺一次、图与色标同读一份内存。
+  const lnBarPx = (i) => JSON.parse(read('JSON.stringify(Array.prototype.slice.call(' +
+    '$("line-bar")._img.data,' + (i * 4) + ',' + (i * 4 + 3) + '))'));
+  const lnTab = (name, k) => JSON.parse(read('JSON.stringify(Array.prototype.slice.call(' +
+    'cmapTable("' + name + '"),' + (k * 3) + ',' + (k * 3 + 3) + '))'));
+
+  const lnCmapOpts = (function () {
+    const at = html.indexOf('id="line-cmap"');
+    const seg = at < 0 ? '' : html.slice(at, html.indexOf('</select>', at));
+    return Array.from(seg.matchAll(/value="([^"]+)"/g), (m) => m[1]);
+  })();
+  ok('色标下拉写在 index.html 里：灰度排第一（默认），八张彩色色标跟着 —— 名字就是表里的名字',
+     lnCmapOpts.join(',') === 'gray,viridis,inferno,magma,plasma,cividis,turbo,hot,jet',
+     lnCmapOpts.join(','));
+
+  ok('默认灰度：图上最亮那格是白的，图下那条色标两端就是 0 与 255 的灰阶',
+     read("lineCmapName()") === 'gray' &&
+     JSON.stringify(lnBarPx(0)) === JSON.stringify([0, 0, 0]) &&
+     JSON.stringify(lnBarPx(255)) === JSON.stringify([255, 255, 255]) &&
+     JSON.stringify(lnPx(0)) === JSON.stringify([255, 255, 255]),
+     [read("lineCmapName()"), JSON.stringify(lnBarPx(0)), JSON.stringify(lnBarPx(255))].join(' | '));
+
+  calls.length = 0;
+  run("lineCache._mark = 1; $('line-cmap').value = 'viridis'; $('line-cmap').onchange()");
+  ok('切到 viridis：最亮那格 = 色标右端 = [253, 231, 37]、0 那格 = [68, 1, 84] —— 图与色标同读一份表',
+     JSON.stringify(lnPx(0)) === JSON.stringify([253, 231, 37]) &&
+     JSON.stringify(lnBarPx(255)) === JSON.stringify([253, 231, 37]) &&
+     JSON.stringify(lnBarPx(0)) === JSON.stringify([68, 1, 84]),
+     [JSON.stringify(lnPx(0)), JSON.stringify(lnBarPx(255)), JSON.stringify(lnBarPx(0))].join(' | '));
+
+  ok('换色标**只重画**：一个请求都不发、数值那份缓存没被作废，色标名在色标条与闲时那行字里一起改口',
+     calls.length === 0 && read('lineCache._mark') === 1 &&
+     read("$('line-bar').title").indexOf('线包络：线性色标（viridis）') === 0 &&
+     read("$('line-hover').textContent").indexOf('线性色标（viridis）') > 0,
+     [JSON.stringify(calls), read("$('line-bar').title")].join(' | '));
+
+  ok('占最强四分之一的那一格取的是表里第 64 格（同一条式子的 k，不是另算一条渐变）',
+     JSON.stringify(lnPx(1)) === JSON.stringify(lnTab('viridis', 64)),
+     JSON.stringify(lnPx(1)) + ' vs ' + JSON.stringify(lnTab('viridis', 64)));
+
+  run("$('line-cmap').value = 'gray'; $('line-cmap').onchange()");
+  ok('切回灰度：颜色与色标名一起回来（灰度那格就是 64）',
+     JSON.stringify(lnPx(0)) === JSON.stringify([255, 255, 255]) &&
+     JSON.stringify(lnPx(1)) === JSON.stringify([64, 64, 64]) &&
+     read("$('line-bar').title").indexOf('线包络：线性色标（灰度）') === 0,
+     read("$('line-bar').title"));
+
+  calls.length = 0;
+  run("$('line-n').value = '0.5'; $('line-n').oninput()");
+  ok('改 n（3 → 0.5，指数 5/6 → 0）：数值变了、**一个请求都不发**，统计格跟着换',
+     calls.length === 0 &&
+     Math.abs(read('lineSeries()[0]') - 4000) < 1e-6 &&
+     read("$('line-n-note').textContent") === '0.5（指数 0.0000）',
+     read("$('line-n-note').textContent") + ' | ' + JSON.stringify(calls));
+  run("$('line-n').value = '3'; $('line-n').oninput()");
+
+  run("$('line-canvas').onmousemove({ clientX: 150, clientY: 100 })");
+  ok('hover：读出第几帧、那一刻的读出位置、哪个位置、E 与它的直流',
+     read("$('line-hover').textContent") ===
+       '第 2 帧（位置 1.500 µm）　x = 501　E = 12.6　直流 1000.0 ADU（最强的 100.0%）',
+     read("$('line-hover').textContent"));
+  run("$('line-canvas').onmouseleave()");
+  ok('鼠标离开：那行字还给算式本身（写明现在的 n 与指数）',
+     read("$('line-hover').textContent").indexOf('E = |z| ÷ d^0.8333（n = 3）') > 0,
+     read("$('line-hover').textContent"));
+
+  run("$('filt-lmin').value = '1.02'; $('filt-lmax').value = '1.045'; $('filt-lmin').oninput()");
+  ok('填好波段：立刻标出「波段改过，点重算」—— 手里这张还是全通算的，不许冒充',
+     read("$('line-stale').hidden") === false &&
+     read("$('line-stale').textContent") === '波段改过，点重算',
+     read("$('line-stale').textContent"));
+
+  calls.length = 0;
+  run("$('line-col').value = '7'");
+  await run("$('btn-line-yt').onclick()"); await tick();
+  ok('固定一列 x=7（画 y-t）：请求带 axis=x，波段原样跟着走；进度从 0 报起',
+     calls.indexOf('POST /api/scans/82/line?lmin=1.02&lmax=1.045&axis=x&index=7') >= 0 &&
+     read("$('line-progress').textContent") === '正在读盘 0 / 3 张 …',
+     JSON.stringify(calls));
+  run('linePolling.stop()');
+
+  calls.length = 0;
+  run("$('line-row').value = 'abc'");
+  await run("$('btn-line-xt').onclick()"); await tick();
+  ok('行号填了不是数：当场说清要填非负整数，不发请求',
+     !calls.some((c) => c.indexOf('/line?') >= 0) &&
+     read("$('toast').textContent").indexOf('行 y 要填一个非负整数') === 0,
+     read("$('toast').textContent") + ' | ' + JSON.stringify(calls));
+  run("$('line-row').value = '10'");
+
+  run("$('line-n').value = 'abc'; $('line-n').oninput()");
+  ok('n 填了不是数的东西：两个起算按钮都禁用并说明为什么',
+     read("$('btn-line-xt').disabled") === true && read("$('btn-line-yt').disabled") === true &&
+     read("$('btn-line-xt').title").indexOf('算不了') === 0,
+     read("$('btn-line-xt').title"));
+  // ---- 不滤波：去掉带通，逐帧画 |I − d|（与〈强度对齐〉那个「不滤波」同一口径）----
+  run("$('line-n').value = '3'; $('line-n').oninput();");   // 上一条用例把它填成了不是数
+  // 手里这张还是滤波口径那张 → 勾上立刻标「口径改过，点重算」，图与请求都不动。
+  calls.length = 0;
+  run("$('line-nofilter').checked = true; $('line-nofilter').onchange()");
+  ok('勾上「不滤波」：波段那格改说口径、立刻标「口径改过，点重算」，图与请求都不动',
+     read("$('line-stale').hidden") === false &&
+     read("$('line-stale').textContent") === '口径改过，点重算' &&
+     read("$('line-band').textContent").indexOf('不滤波') > 0 && calls.length === 0,
+     read("$('line-stale').textContent") + ' | ' + read("$('line-band').textContent"));
+
+  calls.length = 0;
+  await run("$('btn-line-xt').onclick()"); await tick();
+  ok('不滤波起算：只带 unfiltered=1 与位置，一个波长都不带（波段不参与）',
+     calls.indexOf('POST /api/scans/82/line?unfiltered=1&axis=y&index=10') >= 0,
+     JSON.stringify(calls));
+
+  // 这一份的三列：包络换成 |I − d|（值随便给），直流与每帧位置照旧
+  const LN_UNF = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  const lnUnfBytes = (function () {
+    const f = new Float32Array(12 + 4 + 3);
+    for (let i = 0; i < 12; i++) f[i] = LN_UNF[i];
+    for (let i = 0; i < 4; i++) f[12 + i] = LN_DC[i];
+    for (let i = 0; i < 3; i++) f[16 + i] = LN_POS[i];
+    return f.buffer;
+  })();
+  const lnUnf = Object.assign({}, lnMeta, { unfiltered: true, band: [null, null] });
+  delete lnUnf.k_lo; delete lnUnf.k_hi; delete lnUnf.k_max; delete lnUnf.df_thz;
+  lnBin = lnUnfBytes;
+  lnJob = { running: false, scan_id: 82, done: 3, total: 3, error: null, result: lnUnf };
+  calls.length = 0;
+  await run('linePoll()');
+  ok('不滤波那份：标题写（不滤波）、「留下谱线」换成「口径」、闲时那行写 |I − d|',
+     read("$('line-title').textContent").indexOf('（不滤波）') > 0 &&
+     read("$('line-lines-label').textContent") === '口径' &&
+     read("$('line-lines').textContent") === '不滤波（整条时间序列）' &&
+     read("$('line-hover').textContent").indexOf('E = |I − d| ÷ d^0.8333') > 0 &&
+     calls.indexOf('GET /api/scans/82/line.bin') >= 0,
+     [read("$('line-title').textContent"), read("$('line-lines').textContent"),
+      read("$('line-hover').textContent")].join(' | '));
+  ok('不滤波的数照同一个分母：E = |I − d| ÷ d^(5/6)，逐格与手算一致',
+     (function () {
+       const vals = JSON.parse(read('JSON.stringify(Array.from(lineSeries()))'));
+       const want = LN_UNF.map((e, i) => e / Math.pow(LN_DC[i % 4], 5 / 6));
+       return vals.every((v, i) => Math.abs(v - want[i]) < 1e-6);
+     })(), read('JSON.stringify(Array.from(lineSeries()).slice(0, 4))'));
+
+  run("$('line-nofilter').checked = false; $('line-nofilter').onchange()");
+  ok('取消勾选：又标出「口径改过，点重算」（手里这张是上一口径的，不许冒充）',
+     read("$('line-stale').hidden") === false &&
+     read("$('line-stale').textContent") === '口径改过，点重算',
+     read("$('line-stale').textContent"));
+  lnBin = lnBytes;
+
+  run("$('line-n').value = '3'; $('line-n').oninput(); $('filt-lmin').value = '';" +
+      " $('filt-lmax').value = ''; $('filt-lmin').oninput();");
+
   console.log('\n[AC] 跨语言 golden：pixelSpectrum / filtKeepRange 与后端同一条式子（同一份期望值）');
   const golden = JSON.parse(fs.readFileSync('backend/tests/golden_spectrum.json', 'utf8'));
   run("dataScale = 'um';");   // golden 的时间列就是 time_fs 那一列（原值口径下是另一串数）

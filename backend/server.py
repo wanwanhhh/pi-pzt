@@ -966,19 +966,46 @@ def _align_meta(res: Optional[dict]) -> Optional[dict]:
     return out
 
 
+def _line_run(plan: dict, progress, lmin, lmax, axis, index, unfiltered: bool = False):
+    """线包络怎么算：沿一条线（固定行或固定列）一遍读盘，逐帧取带通信号的包络 |z|。
+
+    分母（d 的 (2n−1)/(2n) 次方）与强度对齐同一个 d、同一个 n —— n 仍然不进后端。
+    unfiltered 去掉带通：b 直接是 I − d，图上画 |b|（与强度对齐的「不滤波」同一口径）。
+    """
+    from . import line_envelope
+
+    return line_envelope.line_envelope(plan["items"], axis, index, crop=plan["rect"],
+                                       lmin=lmin, lmax=lmax, unfiltered=unfiltered,
+                                       progress=progress)
+
+
+def _line_meta(res: Optional[dict]) -> Optional[dict]:
+    """下发前摘掉三列数组；另给 dc_median（直流门限相对它，与强度对齐同一条规矩）。"""
+    import numpy as np
+
+    if res is None:
+        return None
+    out = {k: v for k, v in res.items() if k not in ("env", "dc", "pos_um")}
+    out["dc_median"] = float(np.median(res["dc"]))
+    return out
+
+
 _PHASE = WholeMap("相位图", _phase_run, _phase_meta,
                   lambda res: [res["phase"], res["amp"]], "phasemap")
 _ALIGN = WholeMap("强度对齐", _align_run, _align_meta,
                   lambda res: [res["energy"], res["dc"]], "align")
+_LINE = WholeMap("线包络", _line_run, _line_meta,
+                 lambda res: [res["env"], res["dc"], res["pos_um"]], "linemap")
 
 
 def _map_plan(scan_id: int, lmin: Optional[float], lmax: Optional[float],
-              *, need_band: bool = True) -> dict:
-    """要读哪些帧、按哪个波段 —— 两条作业共用的一段（不合格当场拒，别让它跑到一半才报）。
+              *, need_band: bool = True, what: str = "整幅图") -> dict:
+    """要读哪些帧、按哪个波段 —— 三条作业共用的一段（不合格当场拒，别让它跑到一半才报）。
 
     **只做共有的那几条**：404、正在裁剪 409、逐点校验、波段 → 谱线。
-    "全通收不收"是各自的规矩（相位图不收、强度对齐照算），留在调用方。
+    "全通收不收"是各自的规矩（相位图不收、强度对齐与线包络照算），留在调用方。
     **不滤波**那条不分波段：need_band=False 时只做逐点校验（它仍要读同一批帧）。
+    what 只用来拼「做不了什么」（线包络那条读的是一条线，不是整幅图）。
     """
     from . import bands, frames
 
@@ -993,7 +1020,7 @@ def _map_plan(scan_id: int, lmin: Optional[float], lmax: Optional[float],
     # 逐点校验只有一处：frames.usable（「缺一个点就是另一条采样序列」这句话的家在那里）。
     # 它顺带把「少于 3 个点」判掉 —— 那正是空扫描先炸 max() 的那一格。
     try:
-        frames.usable(items, "整幅图")
+        frames.usable(items, what)
         if need_band:
             t = [p * TIME_FS_PER_UM for (_, p, _) in items]
             bands.band_lines(lmin, lmax, len(t), max(t) - min(t))
@@ -1089,6 +1116,54 @@ def api_align_bin(scan_id: int) -> Response:
     数组按**盘上那张图**的顺序摆，`rect` 把它落回**原始坐标** —— 与取数、剖面、相位图同一套。
     """
     return _ALIGN.bin_response(scan_id)
+
+
+# 线包络：沿一条线的 x-t / y-t —— 每个位置、每一帧的带通包络 |z|（口径见
+# backend/line_envelope.py 的文件头）。分母与强度对齐同一个 d、同一个 n（n 仍在界面上）；
+# **全通照算**（这里不需要载波）；线可以是固定的一行 y（画 x-t），也可以是固定的一列 x（画 y-t）。
+
+@app.post("/api/scans/{scan_id}/line")
+def api_line_run(scan_id: int,
+                 axis: str = Query(..., description="y = 固定一行（画 x-t）；x = 固定一列（画 y-t）"),
+                 index: int = Query(..., ge=0, description="那一行 / 那一列的**原始坐标**"),
+                 lmin: Optional[float] = Query(None, description="波长最小 (µm)"),
+                 lmax: Optional[float] = Query(None, description="波长最大 (µm)"),
+                 unfiltered: bool = Query(
+                     False, description="不滤波：不分波段，逐帧画 |I − d|")) -> dict:
+    """算这一条扫描里**一条线**的逐帧包络（后台线程；进度看 GET /api/line）。
+
+    波段仍只有〈滤波曲线〉那两个框一个来源；两个都空 = 全通，照算。
+    `index` 是**原始坐标**（裁过的扫描也一样），`axis` 说固定的是哪一根。
+    只读盘上的图、不碰设备。
+    """
+    if axis not in ("x", "y"):
+        raise HTTPException(400, "线只有两种：x（固定一列、画 y-t）或 y（固定一行、画 x-t）")
+    if unfiltered:
+        if lmin is not None or lmax is not None:
+            raise HTTPException(400, "不滤波就不分波段：波长框要留空（或去掉 unfiltered）")
+        plan = _map_plan(scan_id, None, None, need_band=False, what="线包络图")
+    else:
+        plan = _map_plan(scan_id, lmin, lmax, what="线包络图")
+    out = _LINE.start(scan_id, plan, lmin=lmin, lmax=lmax, unfiltered=unfiltered,
+                      axis=axis, index=index)
+    out["axis"] = axis
+    out["index"] = index
+    return out
+
+
+@app.get("/api/line")
+def api_line_state() -> dict:
+    """线包络的进度 + 最近算完的那一份（**不含三列数组**：它们走 line.bin）。"""
+    return _LINE.state()
+
+
+@app.get("/api/scans/{scan_id}/line.bin")
+def api_line_bin(scan_id: int) -> Response:
+    """包络 |z|（帧 × 线长）、直流 d（线长）、每帧读出位置（帧数）：三段 float32 连着给。
+
+    各段长度都在结果里（p / n），顺序就是这个顺序；`rect` 把线落回**原始坐标**。
+    """
+    return _LINE.bin_response(scan_id)
 
 
 # ------------------------------------------------------------------ 数据页：裁剪

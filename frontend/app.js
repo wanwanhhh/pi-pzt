@@ -90,7 +90,7 @@ function showView(v) {
   if (view === 'data') {
     // 扫描列表回来之后要再刷一次两张整幅图的「该重算」标记：
     // 刚进页面时列表还是空的，scanIdOf() 给 null —— 那一格会写成「现在选的是 #null」（编出来的号）。
-    loadDataScans().then(function () { mapSyncUI(); alignSyncUI(); });
+    loadDataScans().then(function () { mapSyncUI(); alignSyncUI(); lineSyncUI(); });
     loadDataSources();     // 「这条是哪台设备采的」的选项（系数只在后端，前端只拿键与文案）
     fitChart(dataChart, 'data-chart', 240);
     fitChart(specChart, 'spec-chart', 180);
@@ -507,7 +507,8 @@ function showPointsBelow(max) {
   return function (u) { return u.data[0].length <= max; };
 }
 
-/* 一根轴按**整条曲线**铺满，不看视窗 —— 给「只有自动范围、不吃滚轮/拖动」的那根轴用（相位）。
+/* 一根轴按**整条曲线**铺满，不看视窗 —— 相位那两根轴的默认铺法：频谱那张的两个框没填过时走这里，
+   滤波那张只有这一条（那一页不设相位范围框）。
    uPlot 重铺范围时会把每根没写死 min/max 的轴**按视窗里那几个数**重算（它传进来的 min/max 就是
    那几个数，见它的 qn/bn）：谱的相位散在整条横轴上，视窗挪开一点、门限内那几根就一根不剩 ——
    实测滚一下滚轮，相位轴直接变成 [null, null]，整条相位就没了。所以这里丢开传进来的两个数，
@@ -2029,6 +2030,8 @@ const DATA_TABS = {
          note: '整幅图里每个像素跟基准像素差多少相位' },
   align: { tab: 'data-tab-align', card: 'card-align', chart: null, height: 0,
            note: '整幅图里哪个像素的条纹更深（除掉了各自的直流）' },
+  line: { tab: 'data-tab-line', card: 'card-line', chart: null, height: 0,
+          note: '沿一条线：条纹深度随时间和位置怎么变' },
 };
 
 function dataTabShow(name) {
@@ -2682,13 +2685,16 @@ function renderSpectrum(d) {
   specImportNote();                       // 下面那行小字跟着导入的那条线走
 }
 
-/* 频率轴（X）与纵轴（Y）**各是一个范围框**（同一套规矩，见 rangeBox），各钉各的标记、各一个「自动范围」。 */
+/* 频率轴（X）、纵轴（Y）、相位轴（Y2）**各是一个范围框**（同一套规矩，见 rangeBox），
+   各钉各的标记、各一个「自动范围」—— 填了相位那两个框也只钉相位轴，别的不动。 */
 function specApply() {
   if (!specChart) return;
   const wx = specX.window();
   if (wx) specChart.setScale('x', { min: wx[0], max: wx[1] });
   const wy = specY.window();
   if (wy) specChart.setScale('y', { min: wy[0], max: wy[1] });
+  const wr = specRad.window();
+  if (wr) specChart.setScale('y2', { min: wr[0], max: wr[1] });
 }
 
 const specX = rangeBox({
@@ -2726,7 +2732,19 @@ const specY = rangeBox({
   },
 }).wire();
 
-function applySpecRange() { specX.apply(); specY.apply(); }
+/* 右边那条相位轴：**也能钉住**。没填过就按门限内整条相位自己铺满 —— 铺法与从前一模一样
+   （axisFullRange：整条、跳过门限外那些空点、按 rangeNum 补边），所以默认看起来没变；
+   填了就只按框里的数。它**不吃滚轮/拖动**：一次拖动不能同时改两根纵轴（这是唯一的例外，
+   写在设计 §十一 里）—— 改相位范围只走这两个框与「自动范围」。 */
+const specRad = rangeBox({
+  min: 'spec-radmin', max: 'spec-radmax', pin: 'spec-radpin', fit: 'btn-spec-radfit',
+  decimals: 3, onApply: specApply,
+  fitValues: function () { return specChart ? axisFullRange(specChart, 0, 0, 'y2') : null; },
+}).wire();
+
+/* 三根轴各按自己的框套一遍。相位**先**算：它的铺满要读这一遍刚贴上去的那列数据
+   （specApply 一次把三根都套上，所以顺序只影响「谁拿到的数新」）。 */
+function applySpecRange() { specRad.apply(); specX.apply(); specY.apply(); }
 
 /* 「聚焦最强峰」：把频率轴窗口填成以最强分量为中心的一段。**与「自动范围」同一层** ——
    只是替你把两个数填进范围框并钉住（框仍然是唯一的准，之后滚轮/拖动照旧改框里的数）。
@@ -3313,23 +3331,38 @@ function pickCell(ev, canvasId, data, r) {
   return { x: sx + rect[0], y: sy + rect[1], i: sy * data.w + sx };
 }
 
-/* 两列 float32 走二进制口：形状在结果里（w×h 各一列，连着给）。
+/* 几列 float32 走二进制口：各列首尾相接地给，**每列多长由调用方按结果里的形状说**
+   （相位图 / 强度对齐是两列 w×h；线包络是包络 帧×线长、直流 线长、每帧位置 帧数）。
    失败的前半段走 `fetchChecked`（与 JSON 那条路同一处：连不上、非 2xx 各一句原话）；
    这里只管二进制自己的两件事 —— 长度不对、以及慢响应。
    抓不到 / 长度对不上就说清楚并返回 null —— **不硬画**（半张图比没有图更坏）。
    `stale()` 在拿到字节之后、验长度之前问一次：这条流程换了对象（慢响应）就整份丢掉，
    连"长度不对"都不该报 —— 那不是这一份的事。 */
-async function fetchPair(url, r, what, stale) {
+async function fetchArrays(url, lengths, what, stale) {
   const resp = await fetchChecked(url);      // 连不上 / 非 2xx：原因已经摆出来了
   if (!resp) return null;
   const buf = await resp.arrayBuffer();
   if (stale && stale()) return null;
-  const n = r.w * r.h;
-  if (buf.byteLength !== n * 8) {
-    toast(what + '数据长度不对（' + buf.byteLength + ' 字节，应该是 ' + (n * 8) + '）', true);
+  let total = 0;
+  for (let i = 0; i < lengths.length; i++) total += lengths[i];
+  if (buf.byteLength !== total * 4) {
+    toast(what + '数据长度不对（' + buf.byteLength + ' 字节，应该是 ' + (total * 4) + '）', true);
     return null;
   }
-  return { first: new Float32Array(buf, 0, n), second: new Float32Array(buf, n * 4, n) };
+  const out = [];
+  let off = 0;
+  for (let i = 0; i < lengths.length; i++) {
+    out.push(new Float32Array(buf, off, lengths[i]));
+    off += lengths[i] * 4;
+  }
+  return out;
+}
+
+/* 两张整幅图（相位图 / 强度对齐）都是两列 w×h —— 照旧把它们叫 first / second。 */
+async function fetchPair(url, r, what, stale) {
+  const n = r.w * r.h;
+  const a = await fetchArrays(url, [n, n], what, stale);
+  return a ? { first: a[0], second: a[1] } : null;
 }
 
 /* 进度行上的每一句话：**从起算到画完，一条流程要说五种**，两条整幅图说的是同一套。
@@ -3955,7 +3988,8 @@ function mapRingFit() {
    不重读盘、不重算带通。换波段、换扫描才要重算。全通也能算（这里不需要载波）。
    配色是**线性**灰度：0 → 最深、上限 → 最白（不做对数 —— 图上直接读的是 S 的比例）；
    上限默认是最强那一格，填了「显示上限」就按它画（超过的涂白并计数），几个坏点压不黑整幅图。
-   门限以下（直流太小）的像素涂深灰，不当成 0。 */
+   门限以下（直流太小）的像素涂深灰，不当成 0；勾了「掩掉亮斑」时，比 64×64 块中位数
+    亮 N 倍的格子涂深红（见 alignMaskOn 那一族）—— 灰尘斑是十几像素的弥散斑，小窗口判不出来。 */
 
 let alignResult = null;         // 后端那一份结果的 meta（扫描号 / 波段 / rect / 幅面 / 谱线 / 直流中位数）
 let alignData = null;           // {w, h, energy, dc}：两列 float32（与 n 无关）
@@ -3969,12 +4003,160 @@ const alignPolling = poller(alignPoll, 400);
    下限是 1/2，不是 0：n < 1/2 时指数 (2n−1)/(2n) 为负，d^负 会把直流小的像素**放大**
    （n=0.1 时指数 −4），整幅图被几个暗点顶死。这个下限只有这一处说了算 ——
    index.html 的 min 属性只是浏览器里的提示，拦不住手打。 */
-function alignN() {
-  const v = parseFloat(String($('align-n').value || '').trim());
+function normN(id) {
+  const v = parseFloat(String($(id).value || '').trim());
   return isFinite(v) && v >= 0.5 ? v : NaN;
 }
 
-function alignExponent(n) { return (2 * n - 1) / (2 * n); }
+/* 每张灰度图读自己的那个框（线包络那张也有一个 n，见那一节）。 */
+function alignN() { return normN('align-n'); }
+
+function normExponent(n) { return (2 * n - 1) / (2 * n); }
+
+/* ============ 亮斑掩模：比局部背景亮 N 倍的格子不画 ============
+   灰尘/颗粒在图上是一颗十几像素的弥散斑，**不是单个像素** —— 5×5 那种小窗口里
+   斑自己就是"邻域"，永远判不出离群。所以局部背景按 64×64 的块取中位数、再双线性
+   插值到每个像素：块远大于一颗斑，背景就是"这一带本该有多亮"。
+   S 超过背景 N 倍的格子**按邻域填平**（从斑边缘往里铺，画成与附近同一档灰）并单独计数
+   （不参与「超过上限」），hover 照实读真值 —— 图上看不见，账上不少一格。
+   **只改画法**：energy、dc、n、门限、显示上限都不动；N 改了只重判一次。 */
+
+const ALIGN_BG_BLOCK = 64;      // 局部背景的块边长（px）
+
+function alignMaskOn() { return $('align-mask').checked === true; }
+
+/* N 倍：框是唯一的准，读不出数（≤ 1 / 不是数）就按 4 —— 与门限、上限同一个脾气：
+   填错了照实画，统计条写明用的是几。 */
+function alignMaskN() {
+  const v = parseFloat(String($('align-mask-n').value || '').trim());
+  return isFinite(v) && v > 1 ? v : 4;
+}
+
+/* 局部背景：块中位数（NaN 不参与）→ 块格双线性插值。四角有一个估不出来就不判这一格。 */
+function alignLocalBg(vals, w, h) {
+  const B = ALIGN_BG_BLOCK;
+  const gw = Math.ceil(w / B), gh = Math.ceil(h / B);
+  const grid = new Float64Array(gw * gh), sub = new Float64Array(B * B);
+  for (let gy = 0; gy < gh; gy++) {
+    const y1 = Math.min(h, (gy + 1) * B);
+    for (let gx = 0; gx < gw; gx++) {
+      const x1 = Math.min(w, (gx + 1) * B);
+      let n = 0;
+      for (let y = gy * B; y < y1; y++) {
+        const row = y * w;
+        for (let x = gx * B; x < x1; x++) {
+          const v = vals[row + x];
+          if (v === v) sub[n++] = v;
+        }
+      }
+      grid[gy * gw + gx] = n ? sub.subarray(0, n).sort()[n >> 1] : NaN;
+    }
+  }
+  const bg = new Float64Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let fy = (y + 0.5) / B - 0.5, y0 = Math.floor(fy);
+    if (y0 < 0) { y0 = 0; fy = 0; } else if (y0 > gh - 1) { y0 = gh - 1; fy = 0; }
+    const y1 = Math.min(y0 + 1, gh - 1), ty = fy - y0, r0 = y0 * gw, r1 = y1 * gw;
+    for (let x = 0; x < w; x++) {
+      let fx = (x + 0.5) / B - 0.5, x0 = Math.floor(fx);
+      if (x0 < 0) { x0 = 0; fx = 0; } else if (x0 > gw - 1) { x0 = gw - 1; fx = 0; }
+      const x1 = Math.min(x0 + 1, gw - 1), tx = fx - x0;
+      const a = grid[r0 + x0], b = grid[r0 + x1], c = grid[r1 + x0], d = grid[r1 + x1];
+      bg[y * w + x] = (a === a && b === b && c === c && d === d)
+        ? (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty : NaN;
+    }
+  }
+  return bg;
+}
+
+/* 这一列（也就是这个 n 与这个门限）的背景。**与 N 无关**，所以改 N 不重算它。 */
+let alignBgCache = null;        // {key, bg}
+
+function alignLocalBgOf() {
+  const c = alignSeriesCached();
+  if (!c) return null;
+  const key = alignLoadedKey + '|' + alignN() + '|' + alignGate();
+  if (alignBgCache && alignBgCache.key === key) return alignBgCache.bg;
+  const bg = alignLocalBg(c.vals, alignData.w, alignData.h);
+  alignBgCache = { key: key, bg: bg };
+  return bg;
+}
+
+/* 这一格该不该判为亮斑：背景估不出来（NaN）或不是正数就不判 —— 宁可漏掩，不误伤。 */
+function alignIsBlot(bg, i, v, nMul) {
+  return !!(bg && bg[i] > 0 && v > bg[i] * nMul);
+}
+
+/* 判断出来的格子再做一次**膨胀**：亮斑是从中心往外渐弱的，只抹中心就会留下亮边，
+   图上成了"甜甜圈"。膨胀把斑的边缘一起盖住；半径按图的大小收（小图上不膨胀）。 */
+const ALIGN_BLOT_DILATE = 3;
+
+function alignDilate(src, w, h, r) {
+  if (r <= 0) return src;
+  const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const lo = x - r < 0 ? 0 : x - r, hi = x + r >= w ? w - 1 : x + r;
+      let v = 0;
+      for (let q = lo; q <= hi && !v; q++) v = src[row + q];
+      tmp[row + x] = v;
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) {
+      const lo = y - r < 0 ? 0 : y - r, hi = y + r >= h ? h - 1 : y + r;
+      let v = 0;
+      for (let q = lo; q <= hi && !v; q++) v = tmp[q * w + x];
+      out[y * w + x] = v;
+    }
+  }
+  return out;
+}
+
+/* 填平：从斑的边缘往里一轮一轮铺 —— 每轮拿上下左右「已知」的值的平均，铺一层进来。
+   填出来的就是**紧邻的亮度**；用远处的块中位数不行，弥散斑里它偏暗，会留下一圈暗影。
+   只遍历被掩的那几千到几万个格子，几轮就填满（斑直径几十像素也就几十轮）。 */
+function alignFillIn(vals, mask, w, h) {
+  const n = w * h, out = Float64Array.from(vals), known = new Uint8Array(n);
+  let cur = [];
+  for (let i = 0; i < n; i++) { if (mask[i]) cur.push(i); else known[i] = 1; }
+  let guard = 0;
+  while (cur.length && guard++ < 1024) {
+    const next = [];
+    for (let k = 0; k < cur.length; k++) {
+      const i = cur[k], x = i % w, y = (i - x) / w;
+      let s = 0, c = 0;
+      if (x > 0 && known[i - 1]) { s += out[i - 1]; c++; }
+      if (x < w - 1 && known[i + 1]) { s += out[i + 1]; c++; }
+      if (y > 0 && known[i - w]) { s += out[i - w]; c++; }
+      if (y < h - 1 && known[i + w]) { s += out[i + w]; c++; }
+      if (c) { out[i] = s / c; known[i] = 1; } else next.push(i);
+    }
+    cur = next;
+  }
+  return out;
+}
+
+/* 该抹哪些格子、填成什么。key 里含 N —— 改 N 只重算掩模与填平（几十毫秒），
+   不改数据、不重读盘。 */
+let alignBlotCache = null;      // {key, mask, count, filled}
+
+function alignBlotMask() {
+  const c = alignSeriesCached(), bg = alignLocalBgOf();
+  if (!c || !bg) return null;
+  const w = alignData.w, h = alignData.h, n = w * h, nMul = alignMaskN();
+  const key = alignLoadedKey + '|' + alignN() + '|' + alignGate() + '|' + nMul;
+  if (alignBlotCache && alignBlotCache.key === key) return alignBlotCache;
+  const raw = new Uint8Array(n);
+  for (let i = 0; i < n; i++) if (alignIsBlot(bg, i, c.vals[i], nMul)) raw[i] = 1;
+  const r = Math.min(ALIGN_BLOT_DILATE, Math.floor(Math.min(w, h) / 8));
+  const mask = alignDilate(raw, w, h, r);
+  let count = 0;
+  for (let i = 0; i < n; i++) if (mask[i]) count++;
+  alignBlotCache = { key: key, mask: mask, count: count, filled: alignFillIn(c.vals, mask, w, h) };
+  return alignBlotCache;
+}
 
 /* 勾没勾「不滤波」。**只此一处读这个框**：起算、旧图标记、统计条都从这里拿。 */
 function alignUnfiltered() { return $('align-nofilter').checked === true; }
@@ -3994,7 +4176,7 @@ function alignSeries() {
   if (!alignData) return null;
   const n = alignN();
   if (!isFinite(n)) return null;
-  const ex = alignExponent(n), gate = alignGate(), cnt = alignData.w * alignData.h;
+  const ex = normExponent(n), gate = alignGate(), cnt = alignData.w * alignData.h;
   const out = new Float64Array(cnt);
   for (let i = 0; i < cnt; i++) {
     const d = alignData.dc[i];
@@ -4003,9 +4185,9 @@ function alignSeries() {
   return out;
 }
 
-/* 这一列里最强的那一格（**跳过门限以下的**：直流小的像素除出来极大，先取最大值再掐，
-   色标会被一个孤立坏点顶死）。 */
-function alignTop(vals) {
+/* 这一列里最强的那一格（**跳过门限以下 / 除不了的**：直流小的位置除出来极大，
+   先取最大值再掐，色标会被一个孤立坏点顶死）。两张灰度图共用。 */
+function seriesTop(vals) {
   let top = 0;
   for (let i = 0; i < vals.length; i++) if (vals[i] === vals[i] && vals[i] > top) top = vals[i];
   return top;
@@ -4015,8 +4197,8 @@ function alignTop(vals) {
    （只有最亮的 0.1% 涂白）；填一个数 = 绝对上限（S 的单位，色标右端就是它）。
    **它只改画法**：不改数据、不进请求、不算错一行；比最强那一格还大 = 没掐。
    填了认不出的东西也按不掐画（与门限留空同一个脾气）—— 图上与色标都照实说话。 */
-function alignCapInput() {
-  const raw = String($('align-cap').value || '').trim();
+function capInput(id) {
+  const raw = String($(id).value || '').trim();
   if (!raw) return null;
   if (raw.charAt(raw.length - 1) === '%') {
     const p = parseFloat(raw.slice(0, -1));
@@ -4030,7 +4212,7 @@ function alignCapInput() {
    全幅 1.5 M 个点排序是 200 ms 级，而改上限是改一下看一眼的操作 —— 线性量化到 4096 段再数，
    误差 ≤ 满量程 / 4096（最强那一格的 0.024%），画面上看不出来。 */
 const ALIGN_Q_BINS = 4096;
-function alignQuantile(vals, top, p) {
+function capQuantile(vals, top, p) {
   if (!(top > 0)) return 0;
   const step = top / ALIGN_Q_BINS, bins = new Int32Array(ALIGN_Q_BINS);
   let n = 0;
@@ -4060,16 +4242,16 @@ let alignCache = null;          // {key, vals, top, cap}
 
 function alignSeriesCached() {
   if (!alignData || !alignResult) return null;
-  const capIn = alignCapInput();
+  const capIn = capInput('align-cap');
   const key = alignLoadedKey + '|' + alignN() + '|' + alignGate() + '|' +
     (capIn ? (capIn.pct || capIn.abs) : '');
   if (alignCache && alignCache.key === key) return alignCache;
   const vals = alignSeries();
   if (!vals) return null;
-  const top = alignTop(vals);
+  const top = seriesTop(vals);
   // 上限比最强那一格还大 = 没掐（色标右端仍是那一个数，图不会因为填大了反而变暗）
   const cap = capIn
-    ? Math.min(top, capIn.pct ? alignQuantile(vals, top, capIn.pct) : capIn.abs)
+    ? Math.min(top, capIn.pct ? capQuantile(vals, top, capIn.pct) : capIn.abs)
     : top;
   alignCache = { key: key, vals: vals, top: top, cap: cap };
   return alignCache;
@@ -4163,7 +4345,7 @@ async function alignFetchArrays() {
 function alignPick(ev) { return pickCell(ev, 'align-canvas', alignData, alignResult); }
 
 /* 图上那套数值的写法：三格刻度与 hover 共用（一个数只有一处决定它长什么样）。 */
-function alignNum(v) {
+function grayNum(v) {
   if (!isFinite(v)) return '—';
   if (v === 0) return '0';
   const a = Math.abs(v);
@@ -4178,8 +4360,8 @@ function alignNum(v) {
    几个坏点不该决定整幅图的对比度。
    门限以下的直流涂深灰并计数（那是「算得出却不可复现」，不是 0）。 */
 function alignPaint() {
-  alignBarPaint();               // 色标那条灰度条本身：与有没有图无关，空态也要摆着
-  const ids = ['align-size', 'align-lines', 'align-dcmed', 'align-blank', 'align-over'];
+  barPaint('align-bar');         // 色标那条灰度条本身：与有没有图无关，空态也要摆着
+  const ids = ['align-size', 'align-lines', 'align-dcmed', 'align-blank', 'align-over', 'align-masked'];
   const empty = $('align-empty');
   const n = alignN();
   const cached = alignSeriesCached();
@@ -4187,7 +4369,7 @@ function alignPaint() {
   if (!alignData || !alignResult || !vals) {
     setText('align-lines-label', alignResult && alignResult.unfiltered ? '口径' : '留下谱线');
     for (let i = 0; i < ids.length; i++) setText(ids[i], '—');
-    setText('align-n-note', isFinite(n) ? n + '（指数 ' + alignExponent(n).toFixed(4) + '）' : '—');
+    setText('align-n-note', isFinite(n) ? n + '（指数 ' + normExponent(n).toFixed(4) + '）' : '—');
     setText('align-title', '未算');
     alignScaleText(null, null);
     setText('align-hover', '鼠标停在图上：读出那一格的值、它的直流，以及它占最强的多少。');
@@ -4196,7 +4378,11 @@ function alignPaint() {
   }
   const r = alignResult, w = alignData.w, h = alignData.h;
   const top = cached.top, cap = cached.cap;
-  let blank = 0, over = 0;
+  // 亮斑掩模：背景只随数据 / n / 门限变；掩模（含膨胀）随 N 变，两者都缓存
+  const blot = alignMaskOn() ? alignBlotMask() : null;
+  const bg = blot ? alignLocalBgOf() : null;
+  const nMul = alignMaskN();
+  let blank = 0, over = 0, masked = 0;
   for (let i = 0; i < w * h; i++) if (vals[i] !== vals[i]) blank++;
   const cv = $('align-canvas');
   if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }   // 内部 1:1，CSS 负责缩放
@@ -4207,6 +4393,13 @@ function alignPaint() {
     const v = vals[i];
     if (v !== v) {
       px[j] = 30; px[j + 1] = 41; px[j + 2] = 59; px[j + 3] = 255;
+      continue;
+    }
+    if (blot && blot.mask[i]) {
+      masked++;
+      // 填平：用**紧邻填进来的亮度**画，不涂记号 —— 真值仍在统计条与 hover 里
+      const kb = Math.round(Math.max(0, Math.min(1, cap > 0 ? blot.filled[i] / cap : 0)) * 255);
+      px[j] = kb; px[j + 1] = kb; px[j + 2] = kb; px[j + 3] = 255;
       continue;
     }
     // **线性**：k = v / 上限 × 255（0 最深、上限最白）。v 可能是负的（数据本该非负，
@@ -4220,7 +4413,7 @@ function alignPaint() {
   const rect = mapRectOf(r);
   setText('align-title', '#' + r.scan_id + '　强度对齐' + (r.unfiltered ? '（不滤波）' : '') +
     '　' + (r.rect ? '裁剪块 ' + w + '×' + h + ' @ (' + rect[0] + ',' + rect[1] + ')' : w + '×' + h));
-  setText('align-n-note', n + '（指数 ' + alignExponent(n).toFixed(4) + '）');
+  setText('align-n-note', n + '（指数 ' + normExponent(n).toFixed(4) + '）');
   setText('align-size', w + '×' + h + (r.rect ? '（原始坐标原点 ' + rect[0] + ',' + rect[1] + '）' : ''));
   if (r.unfiltered) {
     setText('align-lines-label', '口径');
@@ -4234,6 +4427,7 @@ function alignPaint() {
   setText('align-dcmed', fmt(r.dc_median, 1));
   setText('align-blank', blank ? blank + ' / ' + (w * h) + '（' + (blank * 100 / (w * h)).toFixed(1) + '%）' : '0');
   setText('align-over', over ? over + ' / ' + (w * h) + '（' + (over * 100 / (w * h)).toFixed(1) + '%）' : '0');
+  setText('align-masked', masked ? masked + ' / ' + (w * h) + '（' + (masked * 100 / (w * h)).toFixed(1) + '%，' + nMul + ' 倍，已按邻域填平）' : '0');   // 含成片膨胀后的格数
   empty.hidden = true;
   alignScaleText(top, cap);
   setText('align-hover', alignIdleText());
@@ -4247,23 +4441,113 @@ function alignScaleText(top, cap) {
   const cv = $('align-bar');
   cv.title = top === null
     ? '强度对齐：线性灰度（0 → 最深、最强那一格 → 最白）；深灰 = 直流在门限以下（不是 0）'
-    : '强度对齐：线性灰度 —— 最深 = 0、最白 = ' + alignNum(cap) +
+    : '强度对齐：线性灰度 —— 最深 = 0、最白 = ' + grayNum(cap) +
       (cap < top ? '（显示上限：超过它的都涂白）' : '（这张图里最强的那一格）') +
       '；深灰 = 直流在门限以下（不是 0）';
   setText('align-bar-lo', '0');      // 左端永远是 0（最深），与有没有图无关
-  setText('align-bar-mid', top === null ? '—' : alignNum(cap / 2));
-  setText('align-bar-hi', top === null ? '—' : alignNum(cap));
+  setText('align-bar-mid', top === null ? '—' : grayNum(cap / 2));
+  setText('align-bar-hi', top === null ? '—' : grayNum(cap));
 }
 
-/* 色标那条灰度条本身：第 0 格 = 最深、第 255 格 = 最白 —— 与图上同一条线性式子。 */
-function alignBarPaint() {
-  const cv = $('align-bar');
+/* 色标：一张 256 格表（每格 RGB 0~255）。图上色与图下那条色标**读的是同一份** ——
+   一个决定只有一个家，图上与色标不各算各的颜色。
+   "gray" 没有锚点：第 k 格就是 (k, k, k)，0 最深、255 最亮；其余名字给的是 matplotlib
+   同名色标的**锚点**（0~255 均匀取样，33 个，与官方表最大差 ≤ 9/255），第一次用到时按
+   线性插值铺满 256 格并留着。锚点只决定颜色 —— 换一组锚点不动任何数。 */
+const CMAP_ANCHORS = {
+  viridis: [
+      [68, 1, 84], [71, 13, 96], [72, 24, 106], [72, 35, 116], [71, 45, 123], [69, 55, 129],
+      [66, 64, 134], [62, 73, 137], [59, 82, 139], [55, 91, 141], [51, 99, 141], [47, 107, 142],
+      [44, 114, 142], [41, 122, 142], [38, 130, 142], [35, 137, 142], [33, 145, 140], [31, 151, 139],
+      [31, 159, 136], [33, 166, 133], [39, 173, 129], [49, 181, 123], [61, 188, 116], [76, 194, 108],
+      [92, 200, 99], [110, 206, 88], [129, 211, 77], [149, 216, 64], [170, 220, 50], [192, 223, 37],
+      [213, 226, 26], [234, 229, 26], [253, 231, 37],
+  ],
+  inferno: [
+      [0, 0, 4], [4, 3, 18], [11, 7, 36], [21, 11, 55], [33, 12, 74], [47, 10, 91],
+      [61, 9, 101], [74, 12, 107], [87, 16, 110], [100, 21, 110], [113, 25, 110], [125, 30, 109],
+      [138, 34, 106], [151, 39, 102], [163, 44, 97], [176, 49, 91], [188, 55, 84], [198, 61, 77],
+      [208, 69, 69], [218, 78, 60], [227, 89, 51], [235, 100, 41], [241, 113, 31], [246, 126, 20],
+      [249, 140, 10], [251, 155, 6], [252, 170, 15], [251, 186, 31], [249, 201, 50], [245, 217, 73],
+      [242, 232, 101], [243, 245, 134], [252, 255, 164],
+  ],
+  magma: [
+      [0, 0, 4], [3, 3, 18], [10, 8, 34], [19, 13, 52], [29, 17, 71], [41, 17, 90],
+      [54, 16, 107], [68, 15, 118], [81, 18, 124], [93, 23, 127], [106, 28, 129], [118, 33, 129],
+      [131, 38, 129], [144, 42, 129], [156, 46, 127], [170, 51, 125], [183, 55, 121], [194, 59, 117],
+      [207, 64, 112], [219, 71, 106], [229, 80, 100], [238, 91, 94], [244, 105, 92], [249, 120, 93],
+      [251, 135, 97], [253, 150, 104], [254, 165, 113], [254, 180, 123], [254, 194, 135], [254, 209, 148],
+      [253, 224, 161], [252, 238, 176], [252, 253, 191],
+  ],
+  plasma: [
+      [13, 8, 135], [34, 6, 144], [49, 5, 151], [63, 4, 156], [76, 2, 161], [89, 1, 165],
+      [102, 0, 167], [114, 1, 168], [126, 3, 168], [138, 9, 165], [149, 17, 161], [160, 26, 156],
+      [170, 35, 149], [179, 44, 142], [188, 53, 135], [196, 62, 127], [204, 71, 120], [210, 79, 113],
+      [217, 88, 106], [223, 98, 99], [229, 107, 93], [235, 117, 86], [240, 127, 79], [244, 137, 72],
+      [248, 148, 65], [251, 159, 58], [253, 171, 51], [254, 183, 45], [253, 195, 40], [252, 208, 37],
+      [249, 221, 37], [245, 235, 39], [240, 249, 33],
+  ],
+  cividis: [
+      [0, 34, 78], [0, 40, 91], [0, 46, 106], [5, 51, 113], [26, 56, 111], [39, 62, 110],
+      [50, 67, 109], [59, 73, 108], [67, 78, 108], [75, 84, 108], [83, 90, 109], [90, 95, 110],
+      [97, 101, 111], [104, 106, 113], [111, 112, 115], [118, 118, 118], [125, 124, 120], [131, 129, 121],
+      [139, 135, 120], [146, 141, 120], [154, 147, 118], [162, 153, 117], [170, 160, 115], [179, 166, 112],
+      [187, 173, 109], [195, 179, 105], [204, 186, 100], [212, 193, 95], [221, 200, 88], [230, 208, 81],
+      [239, 215, 72], [248, 223, 60], [254, 232, 56],
+  ],
+  turbo: [
+      [48, 18, 59], [57, 42, 115], [64, 64, 162], [68, 86, 199], [70, 107, 227], [70, 128, 246],
+      [66, 148, 255], [55, 168, 250], [40, 188, 235], [28, 205, 216], [24, 221, 194], [31, 233, 175],
+      [50, 242, 152], [78, 249, 125], [109, 254, 98], [139, 255, 75], [164, 252, 60], [183, 247, 53],
+      [203, 237, 52], [221, 224, 55], [236, 209, 58], [247, 193, 58], [253, 174, 53], [254, 153, 44],
+      [251, 129, 34], [245, 105, 24], [236, 83, 15], [225, 65, 9], [210, 49, 5], [193, 35, 2],
+      [172, 23, 1], [149, 13, 1], [122, 4, 3],
+  ],
+  hot: [
+      [11, 0, 0], [32, 0, 0], [53, 0, 0], [74, 0, 0], [95, 0, 0], [116, 0, 0],
+      [137, 0, 0], [158, 0, 0], [179, 0, 0], [200, 0, 0], [221, 0, 0], [242, 0, 0],
+      [255, 8, 0], [255, 29, 0], [255, 50, 0], [255, 71, 0], [255, 92, 0], [255, 110, 0],
+      [255, 131, 0], [255, 152, 0], [255, 173, 0], [255, 194, 0], [255, 215, 0], [255, 236, 0],
+      [255, 255, 3], [255, 255, 34], [255, 255, 66], [255, 255, 97], [255, 255, 129], [255, 255, 160],
+      [255, 255, 192], [255, 255, 223], [255, 255, 255],
+  ],
+  jet: [
+      [0, 0, 128], [0, 0, 164], [0, 0, 200], [0, 0, 237], [0, 0, 255], [0, 32, 255],
+      [0, 64, 255], [0, 96, 255], [0, 128, 255], [0, 160, 255], [0, 192, 255], [0, 224, 251],
+      [22, 255, 225], [48, 255, 199], [73, 255, 173], [99, 255, 148], [125, 255, 122], [148, 255, 99],
+      [173, 255, 73], [199, 255, 48], [225, 255, 22], [251, 241, 0], [255, 211, 0], [255, 182, 0],
+      [255, 152, 0], [255, 122, 0], [255, 93, 0], [255, 63, 0], [255, 34, 0], [237, 4, 0],
+      [200, 0, 0], [164, 0, 0], [128, 0, 0],
+  ]
+};
+const cmapBuilt = {};
+
+function cmapTable(name) {
+  if (cmapBuilt[name]) return cmapBuilt[name];
+  const a = CMAP_ANCHORS[name], out = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const k = i * 3;
+    if (!a) { out[k] = out[k + 1] = out[k + 2] = i; continue; }        // 灰度：就是 k 本身
+    const x = i * (a.length - 1) / 255, lo = Math.floor(x), hi = Math.min(a.length - 1, lo + 1);
+    const f = x - lo;
+    for (let c = 0; c < 3; c++) out[k + c] = Math.round(a[lo][c] + (a[hi][c] - a[lo][c]) * f);
+  }
+  cmapBuilt[name] = out;
+  return out;
+}
+
+/* 色标那条条本身：第 i 格画表的第 i 格（不给表就是灰度）—— 与图上同源。
+   与有没有图无关：空态也摆着。 */
+function barPaint(id, lut) {
+  const cols = lut || cmapTable('gray');
+  const cv = $(id);
   if (cv.width !== 256 || cv.height !== 1) { cv.width = 256; cv.height = 1; }
   const ctx = cv.getContext('2d');
   if (!ctx) return;
   const img = ctx.createImageData(256, 1), px = img.data;
   for (let i = 0, j = 0; i < 256; i++, j += 4) {
-    px[j] = px[j + 1] = px[j + 2] = i; px[j + 3] = 255;
+    const k = i * 3;
+    px[j] = cols[k]; px[j + 1] = cols[k + 1]; px[j + 2] = cols[k + 2]; px[j + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
 }
@@ -4274,9 +4558,10 @@ function alignIdleText() {
   const c = alignSeriesCached();
   const energy = alignResult && alignResult.unfiltered ? 'Σ(I−d)²' : 'Σ b²';
   const scale = c && c.cap < c.top
-    ? '线性灰度（最白 = 显示上限 ' + alignNum(c.cap) + '，超过的涂白）'
+    ? '线性灰度（最白 = 显示上限 ' + grayNum(c.cap) + '，超过的涂白）'
     : '线性灰度（最白 = 最强那一格）';
-  return '每个像素：S = ' + energy + ' ÷ d^' + alignExponent(n).toFixed(4) + '（n = ' + n + '）' +
+  return '每个像素：S = ' + energy + ' ÷ d^' + normExponent(n).toFixed(4) + '（n = ' + n + '）' +
+    (alignMaskOn() ? '　｜　比局部背景亮 ' + alignMaskN() + ' 倍的格子已按邻域填平（hover 读真值）' : '') +
     '　｜　' + scale + '　｜　鼠标停在图上读任意一点';
 }
 
@@ -4293,12 +4578,339 @@ function alignHover(ev) {
       ' ADU 在门限以下 —— 没算（不是 0）');
     return;
   }
+  // 被掩掉的格子照实读真值，并把判它的局部背景一起说清（不然"为什么这里涂红了"没法核对）
+  if (alignMaskOn()) {
+    const blot = alignBlotMask(), bg = alignLocalBgOf();
+    if (blot && blot.mask[p.i]) {
+      setText('align-hover', '像素 (' + p.x + ', ' + p.y + ')　S = ' + grayNum(v) +
+        '　局部背景 ' + grayNum(bg[p.i]) + '（' + (v / bg[p.i]).toFixed(1) + ' 倍）' +
+        '　已按邻域填平 —— 真值照实读');
+      return;
+    }
+  }
   const top = cached.top, cap = cached.cap;
   const share = top > 0 ? v / top : 0;
   // 涂白只是画法：这里照旧读**真值**，并注明它已经在色标顶上了
-  setText('align-hover', '像素 (' + p.x + ', ' + p.y + ')　S = ' + alignNum(v) +
+  setText('align-hover', '像素 (' + p.x + ', ' + p.y + ')　S = ' + grayNum(v) +
     '　直流 ' + fmt(d, 1) + ' ADU（最强的 ' + (share * 100).toFixed(1) + '%' +
     (v > cap ? '；超过显示上限，涂白' : '') + '）');
+}
+
+/* ==================== 数据页：线包络（沿一条线的 x-t / y-t） ====================
+   固定一行 y（画 x-t）或一列 x（画 y-t）：把这条线上的每个位置、每一帧的带通包络 |z|
+   摆成一张图 —— **横轴是位置、纵轴是帧**（第一帧在最上面）。再除以该位置自己的直流
+   d^((2n−1)/(2n))：分母与强度对齐同一个（n 也照那张卡的口径与下限），区别只有一处 ——
+   那张把时间加掉（Σb²，每个像素一个数），这张把时间**留着**。
+   后端一遍读盘交三列：包络（帧 × 线长）、直流（线长）、每帧读出位置（帧数）；
+   所以**改 n、门限、显示上限都只重画**，换波段、换扫描、换那条线才要重算。
+   口径住在 backend/line_envelope.py 的文件头 —— 这边只管显示。 */
+
+let lineResult = null;          // meta：扫描号 / 轴 / 位置 / 波段 / 线长 / 帧数 / 幅面
+let lineData = null;            // {p, nf, env, dc, pos}：三列 float32
+let lineLoadedKey = '';         // 已经抓到手里的是哪一份（同一份不再抓一遍二进制）
+let lineSeq = 0;                // 抓二进制的序号：慢响应回来时可能已经换了一份
+const linePolling = poller(linePoll, 400);
+
+function lineN() { return normN('line-n'); }
+
+/* 色标选的是哪一张：下拉框（#line-cmap）是这个决定的**唯一**的家 —— 图上色、图下色标、
+   闲时那行话都从这里取。名字不在表里（含还没选中时的空串）一律按灰度，默认值只此一处。 */
+function lineCmapName() {
+  const v = $('line-cmap').value;
+  return v === 'gray' || Object.prototype.hasOwnProperty.call(CMAP_ANCHORS, v) ? v : 'gray';
+}
+
+/* 色标怎么念：色标那段话的唯一写法（灰度写「灰度」，其余照名字写）。 */
+function lineCmapText() {
+  const v = lineCmapName();
+  return '线性色标（' + (v === 'gray' ? '灰度' : v) + '）';
+}
+
+/* 勾没勾「不滤波」。**只此一处读这个框**：起算、旧图标记、统计条都从这里拿
+   （与强度对齐同一个脾气）。 */
+function lineUnfiltered() { return $('line-nofilter').checked === true; }
+
+/* 直流门限 (dB)：相对**这条线直流的中位数**（与强度对齐同一条规矩：不是最强那个位置 ——
+   直流常有零星热点，按最强算会把整片掐掉）。留空 = 不掐。 */
+function lineGate() {
+  const v = parseFloat($('line-dcmin').value);
+  if (!isFinite(v) || !lineResult || !(lineResult.dc_median > 0)) return 0;
+  return lineResult.dc_median * Math.pow(10, v / 20);
+}
+
+/* 显示层唯一的算式：E = |z| / d^α（行优先：第 i 帧的第 j 个位置在 i×p + j）。
+   直流落在门限以下的**整列**给 NaN（涂深灰，不当成 0）—— 那是「除不了」，不是「很小」。 */
+function lineSeries() {
+  if (!lineData) return null;
+  const n = lineN();
+  if (!isFinite(n)) return null;
+  const ex = normExponent(n), gate = lineGate();
+  const p = lineData.p, nf = lineData.nf, dc = lineData.dc, env = lineData.env;
+  // 一列一个 pow：d^-α 是逐位置的常数，不必每格算一遍
+  const scale = new Float64Array(p);
+  for (let j = 0; j < p; j++) {
+    const d = dc[j];
+    scale[j] = (!(d > 0) || d < gate) ? NaN : Math.pow(d, -ex);
+  }
+  const out = new Float64Array(nf * p);
+  for (let i = 0; i < nf; i++) {
+    const row = i * p;
+    for (let j = 0; j < p; j++) out[row + j] = env[row + j] * scale[j];
+  }
+  return out;
+}
+
+/* 手里那一列、它的峰值与上色的顶（与强度对齐同一个缓存形状：作废条件就是那四个输入）。 */
+let lineCache = null;           // {key, vals, top, cap}
+
+function lineSeriesCached() {
+  if (!lineData || !lineResult) return null;
+  const capIn = capInput('line-cap');
+  const key = lineLoadedKey + '|' + lineN() + '|' + lineGate() + '|' +
+    (capIn ? (capIn.pct || capIn.abs) : '');
+  if (lineCache && lineCache.key === key) return lineCache;
+  const vals = lineSeries();
+  if (!vals) return null;
+  const top = seriesTop(vals);
+  const cap = capIn
+    ? Math.min(top, capIn.pct ? capQuantile(vals, top, capIn.pct) : capIn.abs)
+    : top;
+  lineCache = { key: key, vals: vals, top: top, cap: cap };
+  return lineCache;
+}
+
+/* 哪一份**三列图**：扫描号 + 轴 + 位置 + 波段 + 形状 —— 与 n、门限这些"显示这一层"的数无关。 */
+function lineKeyOf(r) {
+  if (!r) return '';
+  return [r.scan_id, r.unfiltered ? 'u' : 'f', r.axis, r.at, r.k_lo, r.k_hi, r.p, r.n].join('|');
+}
+
+/* 按钮与提示的现状：波段从哪来、n 填对没有、手里这张是不是当前这一条、正在算什么。 */
+function lineSyncUI() {
+  const b = bandOf(), unf = lineUnfiltered();
+  setText('line-band', unf
+    ? '口径：不滤波（不分波段；整条时间序列的逐帧偏差 |I − d|）'
+    : bandText(b, '所有能解出的谱线的包络'));
+  const n = lineN(), running = linePolling.running();
+  // 波段填错了（≤ 0 / 不是数）也算不了 —— 不滤波时不看波段，那时不拦（与强度对齐同一套判据）
+  const bad = unf ? null : b.bad;
+  const btnX = $('btn-line-xt'), btnY = $('btn-line-yt');
+  btnX.disabled = btnY.disabled = !isFinite(n) || !!bad || running;
+  const how = unf
+    ? '把这一条扫描的每一帧读一遍，逐位置直接算 |I − d|（不按波段；后台跑，进度在右边）。' +
+      '换扫描、换一条线要重算；改 n、门限、上限、改波段都不用。'
+    : '把这一条扫描的每一帧读一遍（后台跑，进度在右边）。换波段、换扫描、换一条线要重算；' +
+      '改 n、门限、上限不用。';
+  btnX.title = btnY.title = (!isFinite(n)
+    ? '算不了：n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)，n < 1/2 会变成负数、把暗点放大）'
+    : bad ? '算不了：' + bad + '（在〈滤波曲线〉那张卡里改）'
+      : how + (scanActive ? '　**扫描进行中**：这一遍要读全盘，会跟采图抢磁盘。' : ''));
+  // 扫描列表还没回来时 cur 是 null —— 不下判断（与相位图、强度对齐同一处说明）
+  const r = lineResult, cur = scanIdOf();
+  let why = '';
+  if (r && cur === null) why = '';
+  else if (r && r.scan_id !== cur) why = '图是 #' + r.scan_id + ' 的（现在选的是 #' + cur + '）';
+  else if (r && !!r.unfiltered !== unf) why = '口径改过，点重算';
+  else if (r && !unf && (r.band[0] !== b.lmin || r.band[1] !== b.lmax)) why = '波段改过，点重算';
+  $('line-stale').hidden = !why;
+  setText('line-stale', why ? (running ? why + '（正在算新的…）' : why) : '');
+}
+
+/* 起算：axis 说固定的是哪一根（'y' = 固定一行、画 x-t；'x' = 固定一列、画 y-t）。
+   位置是**原始坐标**里的行号 / 列号 —— 与取数、剖面、相位图同一套。 */
+async function lineRun(axis) {
+  const s = dataScanPick();
+  if (!s) { toast('先选一条扫描', true); return; }
+  if (!isFinite(lineN())) { toast('n 要填 ≥ 0.5 的数（指数是 (2n−1)/(2n)）', true); return; }
+  const unf = lineUnfiltered(), b = bandOf();
+  // 滤波口径下波段填错了当场说清，一个请求都不发（后端对同一串参数也是抛这句话）；
+  // 不滤波时波段不参与，就不拦（与强度对齐同一套判据）。
+  if (!unf && b.bad) {
+    toast('线包络算不了：' + b.bad + '（在〈滤波曲线〉那张卡里改）', true); return;
+  }
+  const raw = String($(axis === 'y' ? 'line-row' : 'line-col').value || '').trim();
+  const index = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
+  if (!isFinite(index)) {
+    toast(axis === 'y' ? '行 y 要填一个非负整数（像素行号）' : '列 x 要填一个非负整数（像素列号）', true);
+    return;
+  }
+  if (linePolling.running()) return;
+  if (scanActive) toast('扫描进行中：这一遍要读全盘，会跟采图抢磁盘');
+  const d = await post('/api/scans/' + s.id + '/line' +
+                       (unf ? '?unfiltered=1&axis=' + axis + '&index=' + index
+                            : bandQuery(b, ['axis=' + axis, 'index=' + index])));
+  if (!d) return;
+  setText('line-progress', JOB_TEXT.started(d.total));
+  linePolling.start();
+  lineSyncUI();
+}
+
+/* 进度：与相位图、强度对齐同一个节拍器。**算完就停**（停在哪一份情形里由 pollJob 一处说了算）。 */
+async function linePoll() {
+  const p = await pollJob('/api/line', linePolling);
+  if (p.text) setText('line-progress', p.text);
+  if (p.state === 'error') { toast('线包络失败：' + p.error, true); lineSyncUI(); return; }
+  if (p.state !== 'done') { lineSyncUI(); return; }
+  const fresh = lineKeyOf(p.result) !== lineLoadedKey;
+  lineResult = p.result;
+  lineSyncUI();
+  if (fresh) {
+    setText('line-progress', JOB_TEXT.fetching);
+    await lineFetchArrays();
+  } else {
+    linePaint();
+  }
+}
+
+/* 三列走二进制口，长度按结果里的形状说：包络 帧×线长、直流 线长、每帧位置 帧数。 */
+async function lineFetchArrays() {
+  const r = lineResult;
+  const seq = ++lineSeq;
+  const arr = await fetchArrays('/api/scans/' + r.scan_id + '/line.bin',
+    [r.n * r.p, r.p, r.n], '线包络',
+    function () {
+      return seq !== lineSeq || !lineResult || lineKeyOf(lineResult) !== lineKeyOf(r);
+    });
+  if (!arr) return;
+  lineData = { p: r.p, nf: r.n, env: arr[0], dc: arr[1], pos: arr[2] };
+  lineLoadedKey = lineKeyOf(r);
+  setText('line-progress', JOB_TEXT.done(r.n));
+  linePaint();
+  lineSyncUI();
+}
+
+/* 鼠标落在哪一格：画布内部分辨率就是**线长 × 帧数**，这里只有一次比例换算，不插值。 */
+function linePick(ev) {
+  const box = $('line-canvas').getBoundingClientRect();
+  if (!lineData || !box.width || !box.height) return null;
+  const j = Math.floor((ev.clientX - box.left) / box.width * lineData.p);
+  const i = Math.floor((ev.clientY - box.top) / box.height * lineData.nf);
+  if (j < 0 || i < 0 || j >= lineData.p || i >= lineData.nf) return null;
+  return { j: j, i: i };
+}
+
+/* 色标的三格刻度：讲的是这一张图的数（0 → 色标左端、上限 → 右端），与图上那条线性式子同源。 */
+function lineScaleText(top, cap) {
+  const cv = $('line-bar'), how = lineCmapText();
+  cv.title = top === null
+    ? '线包络：' + how + '（0 → 左端、最强那一格 → 右端）；深灰 = 直流在门限以下（不是 0）'
+    : '线包络：' + how + ' —— 左端 = 0、右端 = ' + grayNum(cap) +
+      (cap < top ? '（显示上限：超过它的都按右端画）' : '（这张图里最强的那一格）') +
+      '；深灰 = 直流在门限以下（不是 0）';
+  setText('line-bar-lo', '0');      // 左端永远是 0（最深），与有没有图无关
+  setText('line-bar-mid', top === null ? '—' : grayNum(cap / 2));
+  setText('line-bar-hi', top === null ? '—' : grayNum(cap));
+}
+
+/* 画：一张 ImageData，逐格上色。**线性**：k = v / 上限 × 255，第 k 格画表的第 k 格
+   （灰度下 0 最深、上限最亮；彩色色标 0 在左端、上限在右端 —— 只换颜色、不换数）。
+   行是帧（第一帧在最上面）、列是位置；深灰 = 那一列的直流在门限以下（不是 0）。 */
+function linePaint() {
+  const lut = cmapTable(lineCmapName());   // 图上色与图下色标读的是**同一份** 256 格表
+  barPaint('line-bar', lut);               // 色标与有没有图无关：空态也要摆着
+  const ids = ['line-size', 'line-at', 'line-lines', 'line-frames', 'line-dcmed',
+               'line-blank', 'line-over'];
+  const empty = $('line-empty');
+  const n = lineN();
+  const cached = lineSeriesCached();
+  const vals = cached && cached.vals;
+  if (!lineData || !lineResult || !vals) {
+    setText('line-lines-label', lineResult && lineResult.unfiltered ? '口径' : '留下谱线');
+    for (let i = 0; i < ids.length; i++) setText(ids[i], '—');
+    setText('line-n-note', isFinite(n) ? n + '（指数 ' + normExponent(n).toFixed(4) + '）' : '—');
+    setText('line-title', '未算');
+    setText('line-x-lo', '—'); setText('line-x-mid', '—'); setText('line-x-hi', '—');
+    lineScaleText(null, null);
+    setText('line-hover', lineIdleText());
+    empty.hidden = false;
+    return;
+  }
+  const r = lineResult, p = lineData.p, nf = lineData.nf, cnt = p * nf;
+  const top = cached.top, cap = cached.cap;
+  const gate = lineGate(), dc = lineData.dc;
+  // 门限按**列**（位置）判：直流是每个位置一个数，不是每格一个
+  let blank = 0;
+  for (let j = 0; j < p; j++) if (!(dc[j] > 0) || dc[j] < gate) blank++;
+  let over = 0;
+  const cv = $('line-canvas');
+  if (cv.width !== p || cv.height !== nf) { cv.width = p; cv.height = nf; }   // 内部 1:1，CSS 负责缩放
+  const ctx = cv.getContext('2d');
+  if (!ctx) return;
+  const img = ctx.createImageData(p, nf), px = img.data;
+  for (let i = 0, j = 0; i < cnt; i++, j += 4) {
+    const v = vals[i];
+    if (v !== v) {
+      px[j] = 30; px[j + 1] = 41; px[j + 2] = 59; px[j + 3] = 255;
+      continue;
+    }
+    if (v > cap) over++;
+    // **线性**：k = v / 上限 × 255。负的（浮点 −0 那一类）一并在 0 这一头夹住；
+    // 颜色只从表里取（与图下那条色标同一份，不各算各的）。
+    const k = Math.round(Math.max(0, Math.min(1, cap > 0 ? v / cap : 0)) * 255) * 3;
+    px[j] = lut[k]; px[j + 1] = lut[k + 1]; px[j + 2] = lut[k + 2]; px[j + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const axisName = r.axis === 'y' ? 'x' : 'y';
+  const fixedName = r.axis === 'y' ? '行 y' : '列 x';
+  setText('line-title', '#' + r.scan_id + '　线包络 ' + (r.axis === 'y' ? 'x-t' : 'y-t') +
+    (r.unfiltered ? '（不滤波）' : '') + ' · ' + fixedName + ' = ' + r.at + '　' + p + '×' + nf);
+  setText('line-n-note', n + '（指数 ' + normExponent(n).toFixed(4) + '）');
+  setText('line-at', fixedName + ' = ' + r.at + '，横轴 ' + axisName);
+  setText('line-size', r.w + '×' + r.h +
+    (r.rect ? '（原始坐标原点 ' + r.rect[0] + ',' + r.rect[1] + '）' : ''));
+  if (r.unfiltered) {
+    setText('line-lines-label', '口径');
+    setText('line-lines', '不滤波（整条时间序列）');
+  } else {
+    setText('line-lines-label', '留下谱线');
+    setText('line-lines', r.k_lo + ' ~ ' + r.k_hi + '（共 ' + (r.k_hi - r.k_lo + 1) +
+      ' 根 / Nyquist 到 ' + r.k_max + '）' +
+      (r.band[0] === null && r.band[1] === null ? '　全通' : ''));
+  }
+  setText('line-frames', nf + ' 帧，真实跨度 ' + r.span_fs.toFixed(1) + ' fs');
+  setText('line-dcmed', fmt(r.dc_median, 1));
+  setText('line-blank', blank ? blank + ' / ' + p + ' 列（' + (blank * 100 / p).toFixed(1) + '%）' : '0');
+  setText('line-over', over ? over + ' / ' + cnt + ' 格（' + (over * 100 / cnt).toFixed(1) + '%）' : '0');
+  setText('line-x-lo', axisName + ' ' + r.from);
+  setText('line-x-mid', axisName + ' ' + (r.from + Math.floor((p - 1) / 2)));
+  setText('line-x-hi', axisName + ' ' + (r.from + p - 1));
+  empty.hidden = true;
+  lineScaleText(top, cap);
+  setText('line-hover', lineIdleText());
+}
+
+function lineIdleText() {
+  if (!lineData || !isFinite(lineN())) {
+    return '鼠标停在图上：读出那一帧、那一列的位置与 E（= |z| ÷ d^α）。';
+  }
+  const unf = lineResult && lineResult.unfiltered;
+  return '每个位置每帧：E = ' + (unf ? '|I − d|' : '|z|') + ' ÷ d^' +
+    normExponent(lineN()).toFixed(4) + '（n = ' + lineN() + '）　｜　' + lineCmapText() +
+    '　｜　鼠标停在图上读任意一格';
+}
+
+function lineHover(ev) {
+  if (!lineData || !lineResult) return;
+  const q = linePick(ev);
+  if (!q) { setText('line-hover', lineIdleText()); return; }
+  const cached = lineSeriesCached();
+  if (!cached) return;
+  const r = lineResult;
+  const v = cached.vals[q.i * lineData.p + q.j], d = lineData.dc[q.j];
+  const axisName = r.axis === 'y' ? 'x' : 'y';
+  const at = '第 ' + (q.i + 1) + ' 帧（位置 ' + fmt(lineData.pos[q.i], 3) + ' µm）';
+  const where = axisName + ' = ' + (q.j + r.from);
+  if (v !== v) {
+    setText('line-hover', at + '　' + where + '　直流 ' + fmt(d, 1) +
+      ' ADU 在门限以下 —— 没算（不是 0）');
+    return;
+  }
+  const share = cached.top > 0 ? v / cached.top : 0;
+  // 涂白只是画法：这里照旧读**真值**，并注明它已经在色标顶上了
+  setText('line-hover', at + '　' + where + '　E = ' + grayNum(v) +
+    '　直流 ' + fmt(d, 1) + ' ADU（最强的 ' + (share * 100).toFixed(1) + '%' +
+    (v > cached.cap ? '；超过显示上限，按色标右端画' : '') + '）');
 }
 
 /* ==================== 分栏拖动 ==================== */
@@ -4952,10 +5564,11 @@ function wire() {
   $('data-tab-filt').onclick = function () { dataTabShow('filt'); };
   $('data-tab-map').onclick = function () { dataTabShow('map'); };
   $('data-tab-align').onclick = function () { dataTabShow('align'); };
+  $('data-tab-line').onclick = function () { dataTabShow('line'); };
   // 滤波范围：填完就重算（2500 点、整段重建也就几毫秒，不用等失焦），「全通」= 清空两个框。
   // 相位图跟的是**同一段波长**，所以改完这两格还要把它的「波段改过」标出来。
   ['filt-lmin', 'filt-lmax'].forEach(function (id) {
-    $(id).oninput = function () { renderFiltered(); mapSyncUI(); alignSyncUI(); };
+    $(id).oninput = function () { renderFiltered(); mapSyncUI(); alignSyncUI(); lineSyncUI(); };
   });
   $('filt-phmin').oninput = renderFiltered;
   $('btn-map-run').onclick = mapRun;
@@ -4980,12 +5593,29 @@ function wire() {
   $('align-n').oninput = function () { alignPaint(); alignSyncUI(); };
   $('align-dcmin').oninput = alignPaint;
   $('align-cap').oninput = alignPaint;            // 显示上限：与门限同一个脾气，只重画
+  // 亮斑掩模：换开关要算一次局部背景（全幅几十毫秒级），改 N 只重判 —— 都用 change
+  $('align-mask').onchange = alignPaint;
+  $('align-mask-n').onchange = alignPaint;
   // 不滤波只改口径：手里那张图不动，只把「该重算」标出来（与相位图换时刻同一类）
   $('align-nofilter').onchange = alignSyncUI;
   $('align-canvas').onmousemove = alignHover;
   $('align-canvas').onmouseleave = function () { setText('align-hover', alignIdleText()); };
   wireNote('btn-align-note', 'align-note');
-  alignBarPaint();                                // 色标与有没有图无关：出生就摆着
+  // 线包络：两个起算按钮（固定行 / 固定列），n、门限、上限都**只改显示**
+  $('btn-line-xt').onclick = function () { lineRun('y'); };      // 固定一行 y → x-t
+  $('btn-line-yt').onclick = function () { lineRun('x'); };      // 固定一列 x → y-t
+  $('line-n').oninput = function () { linePaint(); lineSyncUI(); };
+  $('line-dcmin').oninput = linePaint;
+  $('line-cap').oninput = linePaint;
+  $('line-cmap').onchange = linePaint;           // 换色标只改画法：不重算、不重读盘
+  $('line-nofilter').onchange = lineSyncUI;      // 口径只改「该重算」，手里那张图不动
+  $('line-canvas').onmousemove = lineHover;
+  $('line-canvas').onmouseleave = function () { setText('line-hover', lineIdleText()); };
+  wireNote('btn-line-note', 'line-note');
+  barPaint('line-bar', cmapTable(lineCmapName()));   // 色标与有没有图无关：出生就摆着
+  lineScaleText(null, null);                      // 还没有图：三格刻度写「—」
+  lineSyncUI();
+  barPaint('align-bar');                          // 色标与有没有图无关：出生就摆着
   alignScaleText(null, null);                     // 还没有图：三格刻度写「—」，不拿一个无关的数顶着
   alignSyncUI();
   mapViewTitle = $('btn-map-view').title;         // 原样的说明（切到强度视图时换成那一句）
@@ -5029,6 +5659,7 @@ function wire() {
     dataScanInfo();
     mapSyncUI();          // 手里那张相位图是不是这一条的，立刻标出来
     alignSyncUI();        // 强度对齐那张同理
+    lineSyncUI();         // 线包络那张同理
     if (dataChart) drawPixelCurve();
   };
 
