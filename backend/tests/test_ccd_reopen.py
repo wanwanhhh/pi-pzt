@@ -64,6 +64,7 @@ class _Cam:
         self.gain_writes = 0
         self.trigger_calls = 0
         self.image_poll_timeout_ms = 2000
+        self.frame_time_us = 40_718       # 曝光 8 ms 时的实测值（认识账 E12）
         self._frames_per_trigger = 0
         self.frames: list = []            # 待取帧队列：get_pending_frame_or_null 从队首拿
 
@@ -507,6 +508,83 @@ def test_single_frame_session_never_auto_triggers():
     cont.armed = True
     assert cam._next_frame(cont) is None
     assert cont.cam.trigger_calls == 1
+
+
+def test_frame_wait_follows_frame_time_not_a_fixed_30_s():
+    """等帧预算跟着相机自报的帧时间走，不写死 30 s。"""
+    cam = _cam()
+    sess = _session(single_frame=True)
+    sess.frame_time_us = 40_718           # 曝光 12 ms 的实测值
+    assert cam._frame_wait_s(sess) == 1.0, "短曝光也要给至少 1 s"
+    sess.frame_time_us = 1_028_000        # 曝光 1 s 的帧时间
+    assert 2.5 <= cam._frame_wait_s(sess) <= 2.7
+    sess.frame_time_us = 0                # 读不到帧时间：按曝光算
+    cam._exposure_us = 300_000
+    assert 1.0 <= cam._frame_wait_s(sess) <= 1.2
+
+
+def test_missing_frame_is_recovered_with_one_retrigger():
+    """丢一发触发（等帧超时）时补发**一发**，这一帧照常采到，扫描不用整条失败。"""
+    import numpy as np
+
+    cam = _cam()
+    sess = cam._sess = _session(single_frame=True)
+    sess.armed = True
+    sess.cam.trigger_calls = 1             # 扫描已经发过这一点的触发
+    orig = sess.cam.issue_software_trigger
+
+    def issue():
+        orig()
+        if sess.cam.trigger_calls == 2:    # 补发的那一发才出帧
+            sess.cam.frames.append(_Frame(np.full((4, 6), 9, dtype=np.uint16)))
+
+    sess.cam.issue_software_trigger = issue
+    cam._frame_wait_s = lambda _sess: 0.02
+    path, exposure = cam._grab_frame(0, 0, 0.0, save=False)
+    assert sess.cam.trigger_calls == 2, "只许补发一发"
+    assert exposure == 8000
+    assert sess.cam.frames == [], "补发后拿到的这一帧不该留在队列里"
+
+
+def test_missing_frame_after_retrigger_fails_with_the_real_reason():
+    """补发一发后还是没帧：才判这一点没采到，并说清是补发过之后仍无帧。"""
+    cam = _cam()
+    sess = cam._sess = _session(single_frame=True)
+    sess.armed = True
+    sess.cam.trigger_calls = 1
+    cam._frame_wait_s = lambda _sess: 0.01
+    try:
+        cam._grab_frame(0, 3, 1.234, save=False)
+    except CameraError as exc:
+        assert "补发一发触发后仍无帧" in str(exc), exc
+        assert "1.2340" in str(exc), "错报要带目标位置"
+    else:
+        raise AssertionError("补发后仍无帧必须失败")
+    assert sess.cam.trigger_calls == 2, "只补一次，不无限重试"
+
+
+def test_extra_frame_after_retrigger_is_drained():
+    """补发前那一发如果只是迟到，会多出一帧：必须排空，否则下一点拿到上一点的帧。"""
+    import numpy as np
+
+    cam = _cam()
+    sess = cam._sess = _session(single_frame=True)
+    sess.armed = True
+    sess.cam.trigger_calls = 1
+    orig = sess.cam.issue_software_trigger
+
+    def issue():
+        orig()
+        if sess.cam.trigger_calls == 2:
+            # 原来那发迟到 + 补发那发：两帧都在队列里
+            sess.cam.frames.append(_Frame(np.full((4, 6), 1, dtype=np.uint16)))
+            sess.cam.frames.append(_Frame(np.full((4, 6), 2, dtype=np.uint16)))
+
+    sess.cam.issue_software_trigger = issue
+    cam._frame_wait_s = lambda _sess: 0.02
+    cam._grab_frame(0, 0, 0.0, save=False)
+    assert sess.cam.trigger_calls == 2
+    assert sess.cam.frames == [], "多出来的那一帧必须被排空"
 
 
 def test_begin_scan_rolls_back_hold_when_the_session_cannot_be_built():

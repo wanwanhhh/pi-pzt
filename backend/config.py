@@ -192,7 +192,12 @@ TL_OPEN_TIMEOUT_S = 15.0     # 打开相机（含固件握手）的上限
 TL_OPEN_WAIT_S = 8.0
 # 扫描前建会话不等：扫描是程序发起的，设备不在就该立刻失败，别把扫描卡在那儿。
 TL_SCAN_OPEN_WAIT_S = 0.0
-TL_CAPTURE_TIMEOUT_S = 30.0  # 单帧采集上限（含曝光）
+TL_CAPTURE_TIMEOUT_S = 30.0  # 一次等帧的上限；任务外层超时 = 2×这个 + 5 s（见 thorlabs_ccd.capture）
+# 等一帧的预算：跟着相机自报的 frame_time_us 走（≈ 曝光 + 29 ms），给它的 2 倍再加 0.5 s，
+# 至少 1 s。**不再拿 TL_CAPTURE_TIMEOUT_S 当等帧时间**：那等于丢一发触发就干等 30 s、还把
+# 整条扫描判死（实测与根因见 docs/thorlabs/设备认识账.xml E12）。
+TL_FRAME_WAIT_MIN_S = 1.0
+TL_FRAME_WAIT_MARGIN_S = 0.5
 
 # 预览页「80% 能量圆」：原始帧上累积到总能量 80% 的圆直径。
 # **不扣背景**；窗口只是限制积分范围（窗口外不参与），不是背景模型。

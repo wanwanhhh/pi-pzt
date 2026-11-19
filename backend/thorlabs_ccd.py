@@ -44,6 +44,8 @@
    **单帧会话 arm 之后不预触发**：每点在「到位 + 稳定延时」之后由扫描自己发触发，
    触发就是积分起点 —— 这是"整段曝光都落在到位位置"的唯一保证。取帧路径也不再为空队列
    自动补触发：单帧会话里多发一发就是多一帧，会把"一点一帧"的对应关系打乱。
+   **等帧超时（偶发丢触发）时例外**：补发**一发**再等一次，并把可能多出来的帧排空
+   （见 _grab_frame 与认识账 E12）—— 一次丢触发不该把整条扫描判死。
 """
 from __future__ import annotations
 
@@ -78,6 +80,8 @@ from .config import (
     TL_ENERGY_WINDOW_FACTOR,
     TL_ENERGY_WINDOW_MAX,
     TL_ENERGY_WINDOW_MIN,
+    TL_FRAME_WAIT_MARGIN_S,
+    TL_FRAME_WAIT_MIN_S,
     TL_FULL_ROI,
     TL_GAIN,
     TL_JPEG_QUALITY,
@@ -194,6 +198,7 @@ class _Session:
         self.live: Optional[object] = None    # 原生 16 位快照（轮廓图用）
         self.shot: Optional[tuple] = None     # 最近一次整帧采集
         self.frames = 0
+        self.frame_time_us = 0      # 相机自报的一帧时间（曝光 + 读出），等帧预算按它算
         self.last_frame_at = 0.0
         self.frames_expected_since = 0.0   # 从这一刻起"应该出帧"（见 _expect_frames_from_now）
         self.opened_at = time.time()
@@ -379,7 +384,8 @@ class ThorlabsCamera:
         """
         self._ensure_thread()
         job = ("capture", scan_id, index, position_um)
-        return self._submit(job, timeout=TL_CAPTURE_TIMEOUT_S)
+        # 外层要给两次等帧 + 排空留时间（内层等帧预算是毫秒~几秒，正常情况远到不了这里）。
+        return self._submit(job, timeout=2 * TL_CAPTURE_TIMEOUT_S + 5.0)
 
     # ------------------------------------------------------------ owner 线程
     def _ensure_thread(self) -> None:
@@ -727,6 +733,11 @@ class ThorlabsCamera:
         real = cam.exposure_time_us
         if abs(real - exposure_us) > max(50, exposure_us * 0.02):
             raise CameraError(f"曝光没生效：要 {exposure_us} µs，相机读回 {real} µs")
+        # 帧时间跟着曝光变：等帧预算（_frame_wait_s）用的是它，预览中改曝光后要刷新。
+        try:
+            sess.frame_time_us = max(0, int(cam.frame_time_us))
+        except Exception as exc:                      # noqa: BLE001
+            log.warning("改曝光后读不到帧时间（%s），等帧预算先按旧值算", exc)
         log.debug("实时改曝光：%d µs（读回 %d）", exposure_us, real)
 
     def _apply(self, sess: _Session) -> None:
@@ -758,6 +769,13 @@ class ThorlabsCamera:
         # 只警告不抛：真出问题会在图像亮度上现形，抛出去只会把这次打开白白废掉。
         if abs(cam.exposure_time_us - exposure) > max(50, exposure * 0.02):
             log.warning("曝光没设上：要 %d us，读回 %d us", exposure, cam.exposure_time_us)
+        # 等帧预算按相机自报的帧时间算（≈ 曝光 + 读出）；读不到就退回按曝光算。
+        # 扫描期间不再读它（曝光窗里不碰设备）；预览中改曝光时由 _set_exposure_now 刷新。
+        try:
+            sess.frame_time_us = max(0, int(cam.frame_time_us))
+        except Exception as exc:                      # noqa: BLE001
+            log.warning("读不到相机帧时间（%s），等帧预算按曝光算", exc)
+            sess.frame_time_us = 0
 
     def _ensure_armed(self, sess: _Session) -> None:
         """要帧就得 arm —— **一个会话最多 arm 一次**（文件头第 5 条）。
@@ -855,6 +873,58 @@ class ThorlabsCamera:
                      img.shape[1], img.shape[0], 1000 * (t_grab - t0), 1000 * (t_enc - t_grab),
                      1000 * (t_enc - t0), len(jpeg))
 
+    def _frame_time_s(self, sess: _Session) -> float:
+        """一帧要多久（秒）：优先用相机自报的 frame_time_us，读不到就按曝光算。"""
+        frame_s = (sess.frame_time_us or 0) / 1e6
+        return frame_s if frame_s > 0 else max(self._exposure_us, 1000) / 1e6
+
+    def _frame_wait_s(self, sess: _Session) -> float:
+        """等这一帧的预算：帧时间 × 2 + 0.5 s，至少 1 s（上限仍是采集上限）。
+
+        2 倍是给「首帧比后续帧多一段启动」与偶发抖动留的余量；实测一帧在
+        「曝光 + 29 ms」内交付（本机曝光 12 ms 时 frame_time_us = 40718）。
+        以前这里写死 30 s：丢一发触发要干等半分钟，用户看到的是"扫描卡住"。
+        """
+        return min(TL_CAPTURE_TIMEOUT_S,
+                   max(TL_FRAME_WAIT_MIN_S,
+                       2.0 * self._frame_time_s(sess) + TL_FRAME_WAIT_MARGIN_S))
+
+    def _wait_frame(self, sess: _Session, wait_s: float):
+        """等一帧，返回**拷贝**（SDK 的缓冲下一轮就覆写）；超时返回 None。"""
+        deadline = time.monotonic() + wait_s
+        while True:
+            frame = self._next_frame(sess)
+            if frame is not None:
+                return frame.image_buffer.copy()
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.005)
+
+    def _drain_frames(self, sess: _Session) -> int:
+        """把队列里多出来的帧丢掉（只在补发触发后用），返回丢了几帧。
+
+        临时把轮询超时设成 0：get_pending_frame_or_null() 空队列时最多阻塞
+        image_poll_timeout_ms（本机 2000 ms），排空时不该白等这两秒。
+        """
+        cam = sess.cam
+        old = None
+        try:
+            old = int(cam.image_poll_timeout_ms)
+            cam.image_poll_timeout_ms = 0
+        except Exception as exc:                      # noqa: BLE001
+            log.warning("排空多余帧时改不了轮询超时（%s），按原超时排", exc)
+        try:
+            n = 0
+            while cam.get_pending_frame_or_null() is not None:
+                n += 1
+            return n
+        finally:
+            if old is not None:
+                try:
+                    cam.image_poll_timeout_ms = old
+                except Exception as exc:              # noqa: BLE001
+                    log.warning("恢复轮询超时失败：%s", exc)
+
     def _grab_frame(self, scan_id: int, index: int, position_um: float,
                     save: bool = True) -> Optional[str]:
         """取**已经触发**的那一帧，算质心、存 16 位 PNG。
@@ -870,17 +940,28 @@ class ThorlabsCamera:
         # 曝光值在这一帧采完之后就读不到了（恢复预览设置会把它改回去，见 _apply），
         # 而且元数据里记的必须是**这一帧**用的那个值。
         shot_exposure = sess.cam.exposure_time_us
-        img = None
-        deadline = time.monotonic() + TL_CAPTURE_TIMEOUT_S
-        while time.monotonic() < deadline:
-            frame = self._next_frame(sess)
-            if frame is not None:
-                img = frame.image_buffer.copy()   # 必须 copy：下一轮轮询会覆写这块内存
-                break
-            time.sleep(0.005)
-        t_frame = time.perf_counter()
+        wait_s = self._frame_wait_s(sess)
+        img = self._wait_frame(sess, wait_s)
         if img is None:
-            raise CameraError(f"第 {index} 点没采到帧（目标 {position_um:.4f} µm）")
+            # 实测（2026-11-14）：帧在驱动队列里能留 30 s 以上，所以等不到帧不是"取晚了"，
+            # 是**这一发触发没出帧**。补发一发再等一次 —— 不补的话一次偶发丢触发就把整条
+            # 扫描判死（30 s 超时，见 docs/thorlabs/设备认识账.xml E12）。
+            log.warning("第 %d 点 %.1f s 没等到帧：补发一发触发（目标 %.4f µm）",
+                        index, wait_s, position_um)
+            self._fire(sess)
+            img = self._wait_frame(sess, wait_s)
+            if img is None:
+                raise CameraError(
+                    f"第 {index} 点没采到帧（目标 {position_um:.4f} µm；"
+                    f"补发一发触发后仍无帧）")
+            # 原来那一发如果只是迟到，会排在补发那一帧前面。再等一个帧时间把多出来的排空，
+            # 否则下一点会拿到这一帧，一点一帧的对应关系从这儿开始全错位。
+            grace_s = min(wait_s, self._frame_time_s(sess) + 0.2)
+            time.sleep(max(0.1, grace_s))
+            extra = self._drain_frames(sess)
+            if extra:
+                log.warning("第 %d 点补发触发后多出 %d 帧，已丢弃（保持一点一帧）", index, extra)
+        t_frame = time.perf_counter()
 
         # 这一帧的质心（传感器坐标；口径与预览完全一样：不扣背景、不设阈值、不开窗）。
         # 同一帧只算一次 —— 存盘写进文件自己身上，save_raw 也拿这一份。
@@ -982,7 +1063,7 @@ class ThorlabsCamera:
         （见文件头第 5 条）。预览关着时开一个一次性会话，采完就丢。
         """
         self._ensure_thread()
-        st = self._submit(("save",), timeout=TL_CAPTURE_TIMEOUT_S)
+        st = self._submit(("save",), timeout=2 * TL_CAPTURE_TIMEOUT_S + 5.0)
         shot = st.get("shot") if isinstance(st, dict) else None
         if shot is None:
             raise CameraError("没有可保存的帧")

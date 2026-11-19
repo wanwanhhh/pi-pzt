@@ -20,8 +20,15 @@
 * 曝光结束后的读出期间补触发会被接受（两帧间隔 = 曝光 + 26 ms），但**没有证明**它从哪一刻
   开始曝光，所以代码不拿它做提前触发的优化：扫描一律「等帧交付再移动」。
 
+**2026-11-14 补**（认识账 E12）：长扫描偶发"等帧 30 s 超时"，查下来不是取晚了 ——
+retain 模式证明帧在队列里能留 30 s 以上，是**这一发触发没出帧**。所以：
+retain 看"等不到帧"到底是丢触发还是丢帧；scanpath 用真实的 _grab_frame 跑扫描的相机路径
+（含补发与排空），触发次数减点数 = 用了几次补发。
+
     python tools/thorlabs_scan_probe.py all --exposure-us 200000
     python tools/thorlabs_scan_probe.py stream --exposure-us 50000 --points 100
+    python tools/thorlabs_scan_probe.py retain
+    python tools/thorlabs_scan_probe.py scanpath --exposure-us 300000 --points 600 --delay-ms 30 --period-ms 560
 
 注意：探针会显式写曝光（相机掉电保持），下一次打开相机会按配置/界面值重写，不影响数据。
 """
@@ -185,12 +192,81 @@ def mode_stream(cam: ThorlabsCamera, sess: _Session, exposure_us: int, n: int) -
           flush=True)
 
 
+def mode_retain(cam: ThorlabsCamera, sess: _Session, delays: list[float]) -> None:
+    """触发后**故意不取帧**，隔 d 秒再取：帧还在不在队列里。
+
+    这决定"等不到帧"该怎么解释：帧还在 → 是触发没出帧；帧没了 → 是取晚了/驱动丢帧。
+    实测 2026-11-14：0.02~30 s 都还在（见认识账 E12）。
+    """
+    print("== retain：触发后等 d 秒再取帧 ==", flush=True)
+    for d in delays:
+        cam._drain_frames(sess)
+        t0 = time.monotonic()
+        cam._fire(sess)
+        time.sleep(d)
+        frame = sess.cam.get_pending_frame_or_null()
+        print(f"  d={d:6.1f}s -> {'FRAME' if frame is not None else 'NO FRAME'} "
+              f"(总 {time.monotonic() - t0:.2f}s)", flush=True)
+        time.sleep(0.05)
+
+
+def mode_scanpath(cam: ThorlabsCamera, sess: _Session, exposure_us: int, n: int,
+                  delay_ms: float, period_ms: float) -> None:
+    """按扫描的真实相机路径跑：触发 → 模拟台子读数 → _grab_frame（含补发与排空）。
+
+    触发次数减点数 = 用了几次补发；_grab_frame 自己会把"第 N 点 … 补发一发触发"
+    写进日志。点周期按 period_ms 走，尽量贴近扫描的节奏。
+    """
+    exp_ms = exposure_us / 1000
+    print(f"== scanpath：{n} 点，曝光 {exp_ms:.0f} ms，触发后等 {delay_ms:.0f} ms、"
+          f"点周期 {period_ms:.0f} ms；帧时间 {sess.frame_time_us} µs，"
+          f"等帧预算 {cam._frame_wait_s(sess):.2f} s ==", flush=True)
+    fired = 0
+    orig_fire = cam._fire
+
+    def counted_fire(sess_: _Session):
+        nonlocal fired
+        fired += 1
+        return orig_fire(sess_)
+
+    cam._fire = counted_fire                       # type: ignore[method-assign]
+    t_start = time.monotonic()
+    try:
+        for k in range(n):
+            t0 = time.monotonic()
+            cam._fire(sess)
+            time.sleep(delay_ms / 1000.0)
+            try:
+                cam._grab_frame(0, k, 0.0, save=False)
+            except Exception as exc:               # noqa: BLE001
+                print(f"  *** 第 {k} 点采不到帧：{exc}", flush=True)
+                return
+            if (k + 1) % max(1, n // 10) == 0:
+                print(f"  {k + 1}/{n} 点，触发 {fired} 次"
+                      f"（补发 {fired - (k + 1)} 次），{time.monotonic() - t_start:.0f} s",
+                      flush=True)
+            dt = t0 + period_ms / 1000.0 - time.monotonic()
+            if dt > 0:
+                time.sleep(dt)
+    finally:
+        cam._fire = orig_fire                      # type: ignore[method-assign]
+    print(f"  完成 {n} 点，触发 {fired} 次（补发 {fired - n} 次），"
+          f"总 {time.monotonic() - t_start:.1f} s", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="CS165MU 单帧触发探针（不碰位移台）")
-    ap.add_argument("mode", choices=("arm", "latency", "pending", "readout", "window", "stream", "all"),
+    ap.add_argument("mode", choices=("arm", "latency", "pending", "readout", "window", "stream",
+                                     "retain", "scanpath", "all"),
                     help="要跑哪一项；all = arm + latency + pending + readout + stream(20 点)")
     ap.add_argument("--exposure-us", type=int, default=200_000, help="曝光（µs），默认 200 ms")
-    ap.add_argument("--points", type=int, default=100, help="stream 点数，默认 100")
+    ap.add_argument("--points", type=int, default=100, help="stream / scanpath 点数，默认 100")
+    ap.add_argument("--delays", default="0.02,0.1,0.5,1,2,5,10,30",
+                    help="retain 模式的等待秒数（逗号分隔）")
+    ap.add_argument("--delay-ms", type=float, default=30.0,
+                    help="scanpath 模式：触发后到取帧之间的等待（模拟台子读数），默认 30 ms")
+    ap.add_argument("--period-ms", type=float, default=560.0,
+                    help="scanpath 模式的点周期，默认 560 ms")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -219,7 +295,11 @@ def main() -> int:
             mode_window(cam, sess, exposure_us)
         if args.mode == "stream":
             mode_stream(cam, sess, exposure_us, args.points)
-        elif args.mode == "all":
+        if args.mode == "retain":
+            mode_retain(cam, sess, [float(x) for x in args.delays.split(",")])
+        if args.mode == "scanpath":
+            mode_scanpath(cam, sess, exposure_us, args.points, args.delay_ms, args.period_ms)
+        if args.mode == "all":
             mode_stream(cam, sess, exposure_us, min(20, args.points))
         return 0
     finally:
